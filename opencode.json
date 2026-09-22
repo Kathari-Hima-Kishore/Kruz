@@ -1,0 +1,18 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "mcp": {
+    "kruz": {
+      "type": "local",
+      "command": [
+        "node",
+        "D:/project prototypes/Kruz/dist/index.js"
+      ],
+      "cwd": "D:/project prototypes/Kruz",
+      "enabled": true,
+      "timeout": 60000
+    }
+  },
+  "permission": {
+    "kruz_*": "allow"
+  }
+}

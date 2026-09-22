@@ -1,0 +1,50 @@
+{
+  "name": "kruz",
+  "version": "1.7.1",
+  "description": "Headed browser automation MCP server for AI agents — with Kruz Ctrl MV3 extension for bot evasion, shadow DOM piercing, and live DOM observation on JS-heavy websites.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "kruz": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "node install.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "browser-automation",
+    "playwright",
+    "puppeteer",
+    "ats",
+    "job-finder",
+    "ai-agents",
+    "bot-evasion",
+    "shadow-dom"
+  ],
+  "author": "Kruz Contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@azure/cognitiveservices-computervision": "^8.2.0",
+    "@azure/ms-rest-js": "^2.7.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "chrome-remote-interface": "^0.33.0",
+    "puppeteer-core": "^23.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "sharp": "^0.35.4",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.5.0"
+  }
+}
