@@ -1,6 +1,6 @@
 ---
 name: Kruz MCP
-description: Kruz browser automation MCP server — 50 tools for driving a headed Chrome browser. Use when the user asks to browse, click, fill forms, scrape, navigate, take screenshots, handle cookie banners, interact with JS-heavy sites, or automate web workflows via Kruz/MCP. Triggers include "use Kruz", "browser MCP", "drive the browser", "open the site with Kruz", ATS job harvesting, or when an MCP session with server.info/session.create/page.* tools is available.
+description: Kruz browser automation MCP server — 49 tools for driving a headed Chrome browser. Use when the user asks to browse, click, fill forms, scrape, navigate, take screenshots, handle cookie banners, interact with JS-heavy sites, or automate web workflows via Kruz/MCP. Triggers include "use Kruz", "browser MCP", "drive the browser", "open the site with Kruz", ATS job harvesting, or when an MCP session with server.info/session.create/page.* tools is available.
 ---
 
 # Kruz MCP Skill
@@ -101,7 +101,7 @@ MCP Client (LLM agent)
     │  JSON-RPC over stdio
     ▼
 src/index.ts → createServer()
-    ├─ McpServer (50 tools + 4 resources)
+    ├─ McpServer (49 tools + 4 resources)
     ├─ ToolRouter (dispatch, retries, overlay heartbeat)
     │   └─ SessionManager
     └─ BrowserController
@@ -119,7 +119,7 @@ Headed Chrome (persistent profile)
 
 ---
 
-## Tool Catalog (50 tools)
+## Tool Catalog (49 tools)
 
 ### Server & Session
 | Tool | Purpose |

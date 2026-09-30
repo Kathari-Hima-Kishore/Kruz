@@ -23,7 +23,7 @@ export const KNOWN_TOOLS = new Set<string>([
   "page.observe",
   "page.probe",
   "page.click", "page.clickAt",
-  "azureCV.clickText",
+
   "page.computerUseList", "page.computerUseSnapshot",
   "page.fill", "page.press",
   "page.select", "page.check", "page.uncheck",

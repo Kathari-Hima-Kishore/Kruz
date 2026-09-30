@@ -6,7 +6,7 @@ A reliable, verification-first MCP server that gives AI agents a **visible Chrom
 |---|---|
 | **Version** | 1.7.1 |
 | **Transport** | stdio (MCP JSON-RPC) |
-| **Tools** | 50 registered |
+| **Tools** | 49 registered |
 | **Engine** | `puppeteer-core` + Chrome DevTools Protocol |
 | **Node** | >= 18 |
 | **License** | MIT |
@@ -21,7 +21,7 @@ A reliable, verification-first MCP server that gives AI agents a **visible Chrom
 
 ## What It Does
 
-Kruz launches a visible Chrome profile and exposes **50 tools** that let an agent navigate, observe, click, fill, select, extract, evaluate JavaScript, capture network responses, and run ATS (job-board) workflows across real sites — including Workday, Oracle HCM, iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters, SuccessFactors, Phenom, Taleo, Avature, and Eightfold career portals.
+Kruz launches a visible Chrome profile and exposes **49 tools** that let an agent navigate, observe, click, fill, select, extract, evaluate JavaScript, capture network responses, and run ATS (job-board) workflows across real sites — including Workday, Oracle HCM, iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters, SuccessFactors, Phenom, Taleo, Avature, and Eightfold career portals.
 
 Four properties define Kruz:
 
@@ -80,7 +80,7 @@ npm test           # vitest run
 
 ---
 
-## Tools (50 registered)
+## Tools (49 registered)
 
 `KNOWN_TOOLS` (in `src/mcp/tool-names.ts`) is the single source of truth, enforced at startup against the actual registrations. MCP `tools/list` and the `kruz://tools` resource report the same set.
 
@@ -101,7 +101,7 @@ npm test           # vitest run
 `page.observe` (scope + `detail`: `minimal` | `standard` | `full`) · `page.computerUseList` · `page.computerUseSnapshot`
 
 ### Clicking & input
-`page.click` · `azureCV.clickText` · `page.clickAt` · `page.fill` · `page.press` · `page.select` · `page.check` · `page.uncheck` · `page.scroll` · `page.paginate` · `page.wait`
+`page.click` · `page.clickAt` · `page.fill` · `page.press` · `page.select` · `page.check` · `page.uncheck` · `page.scroll` · `page.paginate` · `page.wait`
 
 ### Page interaction
 `page.handleOverlays` · `page.dialog` · `page.evaluate` · `page.frameObserve` · `page.frameEvaluate` · `extract.text`
@@ -257,17 +257,6 @@ calls in external timestamps. Diagnostic metadata only — never a decision inpu
 
 ---
 
-## OCR Fallback (Azure Computer Vision)
-
-Prefer normal selector clicks. OCR is a fallback for canvas/image text:
-
-- `azureCV.clickText({ text: "SEARCH JOBS" })`, or `page.click({ target: { text: "SEARCH JOBS" }, ocr: true })`.
-- Sends a viewport screenshot to Azure, requires a **unique exact** text line, scales image pixels to CSS pixels, and **refuses Apply controls**.
-- Never auto-repeats after an uncertain response.
-- Requires `AZURE_CV_ENDPOINT` and `AZURE_CV_KEY` in the server environment (read at initialization, not import). Some MCP launchers filter inherited variables — forward them explicitly.
-
----
-
 ## Human-in-the-loop
 
 - A **blue overlay** shows when Kruz is controlling the browser. It is **realtime**: a heartbeat (`ping`) keeps it visible only while a tool call is in flight. The moment the call ends — the model is back to thinking/deciding — the overlay turns itself off within ~650ms, even if the server process dies.
@@ -298,7 +287,6 @@ Environment variables always override `config.json` (project root).
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `SAFETY_POLICY` | `off` | `strict` \| `lenient` \| `off` |
 | `OBSERVATION_CACHE_SIZE` | `100` | LRU cache size for observations |
-| `AZURE_CV_ENDPOINT` / `AZURE_CV_KEY` | (none) | Azure OCR fallback |
 
 ```json
 {
@@ -319,7 +307,7 @@ Environment variables always override `config.json` (project root).
                         │  JSON-RPC over stdio
                         ▼
   src/index.ts  (entry, signals, global error handlers)
-      └─ createServer()  src/mcp/server.ts  ── 50 tools + 4 resources
+      └─ createServer()  src/mcp/server.ts  ── 49 tools + 4 resources
            ├─ ToolRouter  src/mcp/router.ts
            │    ├─ sanitizeToolName (tool-names.ts)
            │    ├─ timeouts · retry ladders · control-lock lifecycle
@@ -330,7 +318,7 @@ Environment variables always override `config.json` (project root).
                              ├─ Observer / FidelityExtractor (src/extractor/)
                              ├─ click-completion.ts · selectors.ts
                              ├─ visual-cursor.ts · stealth.ts
-                             ├─ overlays.ts · computer-use.ts · azure-cv.ts
+                             ├─ overlays.ts · computer-use.ts
                              └─ ats-json.ts · ats-tools.ts
                         │  CDP / puppeteer-core
                         ▼
@@ -346,7 +334,7 @@ Environment variables always override `config.json` (project root).
 | `src/errors.ts` | Error taxonomy, envelopes, retry policies |
 | `src/mcp/` | MCP server, tool registry, router, name sanitization |
 | `src/session/manager.ts` | Session lifecycle, tabs, navigation trace |
-| `src/browser/` | Engine contract, Puppeteer engine, controller, verification, cursor, stealth, ATS, OCR |
+| `src/browser/` | Engine contract, Puppeteer engine, controller, verification, cursor, stealth, ATS |
 | `src/extractor/` | Observation (observer/cache/delta) + fidelity extraction |
 | `src/safety/layer.ts` | Destructive-action classification |
 | `src/browser/ref-registry.ts` | The ref contract: one mint/resolve authority per session |

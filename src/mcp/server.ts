@@ -135,11 +135,10 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
 
   // fed by computerUseList/Snapshot grounding.
 
-  t("page.click", "Click a unique target, scrolling it into view. Known safe overlays are dismissed only when they obstruct the target, then the click is retried once. Reports click dispatch separately from rendered navigation; follows only a new tab opened by this page. On AMBIGUOUS_TARGET the error includes a bounded `candidates` list (ref/role/name/href/context) so you can pick one instead of re-observing. Use wait_until for a specific destination/content predicate. ocr:true uses Azure directly; ocr_fallback:true uses it only when a text target was not found before dispatch.", {
+  t("page.click", "Click a unique target, scrolling it into view. Known safe overlays are dismissed only when they obstruct the target, then the click is retried once. Reports click dispatch separately from rendered navigation; follows only a new tab opened by this page. On AMBIGUOUS_TARGET the error includes a bounded `candidates` list (ref/role/name/href/context) so you can pick one instead of re-observing. Use wait_until for a specific destination/content predicate.", {
     target: T, fallback: F, scope: z.string().optional(), timeout_ms: z.number().optional(),
 
-    ocr: z.boolean().optional(),
-    ocr_fallback: z.boolean().optional(), dismiss_overlays: z.boolean().optional(),
+    dismiss_overlays: z.boolean().optional(),
     wait_for: z.enum(['auto','navigation','none']).optional(),
     wait_until: z.string().optional().describe('JavaScript predicate for the desired resulting page state; no automatic re-click if it times out.'),
     wait_timeout_ms: z.number().min(500).max(30000).optional(), follow_new_tab: z.boolean().optional(),
@@ -150,7 +149,7 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
     speed: z.enum(["instant", "fast", "normal", "slow"]).optional().describe("Cursor glide speed when visual:true. Default normal."),
 
   });
-  t("azureCV.clickText", "Click unique visible text using Azure OCR on a viewport screenshot. Explicit fallback after selectors fail; clear overlays first. Never clicks Apply. Reports dispatch, not verified website success.", { text: z.string().min(1), timeout_ms: z.number().positive().max(10000).optional() });
+
 
 
 

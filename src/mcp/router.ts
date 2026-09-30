@@ -1,4 +1,3 @@
-import { cvEnhancedClick, createKruzCVBridge } from "../browser/azure-cv.js";
 import { captureClickState, completeClick } from '../browser/click-completion.js';
 import { randomUUID } from "node:crypto";
 import { KRUZ_VERSION, buildInfo } from "../version.js";
@@ -315,7 +314,6 @@ export class ToolRouter {
 
       // Click - semantic target click (preferred) + coordinate fallback
       case "page.click": return this.click(a);
-      case "azureCV.clickText": return this.click({ target: { text: a.text }, ocr: true, timeout_ms: a.timeout_ms });
       case "page.clickAt": return this.ctrl.clickAt(a.x, a.y, a.button);
 
       // Computer-use (text-only CUA bridge — see src/browser/computer-use.ts)
@@ -459,13 +457,6 @@ export class ToolRouter {
         return { ...response, result: { ...response.result, clicked:true, verified:false, completion_error:String(error), retry_safe:false } };
       }
     };
-    if (a.ocr === true) {
-      if (!a.target.text || a.scope || a.button && a.button !== "left" || a.click_count && a.click_count !== 1) {
-        return { ok: false, error: kruzError(ErrCode.INVALID_OCR_OPTIONS, { subsystem: "ocr", message: "OCR requires target.text, no scope, and a single left click.", trace: ["router"] }).toJSON() };
-      }
-      try { return await finish(await cvEnhancedClick(createKruzCVBridge(engine), a.target.text, { timeout: Math.min(a.timeout_ms ?? 5000, 10000) })); }
-      catch (error) { return { ok: false, error: kruzError(ErrCode.OCR_CLICK_FAILED, { subsystem: "ocr", message: String(error), cause: error, trace: ["router"] }).toJSON(), retry_safe: false }; }
-    }
     const sd = this.safety.classify("click", a.target);
     // NOTE: Safety confirmation gating removed so the browser agent is fully
     // autonomous (e.g. accepting cookie-consent banners). If any restrictive
@@ -550,10 +541,6 @@ export class ToolRouter {
       response = { ok: false, error: shapeError(toErrorEnvelope(err), "page.click") };
     }
 
-    if (!response.ok && a.ocr_fallback === true && a.target.text && !a.scope && (!a.button || a.button==='left') && (!a.click_count || a.click_count===1) && response.error?.code==='TARGET_NOT_FOUND') {
-      try { return await finish({...await cvEnhancedClick(createKruzCVBridge(engine), a.target.text, {timeout:Math.min(a.timeout_ms??5000,10000)}), method:'azure-ocr-fallback'}); }
-      catch(error){return {ok:false,error:kruzError(ErrCode.OCR_CLICK_FAILED,{subsystem:'ocr',message:String(error),cause:error,trace:['router']}).toJSON(),retry_safe:false};}
-    }
     return finish({...response, ...(overlays ? {overlay_handling:overlays} : {}), ...(visualFallback ? {visual_fallback:visualFallback} : {})});
   }
 

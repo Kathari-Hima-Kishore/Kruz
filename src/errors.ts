@@ -1,7 +1,7 @@
 /**
  * KruzError — single source of truth for error classification, provenance, and
  * retry policy across every subsystem (router, controller, engine, observer,
- * ATS tools, OCR, session manager).
+ * ATS tools, session manager).
  *
  * Every failure should surface as a KruzError (or a plain Error that gets
  * normalized through `kruzError()`). All error responses emitted towards the
@@ -20,7 +20,6 @@ export const SUBSYSTEMS = [
   "selector",
   "session",
   "observer",
-  "ocr",
   "ats",
   "launcher",
   "computer-use",
@@ -69,8 +68,6 @@ export const ErrCode = {
   CLICK_FAILED: "CLICK_FAILED",
   INVALID_TARGET: "INVALID_TARGET",
   INVALID_INPUT: "INVALID_INPUT",
-  INVALID_OCR_OPTIONS: "INVALID_OCR_OPTIONS",
-  OCR_CLICK_FAILED: "OCR_CLICK_FAILED",
   // routing / lifecycle
   UNKNOWN_TOOL: "UNKNOWN_TOOL",
   ACTION_TIMEOUT: "ACTION_TIMEOUT",
@@ -310,9 +307,6 @@ export function classify(code: string): Subsystem {
     case ErrCode.TARGET_NOT_FOUND:
     case ErrCode.ELEMENT_NOT_FOUND:
       return "selector";
-    case ErrCode.OCR_CLICK_FAILED:
-    case ErrCode.INVALID_OCR_OPTIONS:
-      return "ocr";
     default:
       return "internal";
   }

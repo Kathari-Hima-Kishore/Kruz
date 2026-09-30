@@ -17,8 +17,6 @@ import type { MatchDescriptor, MatchMode, MatchSpec } from "./inpage-matcher.js"
 import type { SessionManager, SessionState } from "../session/manager.js";
 import type { Observation } from "../types/observation.js";
 import { extractExperienceSignals } from "./ats-tools.js";
-import { ComputerVisionClient } from "@azure/cognitiveservices-computervision";
-import { ApiKeyCredentials } from "@azure/ms-rest-js";
 
 import { bulkHarvest, type TargetCompany } from "./ats-json.js";
 import { kruzError, kruzErrorFromThrown, ErrCode, withRetry, type Subsystem } from "../errors.js";
