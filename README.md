@@ -1,130 +1,260 @@
 # Kruz — Headed Browser Automation MCP Server
 
-A high-speed, low-token, accurate headed browser automation server for AI agents via the Model Context Protocol (MCP).
+A reliable, verification-first MCP server that gives AI agents a **visible Chrome browser** to drive real websites. Kruz is not a computer-use vision loop: it is **deterministic selector-first control** with postcondition verification, recovery ladders, typed errors, and a human-in-the-loop handoff for login/CAPTCHA/2FA.
+
+| | |
+|---|---|
+| **Version** | 1.7.1 |
+| **Transport** | stdio (MCP JSON-RPC) |
+| **Tools** | 50 registered |
+| **Engine** | `puppeteer-core` + Chrome DevTools Protocol |
+| **Node** | >= 18 |
+| **License** | MIT |
+
+> **Agent-facing docs:** [`SKILL.md`](./SKILL.md) is the runtime contract served to agents
+> over MCP (`kruz://skill`) — read the interaction rules there before automating.
+> [`MODEL_GUIDE.md`](./MODEL_GUIDE.md) is the deeper project-local manual with worked
+> examples, recovery recipes and the ATS playbook.
+> This README is the engineering/task-oriented overview.
+
+---
 
 ## What It Does
 
-Launches a **visible Chrome browser** and exposes **44 tools** that let an AI agent navigate, interact with, and extract data from any website — including local HTML files, Workday, Oracle HCM, iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters, SuccessFactors, Phenom, Taleo, Avature, and Eightfold career portals.
+Kruz launches a visible Chrome profile and exposes **50 tools** that let an agent navigate, observe, click, fill, select, extract, evaluate JavaScript, capture network responses, and run ATS (job-board) workflows across real sites — including Workday, Oracle HCM, iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters, SuccessFactors, Phenom, Taleo, Avature, and Eightfold career portals.
 
-Optimized for the `job-finder-v9` skill flow: ATS detection, full-feed enumeration (Phase 1.5/3a), posting-page liveness verification (Phase 3c), result-card summarization (Phase 3b batching), stable pagination (Phase 3), and body-based experience/seniority classification with confidence scoring.
+Four properties define Kruz:
+
+1. **Semantic targeting** — refs and role/name based locators, not brittle coordinates.
+2. **Verified actions** — a click is not "done" when dispatched; it is checked against a postcondition (navigation, rendered destination, in-place change, new tab, dialog).
+3. **Recovery ladders** — failed actions escalate: dismiss overlays → re-observe → visual click.
+4. **Human-in-the-loop** — a headed browser, a control-status overlay, an input lock while the model acts, and explicit pause/resume/takeover.
+
+---
 
 ## Quick Start
 
-### 1. Install prerequisites
-- **Node.js** v18+: https://nodejs.org
-- **Google Chrome**: https://www.google.com/chrome/
+### 1. Prerequisites
+- **Node.js** v18+ — https://nodejs.org
+- **Google Chrome** — https://www.google.com/chrome/
 
-### 2. Setup
+### 2. Build
 
 ```bash
-cd kruz
 npm install
 npm run build
 ```
 
-The `postinstall` hook runs `install.mjs`, which auto-detects Chrome, generates `opencode.json`, and registers Kruz as an MCP server.
+### 3. Register with your MCP client
 
-### 3. Use it
-
-```bash
-opencode
-# Then: "Use kruz to open https://example.com"
-```
-
-If Kruz is already in your `opencode.json`, restart opencode to pick up the rebuilt `dist/`.
-
-## Running
-
-```bash
-npm start          # Production (compiled)
-npm run dev        # Development (tsx)
-npm run typecheck  # tsc --noEmit
-npm run build      # tsc -> dist/
-```
-
-## Tools (44 registered)
-
-The authoritative tool list is returned by MCP `tools/list` and `kruz://tools`.
-`server.info` reports the same registry count. The Azure addition is
-`azureCV.clickText({text: "SEARCH JOBS"})`; the equivalent explicit mode is
-`page.click({target: {text: "SEARCH JOBS"}, ocr: true})`.
-
-Use normal selector clicks first. OCR sends a viewport screenshot to Azure,
-requires a unique exact text line, scales image pixels into viewport CSS pixels,
-and refuses Apply controls. Clear overlays explicitly and scroll the text into
-view first. `clicked: true, verified: false` means an input was dispatched, not
-that the destination or business action has been verified. Inspect the resulting
-page. Never automatically repeat a click after an uncertain response.
-
-Set `AZURE_CV_ENDPOINT` and `AZURE_CV_KEY` in the MCP server's environment.
-MCP launchers may filter inherited variables; forward these two variables explicitly.
-Credentials are read during initialization rather than module import.
-
-`azureCVHelper.js` re-exports the built implementation. Programmatic callers use
-`cvEnhancedClick(createKruzCVBridge(engine), text)` and inspect its result object;
-the former fictional `kruz.page.screenshot/clickAt` object is no longer required.
-An optional `verify` callback performs real post-click verification.
-
-## Kruz Ctrl extension
-
-This workspace's `config.json` enables the bundled `./extension` directory.
-Paths in configuration resolve from the project root, independent of the MCP
-launcher's working directory. `BROWSER_EXTENSION_PATH` overrides this path.
-Chrome must support `Extensions.loadUnpacked`; Kruz uses a private debugging pipe
-and Chrome's extension-debugging flag when an extension is configured. Failure
-to load is reported rather than silently pretending the extension is active.
-
-Check `server.info.config.engine`, `extension_configured`, and `extension_ready`
-on an ordinary web page. For an explicit page-side check, evaluate
-`window.__kruz__.ping()` or `window.__kruz__.queryOne("h1")` through Kruz.
-Native clicking, selection, and scrolling use Kruz's Puppeteer-backed browser
-input implementation; loading the extension does not turn synthetic JS events
-into trusted browser input. No ChatGPT browser extension is involved.
-
-After rebuilding, close the old Kruz session and reconnect the MCP server.
-
-## Targeting System
-
-Every interactive tool accepts a `target` object with semantic selectors (resolved in priority order):
+Add Kruz to your client config (example — `opencode.json` in this repo is already set up):
 
 ```json
 {
-  "target": {
-    "role": "button",
-    "name": "Submit"
+  "mcp": {
+    "kruz": {
+      "type": "local",
+      "command": ["node", "D:/project prototypes/Kruz/dist/index.js"],
+      "cwd": "D:/project prototypes/Kruz",
+      "enabled": true,
+      "timeout": 60000
+    }
   },
-  "fallback": {
-    "text": "Submit",
-    "css": "button.submit"
-  }
+  "permission": { "kruz_*": "allow" }
 }
 ```
 
-**Resolution order:** ref → role+name → label → placeholder → text → testid → name → id → css → xpath
+Then restart the client and ask: *"Use kruz to open https://example.com."*
+
+> After rebuilding `dist/`, close the old Kruz session and reconnect the MCP server.
+
+### 4. Running
+
+```bash
+npm start          # Production (compiled dist/)
+npm run dev        # Development (tsx, no build)
+npm run typecheck  # tsc --noEmit
+npm run build      # tsc -> dist/
+npm test           # vitest run
+```
+
+---
+
+## Tools (50 registered)
+
+`KNOWN_TOOLS` (in `src/mcp/tool-names.ts`) is the single source of truth, enforced at startup against the actual registrations. MCP `tools/list` and the `kruz://tools` resource report the same set.
+
+### Server & session
+| Tool | Purpose |
+|---|---|
+| `server.info` | Server/session/config diagnostics (no session needed) |
+| `session.create` | Create or reuse the headed Chrome session |
+| `session.status` | Session state, tabs, navigation trace |
+| `session.close` | Close the browser |
+| `session.pause` | Release control for manual work (login/CAPTCHA/2FA) |
+| `session.resume` | Hand control back to the model |
+
+### Navigation & tabs
+`page.open` · `page.newTab` · `page.switchTab` · `page.listTabs` · `page.closeTab`
+
+### Observation
+`page.observe` (scope + `detail`: `minimal` | `standard` | `full`) · `page.computerUseList` · `page.computerUseSnapshot`
+
+### Clicking & input
+`page.click` · `azureCV.clickText` · `page.clickAt` · `page.fill` · `page.press` · `page.select` · `page.check` · `page.uncheck` · `page.scroll` · `page.paginate` · `page.wait`
+
+### Page interaction
+`page.handleOverlays` · `page.dialog` · `page.evaluate` · `page.frameObserve` · `page.frameEvaluate` · `extract.text`
+
+### Site helpers
+`page.oracleHCMSearch` · `page.iCIMSSearch` · `page.extractExperience` · `page.detectATS`
+
+### Network
+`network.capture` · `network.body`
+
+### ATS / job hunting
+`ats.enumerate` · `ats.verifyPosting` · `ats.summarize` · `ats.paginate` · `ats.greenhouseHarvest` · `ats.leverHarvest` · `ats.ashbyHarvest` · `ats.smartRecruitersHarvest` · `ats.workdayHarvest` · `ats.bulkHarvest` · `ats.discoverHandle` · `human.takeover`
+
+---
+
+## Targeting System
+
+Every interactive tool accepts a `target` object. Resolution order:
+
+**`ref` → `role`+`name` → `label` → `placeholder` → `text` → `testid` → `nameAttr` → `id` → `css` → `xpath` → fallback**
+
+```json
+{
+  "target": { "role": "button", "name": "Submit" },
+  "fallback": { "text": "Submit", "css": "button.submit" },
+  "scope": "#checkout-form"
+}
+```
+
+Notes:
+- **Prefer refs.** `page.observe` returns a `ref` per element; refs survive minor DOM changes via a recovery ladder and are the most reliable input.
+- **A ref is a promise.** `page.observe`, `page.probe`, and `AMBIGUOUS_TARGET` candidates all mint refs into **one per-session `RefRegistry`**, and every action tool resolves from that same registry. A ref you were just handed is therefore directly actionable.
+- **Ambiguity is refused, not guessed.** If several visible elements match, Kruz returns `AMBIGUOUS_TARGET` with candidate refs rather than clicking the first. Pick a candidate ref, or narrow it with `scope` / a unique selector.
+- **Verification is explicit.** `clicked: true` means input was dispatched. `verified: true` means a postcondition was observed (`verification: rendered_destination | target_disappeared | in_place_change | predicate`). `verified: false` with an `unverified_reason` means nothing changed — inspect the page before retrying.
+
+### The ref contract
+
+Resolution walks a ladder and **never degrades into "act on whatever matched first"**:
+
+| Tier | Basis |
+|---|---|
+| 1 | The exact live node, re-identified by its recorded path **and** verified against its recorded fingerprint (a path-only hit is positional and can rebind to a stranger after a re-render) |
+| 2 | Exact semantic identity — canonical resolved destination (`href` compared after URL resolution, so relative / `../` / `#fragment` / query / `<base href>` all work), or testid / name / placeholder |
+| 3 | Bounded re-resolution within the original match set, narrowed by identity, which must resolve to exactly one node |
+
+Anything less is a structured failure with the true reason — `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `AMBIGUOUS_TARGET`, `ELEMENT_NOT_VISIBLE`, `ELEMENT_DISABLED` — never a silent wrong-element action.
+
+Identity is compared **after URL resolution**: Kruz records both the raw `href` attribute and the resolved `el.href`, because building `a[href="https://…"]` from a resolved URL matches nothing when the document says `href="3.13.html"`. That mismatch previously turned a valid ref into a false `STALE_REFERENCE` after a sidebar re-render.
+
+Refs are scoped to a document. A ref minted in document A is refused in document B (`DOCUMENT_CHANGED`) even when the new page has a same-named element — that is a decoy, and it is never acted on for you.
+
+---
+
+## Action Semantics & Reliability
+
+### Click verification (`verification` values)
+| Value | Meaning |
+|---|---|
+| `rendered_destination` | Navigation completed and the destination rendered |
+| `predicate` | Caller's `wait_until` JS predicate became true |
+| `in_place_change` | Verified state change without navigation |
+| `none_observed` | Nothing detected before the discovery window (1.5 s) |
+| `new_tabs` | Click opened tabs (with `new_tabs` details) |
+| `pending_dialog` | A native dialog is blocking |
+| `wait_timed_out` | Overall deadline reached (`retry_safe: false`) |
+
+### Recovery ladders
+- **click**: `dismiss-overlays` → `re-observe` → `visual-click`
+- **open**: `recreate-session` on `BROWSER_CRASHED`
+- **type / fill**: `re-observe` → direct fill
+
+### Error envelope
+Every failure returns a typed envelope:
+
+```json
+{
+  "code": "TARGET_NOT_FOUND",
+  "message": "Element not found (css=#nope)",
+  "retryable": true,
+  "subsystem": "engine",
+  "help": "Call page.observe to see what is actually on the page and pick a ref.",
+  "trace": ["tool:page.click", "router", "controller"]
+}
+```
+
+**Retryable** (the same call may succeed shortly): `NO_SESSION`, `BROWSER_CRASHED`, `ELEMENT_OBSCURED`, `ELEMENT_NOT_VISIBLE`, `ELEMENT_DISABLED`, `STALE_ELEMENT`, `ACTION_TIMEOUT`, `NO_MATCH`, `INTERNAL_ERROR`.
+
+**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`.
+
+> The same taxonomy, with recovery recipes, is in [`SKILL.md`](./SKILL.md) — that is what
+> agents read at runtime.
+
+### Timeouts
+25 s for most tools, 55 s for navigation-class tools (`session.create`, `page.open`, `page.reload`, `page.iCIMSSearch`, `ats.verifyPosting`).
+
+### Timing
+Actions report their own server-side timing, so callers can spot a stall without wrapping
+calls in external timestamps. Diagnostic metadata only — never a decision input.
+
+| Tool | Fields |
+|---|---|
+| `page.probe` | `probe_ms` |
+| `page.open` | `_timing.total_ms` (+ `navigate_ms`, `poll_ms`) |
+| `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
+| `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
+| `page.scroll` | `timing.total_ms`, `action_ms` |
+| `page.observe` | `timing.total_ms`, `generate_ms` |
+| `page.handleOverlays` | `timing.total_ms`, `discovery_ms`, `dismissal_ms` |
+
+---
+
+## OCR Fallback (Azure Computer Vision)
+
+Prefer normal selector clicks. OCR is a fallback for canvas/image text:
+
+- `azureCV.clickText({ text: "SEARCH JOBS" })`, or `page.click({ target: { text: "SEARCH JOBS" }, ocr: true })`.
+- Sends a viewport screenshot to Azure, requires a **unique exact** text line, scales image pixels to CSS pixels, and **refuses Apply controls**.
+- Never auto-repeats after an uncertain response.
+- Requires `AZURE_CV_ENDPOINT` and `AZURE_CV_KEY` in the server environment (read at initialization, not import). Some MCP launchers filter inherited variables — forward them explicitly.
+
+---
+
+## Human-in-the-loop
+
+- A **blue overlay** shows when Kruz is controlling the browser. It is **realtime**: a heartbeat (`ping`) keeps it visible only while a tool call is in flight. The moment the call ends — the model is back to thinking/deciding — the overlay turns itself off within ~650ms, even if the server process dies.
+- A **visible cursor** tracks every click and hover, so you can see exactly where the model is acting.
+- Page input is locked only while the overlay is alive; when it disappears the page is fully interactive again.
+- **`session.pause`** (or **`human.takeover`**) releases the lock and stands down for manual login/CAPTCHA/2FA; **`session.resume`** hands control back.
+- There is no automatic takeover button — pausing is model/client initiated and explicit.
+
+---
 
 ## Configuration
 
-### Environment Variables
+Environment variables always override `config.json` (project root).
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `BROWSER_PATH` | Auto-detected | Chrome executable path |
-| `BROWSER_HEADLESS` | `false` | Run headless |
-| `BROWSER_VIEWPORT_WIDTH` | `1280` | Viewport width |
-| `BROWSER_VIEWPORT_HEIGHT` | `720` | Viewport height |
+| `BROWSER_HEADLESS` | `false` | Run headless (Kruz is headed by design) |
+| `BROWSER_VIEWPORT_WIDTH` / `BROWSER_VIEWPORT_HEIGHT` | `1280` / `720` | Viewport size |
 | `BROWSER_PROFILE_DIR` | `./browser-profile` | Persistent profile directory |
-| `BROWSER_TIMEOUT_MS` | `30000` | Default timeout |
-| `BROWSER_USER_AGENT` | (Playwright default) | Custom User-Agent |
+| `BROWSER_USER_AGENT` | `null` | Custom User-Agent |
 | `BROWSER_LOCALE` | `en-US` | Browser locale |
-| `BROWSER_PROXY` | (none) | Proxy server URL |
+| `BROWSER_PROXY` | `null` | Proxy server URL |
 | `BROWSER_DOWNLOAD_DIR` | `./downloads` | Download directory |
-| `SAFETY_POLICY` | `off` | `strict`, `lenient`, or `off` |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
-| `OBSERVATION_CACHE_SIZE` | `100` | LRU cache size for page observations |
-
-### File Config
-
-Create `config.json` in the project root to override defaults:
+| `BROWSER_TRACING` | `false` | Tracing |
+| `BROWSER_SCREENSHOTS` | `false` | Screenshot capture |
+| `BROWSER_TIMEOUT_MS` | `30000` | Default timeout |
+| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `SAFETY_POLICY` | `off` | `strict` \| `lenient` \| `off` |
+| `OBSERVATION_CACHE_SIZE` | `100` | LRU cache size for observations |
+| `AZURE_CV_ENDPOINT` / `AZURE_CV_KEY` | (none) | Azure OCR fallback |
 
 ```json
 {
@@ -136,59 +266,105 @@ Create `config.json` in the project root to override defaults:
 }
 ```
 
-Environment variables take precedence over `config.json`.
+---
 
 ## Architecture
 
 ```
-src/
-├── mcp/
-│   ├── server.ts      # MCP server with Zod schemas for all 75 tools
-│   └── router.ts      # Request routing to handlers (25s route timeout)
-├── browser/
-│   ├── launcher.ts    # Chrome launch (headed, persistent profile)
-│   ├── controller.ts  # Page actions (75 methods)
-│   ├── selectors.ts   # Semantic selector resolution (10-level priority)
-│   ├── ats-detector.ts # ATS family detection (URL + DOM)
-│   └── ats-tools.ts   # Phase 1.5/3a/3b/3c ATS helpers + verdict logic
-├── extractor/
-│   ├── observer.ts    # Compact page observation (cache + delta)
-│   ├── cache.ts       # LRU observation cache
-│   ├── delta.ts       # Change detection between observations
-│   └── fidelity.ts    # Exact-fidelity extraction with provenance
-├── session/
-│   └── manager.ts     # Session lifecycle and page tracking
-├── safety/
-│   └── layer.ts       # Action classification and human takeover
-├── types/
-│   ├── schema.ts      # Zod schemas for all inputs
-│   ├── observation.ts # Observation type definitions
-│   └── extraction.ts  # Extraction result envelopes
-├── config.ts          # Environment/file-based configuration
-└── index.ts           # Entry point
+                 MCP client (LLM agent)
+                        │  JSON-RPC over stdio
+                        ▼
+  src/index.ts  (entry, signals, global error handlers)
+      └─ createServer()  src/mcp/server.ts  ── 50 tools + 4 resources
+           ├─ ToolRouter  src/mcp/router.ts
+           │    ├─ sanitizeToolName (tool-names.ts)
+           │    ├─ timeouts · retry ladders · control-lock lifecycle
+           │    └─ SessionManager  src/session/manager.ts
+           └─ handlers ── BrowserController  src/browser/controller.ts
+                             ├─ BrowserEngine (interface)
+                             │    └─ PuppeteerEngine
+                             ├─ Observer / FidelityExtractor (src/extractor/)
+                             ├─ click-completion.ts · selectors.ts
+                             ├─ visual-cursor.ts · stealth.ts
+                             ├─ overlays.ts · computer-use.ts · azure-cv.ts
+                             └─ ats-json.ts · ats-tools.ts
+                        │  CDP / puppeteer-core
+                        ▼
+              Headed Chrome (persistent profile)
 ```
 
-## job-finder-v9 Phase Coverage
+**Layering rule:** the router owns policy (retries, timeouts, verification, control lock); the controller owns semantics (targets, strictness, refs); the engine owns mechanics (CDP, input synthesis, probes); the observer owns perception.
+
+| Path | Role |
+|---|---|
+| `src/index.ts` | Entry point; stdio; signal + global error handling |
+| `src/config.ts` | Env + `config.json` resolution |
+| `src/errors.ts` | Error taxonomy, envelopes, retry policies |
+| `src/mcp/` | MCP server, tool registry, router, name sanitization |
+| `src/session/manager.ts` | Session lifecycle, tabs, navigation trace |
+| `src/browser/` | Engine contract, Puppeteer engine, controller, verification, cursor, stealth, ATS, OCR |
+| `src/extractor/` | Observation (observer/cache/delta) + fidelity extraction |
+| `src/safety/layer.ts` | Destructive-action classification |
+| `src/browser/ref-registry.ts` | The ref contract: one mint/resolve authority per session |
+| `src/browser/inpage-scripts.ts` | Shared in-page matcher (probe + action path share these bytes) |
+| `tests/` | Vitest unit + integration suites (fixtures included) |
+| `SKILL.md` | Agent-facing runtime contract, served as `kruz://skill` |
+| `MODEL_GUIDE.md` | Deeper local manual: worked examples, recipes, ATS playbook |
+
+---
+
+## ATS / job-finder Phase Coverage
 
 | Phase | Description | Tools |
 |---|---|---|
-| 1.5 / 3a | ATS register + full feed/sitemap enumeration | `ats.detect`, `ats.enumerate`, `network.body` |
+| 1.5 / 3a | ATS register + full feed/sitemap enumeration | `page.detectATS`, `ats.enumerate`, `network.body` |
 | 2 | Ground check (facet matrix, category enumeration) | `page.open`, `page.observe`, `page.click`, `page.select` |
 | 3a | Exhaustive enumeration + reconciliation | `ats.paginate`, `ats.summarize` |
-| 3b | Relevance verdict from body (experience + job family + cap) | `page.extractExperience` (delegates to `extractExperienceSignals` in `ats-tools.ts`) |
-| 3c | Posting-page verification (liveness probe + terminal state) | `ats.verifyPosting` |
-| 3d | Terminal state per posting (`live/closed/broken/login_required/captcha_required`) | `ats.verifyPosting` |
+| 3b | Relevance verdict from body (experience + job family + cap) | `page.extractExperience` |
+| 3c | Posting-page verification (liveness probe) | `ats.verifyPosting` |
+| 3d | Terminal state per posting (`live`/`closed`/`broken`/`login_required`/`captcha_required`) | `ats.verifyPosting` |
 
-The `page.extractExperience` tool now delegates to the same thorough `extractExperienceSignals` regex set used by `ats.verifyPosting`, so it correctly parses "0-3 years", "2+ years experience", "recent graduate", "entry-level", "fresher", "new grad", etc. and reports a `confidence` field: `"high"` (level + years both clear), `"low"` (only one), `"none"` (ambiguous/missing — no wrong guess).
+`page.extractExperience` and `ats.verifyPosting` share the same signal engine, parsing "0-3 years", "2+ years experience", "recent graduate", "entry-level", "fresher", "new grad", etc., with a `confidence` field: `"high"` (level + years), `"low"` (one), `"none"` (ambiguous — no wrong guess).
+
+---
+
+## Testing
+
+```bash
+npm test        # Vitest: unit + integration (live headed pages + local fixture)
+```
+
+- Unit suites cover the error taxonomy, visual cursor, ATS detection, session lifecycle, and regression fixes.
+- Integration suites run against a **real headed Chrome** and `tests/fixtures/` (shadow DOM, dialogs, cookies, lists), plus a local HTTP server so relative-href resolution is exercised against a real base URL.
+- Contract suites that guard the ref promise: `ref-contract`, `observe-ref-contract`, `href-identity`, `overlay-latency-timing`, `control-loop-fixes`, `reported-bugs`.
+
+---
+
+## Known Limitations
+
+- **Observation caps** (`minimal` 120 / `standard` 400 / `full` 2000 elements) can starve very dense pages.
+- **Closed shadow roots** are not pierced (open shadow roots and same-origin iframes are).
+- **Cross-origin iframes** are skipped for evaluation.
+- `contextFetch` uses a Node-side fetch **without the page's cookies** — it does not inherit the session.
+- **Headless is not supported**; `session.create` rejects `headless: true` with `HEADED_REQUIRED`.
+- The safety layer is **off by default** and non-blocking.
+
+Known gaps and recommended follow-ups are tracked in the project issues; the
+agent-facing consequences of each limitation are spelled out in
+[`SKILL.md`](./SKILL.md).
+
+---
 
 ## Security Notes
 
-- Browser runs **headed by default** so you can see what Kruz is doing.
-- `file://` URLs are supported for local file testing.
-- Safety layer blocks destructive actions (delete, purchase, etc.) in `strict` mode; `off` by default.
-- No passwords or session tokens are exposed to the AI agent.
-- Human takeover is triggered for login, CAPTCHA, and 2FA pages.
-- `session.attach` lets you drive an existing logged-in Chrome via CDP without sharing credentials.
+- Browser runs **headed by default** so you can see exactly what Kruz is doing.
+- `file://` URLs are supported for local testing.
+- No passwords or session tokens are exposed to the agent; the persistent profile keeps logins on disk under `browser-profile/`.
+- Human takeover/wait handles login, CAPTCHA, and 2FA.
+- The safety layer can classify destructive actions (delete/purchase) but is off by default.
+- All diagnostics go to **stderr**; stdout is reserved for MCP.
+
+---
 
 ## License
 
