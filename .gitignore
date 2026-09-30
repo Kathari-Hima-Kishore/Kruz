@@ -1,6 +1,7 @@
 # Build output
 dist/
-.gitignore
+# NOTE: a .gitignore must never list itself. A previous commit did, which
+# untracked the file and would have dropped it from a fresh clone.
 # Dependencies
 node_modules/
 

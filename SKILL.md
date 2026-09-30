@@ -5,18 +5,32 @@ description: Kruz browser automation MCP server — 50 tools for driving a heade
 
 # Kruz MCP Skill
 
-## Read the Model Guide too
+## Read the Model Guide before you drive the browser
 
-This skill is the **global** runtime contract. The fuller, project-local manual lives at
+This skill is the **global** runtime contract, and it is the shorter of the two
+documents by design. The project-local manual is
 [`MODEL_GUIDE.md`](./MODEL_GUIDE.md) in the Kruz repository
-(`D:/project prototypes/Kruz/MODEL_GUIDE.md`). Read it when you need depth this file
-deliberately omits: worked examples per tool, recovery recipes for stubborn overlays,
-the ATS/job-hunting playbook, and the full error taxonomy.
+(`D:/project prototypes/Kruz/MODEL_GUIDE.md`).
+
+**Do this at the start of a Kruz task, not "if something goes wrong":** open and
+read `MODEL_GUIDE.md` before your first `page.open`. It carries what this file
+deliberately omits — worked examples per tool, recovery recipes for stubborn
+overlays, the ATS/job-hunting playbook, and the full error taxonomy. Reading it
+up front is cheaper than rediscovering a recipe mid-task.
 
 | Want | Read |
 |---|---|
-| The rules, the loop, the tool list, error codes | **this file** |
-| Worked examples, deep recipes, ATS playbook | **`MODEL_GUIDE.md`** |
+| The rules, the closed loop, the tool list, error codes | **this file** |
+| Worked examples, deep recipes, naming edge cases, ATS playbook | **`MODEL_GUIDE.md`** |
+
+**This skill is global; the model guide is local.** That is why the guide is
+referenced by path here rather than embedded: on another machine the skill still
+applies, and the guide is read when it is present. If the guide is missing, carry
+on with this file alone — it is sufficient to drive the browser correctly.
+
+Concretely, consult the guide when you are about to: pick a targeting strategy
+other than a ref, handle a cookie/consent overlay, drive a `<select>`, or run an
+ATS harvest.
 
 ## Browser interaction rules (READ FIRST)
 
