@@ -1,6 +1,6 @@
 # Build output
 dist/
-
+.gitignore
 # Dependencies
 node_modules/
 
