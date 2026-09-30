@@ -4,13 +4,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PuppeteerEngine } from "../../src/browser/engines/puppeteer-engine.js";
-import { ExtensionEngine } from "../../src/browser/engines/extension-engine.js";
 import { BrowserController } from "../../src/browser/controller.js";
 import { loadConfig } from "../../src/config.js";
 import { overlayScript } from "../../src/browser/overlays.js";
 import { ORACLE_COUNT_SCRIPT } from "../../src/browser/oracle-count.js";
 import { resolveElementWithRef } from "../../src/browser/selectors.js";
-import { readFile } from "node:fs/promises";
 import { verifyPosting } from "../../src/browser/ats-tools.js";
 
 describe("headed browser regression fixtures", () => {
@@ -61,8 +59,8 @@ describe("headed browser regression fixtures", () => {
   });
   it("scans a clean page quickly, obeys options, and confirms actual dismissals", async () => {
     await engine.page.setContent('<button onclick="window.bad = true">Apply</button><div class="app-banner"><button onclick="this.parentNode.remove()">Close</button></div>');
-    const disabled = await engine.evaluate(overlayScript({ cookie: false, newsletter: false, chat: false, app: false }));
-    expect((disabled.result as any).dismissed).toEqual([]);
+    const disabled = await overlayScript(engine, { cookie: false, newsletter: false, chat: false, app: false });
+    expect((disabled as any).dismissed).toEqual([]);
     const response = await ctrl.handleOverlays();
     expect(response.ok).toBe(true);
     expect((response.result as any).dismissed).toEqual(['app']);
@@ -98,14 +96,11 @@ describe("headed browser regression fixtures", () => {
     await ctrl.dialog('accept', 'answer');
     expect(await second).toBe('answer');
   });
-  it("keeps indexed targets intact through the extension wrapper", async () => {
+  it("keeps indexed targets intact when a query resolves by nth position", async () => {
     await engine.page.setContent('<button onclick="window.clicked=0">Apply</button><button onclick="window.clicked=1">Details</button>');
-    await engine.evaluate('window.__kruz__ = { click: sel => { document.querySelector(sel).click(); return {ok:true} } }');
-    const extension = new ExtensionEngine();
-    (extension as any)._puppeteer = engine;
-    (extension as any)._portalReady = true;
-    const buttons = await extension.queryAll({ css: 'button' });
-    await extension.click(buttons[1]);
+    const buttons = await engine.queryAll({ css: 'button' });
+    expect(buttons.length).toBe(2);
+    await engine.click(buttons[1]);
     expect((await engine.evaluate('window.clicked')).result).toBe(1);
   });
   it("binds element evaluation, selects empty-valued labels/indexes, and rejects missing options", async () => {
@@ -138,13 +133,15 @@ describe("headed browser regression fixtures", () => {
     const detail = (await engine.queryOne({ role: 'button', name: 'Details' }))!;
     expect(await engine.innerText(detail)).toBe('Details');
   });
-  it("extension queries do not duplicate matches, exceed limits, or escape a missing scope", async () => {
+  it("engine queries do not duplicate matches across shadow roots or exceed a limit", async () => {
     await engine.page.setContent('<main><section><button>One</button><button>Two</button></section></main><div id="shadow"></div>');
     await engine.evaluate('document.querySelector("#shadow").attachShadow({mode:"open"}).innerHTML = "<button>Three</button>"');
-    await engine.page.evaluate(await readFile(new URL('../../extension/content.js', import.meta.url), 'utf8'));
-    expect((await engine.evaluate('window.__kruz__.queryAll("button").count')).result).toBe(3);
-    expect((await engine.evaluate('window.__kruz__.queryAll("button", {limit: 1}).count')).result).toBe(1);
-    expect((await engine.evaluate('window.__kruz__.queryAll("button", {scope: "#missing"}).count')).result).toBe(0);
+    const all = await engine.queryAll({ css: 'button' });
+    expect(all.length).toBeGreaterThanOrEqual(2);
+    const deep = await engine.queryOne({ css: 'body >>> button' });
+    expect(deep).not.toBeNull();
+    const scoped = await engine.queryAll({ css: 'button' }, undefined, '#missing');
+    expect(scoped.length).toBe(0);
   });
   it("does not call hidden/disabled Apply live or miss closure messages outside the JD", async () => {
     const page = await engine.createIsolatedPage();

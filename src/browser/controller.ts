@@ -10,6 +10,10 @@ function normalizeUrl(u: string): string {
 import type { BrowserEngine, KruzElement } from "./engine.js";
 import type { Target, Fallback } from "../types/schema.js";
 import { resolveElement, resolveElementWithRef, tryResolveElement } from "./selectors.js";
+import { RefRegistry } from "./ref-registry.js";
+import { resolveForAction } from "./resolve.js";
+import { runMatch, specFromTarget } from "./inpage-matcher.js";
+import type { MatchDescriptor, MatchMode, MatchSpec } from "./inpage-matcher.js";
 import type { SessionManager, SessionState } from "../session/manager.js";
 import type { Observation } from "../types/observation.js";
 import { extractExperienceSignals } from "./ats-tools.js";
@@ -17,13 +21,62 @@ import { ComputerVisionClient } from "@azure/cognitiveservices-computervision";
 import { ApiKeyCredentials } from "@azure/ms-rest-js";
 
 import { bulkHarvest, type TargetCompany } from "./ats-json.js";
+import { kruzError, kruzErrorFromThrown, ErrCode, withRetry, type Subsystem } from "../errors.js";
+
+/**
+ * Diagnostic timing for an action. Metadata only: never consulted when deciding
+ * what to do next, and measured from inside the process rather than by a caller
+ * wrapping the call in a timer. Fields are omitted when not applicable.
+ */
+export interface ActionTiming {
+  total_ms?: number;
+  identity_ms?: number;
+  resolve_ms?: number;
+  action_ms?: number;
+  verify_ms?: number;
+  observe_ms?: number;
+}
 
 export interface ActionResult {
   ok: boolean;
   ref?: string;
   result?: any;
-  error?: { code: string; message: string; retryable: boolean };
+  timing?: ActionTiming;
+  error?: { code: string; message: string; retryable: boolean; subsystem?: string; help?: string; trace?: string[]; cause?: string };
   observation?: Observation;
+}
+
+/**
+ * Compact, decision-grade page state attached to mutating actions (P1-A). Deliberately
+ * small — never a full observation; just enough for the model to decide the next
+ * dependent action without a second observe round trip.
+ */
+export interface PageFeedback {
+  url: string;
+  title: string;
+  document_id?: number;
+  navigation?: "completed" | "none_observed";
+  url_changed?: boolean;
+  old_url?: string;
+  document_changed?: boolean;
+  dom_changed?: boolean;
+  focus?: string | null;
+  interactive_added?: string[];
+  appeared_text?: string[];
+  settled?: boolean;
+  page_mutated?: boolean;
+  signature?: string;
+}
+
+/**
+ * Map a control's dismissal intent back to the overlay kind it belongs to.
+ * `regionKind` (cookie / newsletter / chat / app / dialog / edge-panel) is
+ * preferred when discovery identified one, because that is what callers mean by
+ * "an overlay of type X".
+ */
+function kindOfIntent(intent: string, regionKind?: string): string {
+  if (regionKind && regionKind !== "edge-panel" && regionKind !== "dialog") return regionKind;
+  return intent === "accept" || intent === "reject" ? "cookie" : intent === "close" ? "overlay" : intent;
 }
 
 export class BrowserController {
@@ -97,9 +150,10 @@ export class BrowserController {
         url: pic.currentUrl || url,
         title: pic.title,
         _ready: pic.loaded,
-        _ready_check: "polled every 250ms up to 15s: off about:blank AND document.body innerText > 100 chars — content-based, host-agnostic (handles cross-host redirects)",
+        _ready_check: "content-based: body text > 100 chars, or a settled document (readyState != 'loading') with a title or interactive elements (P0-B thin-page fix) — polled every 250ms up to 15s",
         _waited_ms: pic.elapsedMs,
         body_length: pic.bodyLength,
+        ...(pic.thin ? { _thin_page: true } : {}),
         _timing: { listen_ms: tNav0 - t0, navigate_ms: tPoll0 - tNav0, poll_ms: tFg - tPoll0, overlay_ms: tEnd - tFg, total_ms: tEnd - t0 },
       };
       if (!pic.loaded) {
@@ -123,39 +177,75 @@ export class BrowserController {
 
   /** Poll for real rendered content after navigation — lets slow SPAs hydrate without
    *  trusting a lifecycle event. Returns the observed state + how long the poll took. */
-  private async pollForContent(engine: BrowserEngine, targetUrl: string, maxMs = 15000, intervalMs = 250): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; elapsedMs: number }> {
+  private async pollForContent(engine: BrowserEngine, targetUrl: string, maxMs = 15000, intervalMs = 250): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; thin: boolean; elapsedMs: number }> {
     const started = Date.now();
     let snap = await this.snapshotPage(engine, targetUrl);
-    if (snap.loaded) return { ...snap, elapsedMs: Date.now() - started };
+    if (snap.loaded && !snap.thin) return { ...snap, elapsedMs: Date.now() - started };
+
+    // Issue A (manual report): a React shell reported `_ready: true` with
+    // `body_length: 0` while the app was still mounting, so the very next action
+    // raced the mount and found nothing. A thin page that is STILL MUTATING is
+    // not ready — but neither should a genuinely thin, settled page (login wall,
+    // empty state) pay a long wait. So: only keep polling while the DOM is
+    // actively changing, under a short bounded window. This is event-driven
+    // (mutation counts), not a fixed sleep, and it does not touch normal pages.
+    const thinWindow = 3000;
+    let lastMut = -1;
+    let lastChangeAt = Date.now();
     for (let elapsed = 0; elapsed < maxMs; elapsed += intervalMs) {
       await engine.waitMs(intervalMs).catch(() => {});
       snap = await this.snapshotPage(engine, targetUrl);
-      if (snap.loaded) return { ...snap, elapsedMs: Date.now() - started };
+      if (snap.loaded && !snap.thin) return { ...snap, elapsedMs: Date.now() - started };
+      if (!snap.thin) return { ...snap, elapsedMs: Date.now() - started };
+      const mut = await this.mutationCount(engine);
+      const now = Date.now();
+      // No tracker means no evidence of continued mounting: without a positive
+      // signal that the page is still growing, a thin page is taken at face
+      // value. This is what keeps a settled thin page (login wall, empty state)
+      // from paying any wait at all.
+      if (mut === null) return { ...snap, elapsedMs: Date.now() - started };
+      if (mut !== lastMut) { lastMut = mut; lastChangeAt = now; }
+      // Settled thin document: nothing more is coming, so stop waiting.
+      if (now - lastChangeAt > 500) return { ...snap, elapsedMs: Date.now() - started };
+      if (now - started > thinWindow) return { ...snap, elapsedMs: Date.now() - started };
     }
     return { ...snap, elapsedMs: Date.now() - started };
   }
 
-  /** Lightweight snapshot: is there anything rendered, even if the load event never fired? */
-  private async snapshotPage(engine: BrowserEngine, targetUrl: string): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number }> {
+  /** Current DOM mutation count, or null when no tracker is installed. */
+  private async mutationCount(engine: BrowserEngine): Promise<number | null> {
+    const r = await engine.evaluate(`(() => { try { const f = (window).__p1MutationCount; return typeof f === 'function' ? f() : null; } catch (e) { return null; } })()`).catch(() => null);
+    const v = r?.ok ? (r.result as number | null) : null;
+    return typeof v === "number" ? v : null;
+  }
+
+  /** Lightweight snapshot: is there anything rendered, even if the load event never fired?
+   *  P0-B: readiness no longer requires >100 chars of body text. A settled document with a
+   *  title or usable interactive DOM counts as ready, so legitimate thin pages (login walls,
+   *  canvas apps, empty states, small utilities) never pay the full readiness poll. */
+  private async snapshotPage(engine: BrowserEngine, targetUrl: string): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; thin: boolean }> {
     try {
       const currentUrl: string = await engine.url();
-      const title: string = await engine.title().catch(() => "");
-      const bodyRes = await engine.evaluate("(() => document.body?.innerText?.trim().length ?? 0)()").catch(() => ({ ok: false as const }));
-      const bodyLength: number = bodyRes?.ok ? (bodyRes.result as number) : 0;
-      let targetHost = "";
-      try { targetHost = new URL(targetUrl).hostname.replace(/^www\./, ""); } catch { /* ignore */ }
+      // One evaluate for title/body/interactive/ready instead of three round trips.
+      const r = await engine.evaluate(`(() => {
+        const bodyLen = document.body ? (document.body.innerText || '').trim().length : 0;
+        const interactive = document.querySelectorAll('a[href],button,input,select,textarea,summary,[role],[onclick],[tabindex]').length;
+        return { bodyLen, interactive, ready: document.readyState !== 'loading', title: document.title || '' };
+      })()`).catch(() => ({ ok: false as const }));
+      const v = (r.ok ? r.result : null) as { bodyLen?: number; interactive?: number; ready?: boolean; title?: string } | null;
+      const bodyLength = v?.bodyLen ?? 0;
+      const title = v?.title ?? "";
+      const interactive = v?.interactive ?? 0;
+      const docReady = v?.ready === true;
       const isHttpBlank = !currentUrl || currentUrl === "about:blank" || currentUrl.startsWith("chrome://");
-      // Loaded = got off the blank/initial screen AND rendered real content.
-      // K31: The URL-host test is dropped as a hard gate — cross-host redirects (e.g.
-      // boards.greenhouse.io → www.greenhouse.com), retail/portal netloc changes and
-      // SPA route rewrites are common and benign, and they trip a false _ready:false even
-      // when the content is fully rendered. Real rendered content (body text > 100 chars,
-      // or a non-empty <title> once off the blank page) is the reliable readiness signal —
-      // that matches the "is the thing visibly there" check a human or agent actually wants.
-      const loaded = !isHttpBlank && bodyLength > 100;
-      return { loaded, currentUrl, title, bodyLength };
+      // Real content is the strong signal; a settled document with a title or any usable
+      // interactive control is the thin-page fallback (P0-B).
+      const meaningful = bodyLength > 100;
+      const thinButUsable = docReady && !meaningful && (title.trim().length > 0 || interactive > 0);
+      const loaded = !isHttpBlank && (meaningful || thinButUsable);
+      return { loaded, currentUrl, title, bodyLength, thin: thinButUsable };
     } catch {
-      return { loaded: false, currentUrl: "", title: "", bodyLength: 0 };
+      return { loaded: false, currentUrl: "", title: "", bodyLength: 0, thin: false };
     }
   }
 
@@ -179,65 +269,311 @@ export class BrowserController {
 
   // ═══ CLICK VARIANTS ══════════════════════════════════════════════════════
 
-  async click(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000, _strict = true, button: "left" | "right" | "middle" = "left", clickCount: 1 | 2 | 3 = 1, opts: { force?: boolean; ignoreVisibility?: boolean } = {}): Promise<ActionResult> {
+  async click(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000, _strict = true, button: "left" | "right" | "middle" = "left", clickCount: 1 | 2 | 3 = 1, opts: { force?: boolean; ignoreVisibility?: boolean; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow" } = {}): Promise<ActionResult> {
+    const t0 = Date.now();
+    let tResolved = 0;
     const e = this.engine(); if (!e) return this.noSession();
-    if (!this.hasTarget(target, fallback)) return { ok: false, error: { code: "INVALID_TARGET", message: "No target specified. Wrap ref in target object: {\"target\": {\"ref\": \"e...\"}}.", retryable: false } };
+    if (!this.hasTarget(target, fallback)) return { ok: false, error: kruzError(ErrCode.INVALID_TARGET, { subsystem: "controller", message: "No target specified. Wrap ref in target object: {\"target\": {\"ref\": \"e...\"}}.", trace: ["controller"] }).toJSON() };
 
     const forceClick = !!(opts.force || opts.ignoreVisibility);
     let resolved = false;
     try {
-      const { el } = await this.resolve(target, fallback, scope, timeoutMs, forceClick);
-      resolved = true;
-      if (_strict && !target.ref) {
-        const candidates = await e.queryAll(target, fallback, scope);
-        const visible = await Promise.all(candidates.map(candidate => e.isVisible(candidate)));
-        if (visible.filter(Boolean).length > 1) return this.err('AMBIGUOUS_TARGET', 'Multiple visible targets match; use a unique selector or ref.', false);
+      // One resolver, one meaning of "this target". The old path resolved with
+      // one matcher and then re-measured ambiguity with a second, private
+      // in-page script; that divergence is why the manual report could see a
+      // node through `page.probe` and then get TARGET_NOT_FOUND from `page.click`.
+      await this.refreshIdentity(e);
+      const r = await resolveForAction(
+        { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+        target, fallback, scope, "clickable",
+        { allowHidden: forceClick, waitMs: _strict && !target.ref ? 0 : Math.min(timeoutMs, 1200) },
+      );
+      if (!r.ok) {
+        return {
+          ok: false,
+          // Diagnostic only: a failed resolution is measured too, because that
+          // is where a latency regression would hide.
+          timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - t0, action_ms: 0 },
+          error: kruzError(r.code, { subsystem: "controller", message: r.message, retryable: r.retryable, help: r.help }).toJSON(),
+          result: r.candidates ? { count: r.candidates.length, candidates: r.candidates, resolution: r.evidence } : r.evidence,
+        };
       }
-      if (!await e.isEnabled(el)) return this.err('ELEMENT_DISABLED', 'Target is disabled.', false);
-      if (!forceClick && !await e.isVisible(el)) return this.err('ELEMENT_NOT_VISIBLE', 'Target is hidden; reveal it explicitly before clicking.', false);
-      await e.click(el, {timeoutMs, button, clickCount, force:forceClick});
+      const el = r.el;
+      resolved = true;
+      tResolved = Date.now() - t0;
+      const tDispatch = Date.now();
+      await e.click(el, {timeoutMs, button, clickCount, force:forceClick, visual: opts.visual, speed: opts.speed});
+      const tAction = Date.now() - tDispatch;
       this.bump();
+      const tVerify = Date.now();
       const dialog = await e.nextDialog();
-      if (dialog) return {ok:true,result:{dialog_pending:true,dialog}};
-      return {ok:true};
+      const timing = { total_ms: Date.now() - t0, resolve_ms: tResolved, action_ms: tAction, verify_ms: Date.now() - tVerify };
+      if (dialog) return {ok:true,timing,result:{dialog_pending:true,dialog}};
+      // The effect token lets post-click verification ask what happened to THIS
+      // element (Bug 6: a banner dismissal is a real effect even when the body
+      // text signature is unchanged).
+      return { ok: true, timing, result: { effect_token: r.token, ref: r.ref, resolution_tier: r.tier } };
     } catch (err) {
-      this.invalidateAllRefs();
-      const notFound = !resolved && String(err).includes('Element not found');
-      return this.err(notFound ? 'TARGET_NOT_FOUND' : 'CLICK_FAILED', String(err), notFound);
+      // Refs are invalidated only when the failure came AFTER resolution, i.e.
+      // dispatch may have mutated the page. A resolution failure leaves the DOM
+      // untouched, and clearing the ref map there made every other ref on the
+      // page unusable — one failed click destroyed the whole observation.
+      if (resolved) this.invalidateAllRefs();
+      const env = kruzErrorFromThrown(err);
+      const recoverable = [ErrCode.ELEMENT_OBSCURED, ErrCode.STALE_ELEMENT, ErrCode.ELEMENT_NOT_VISIBLE, ErrCode.ELEMENT_DISABLED].includes(env.code as any);
+      return this.err(env.code, env.message, recoverable, {
+        subsystem: env.subsystem,
+        help: env.help,
+      });
     }
+  }
+
+
+  // ═══ OBSERVATION / FEEDBACK (P1-A) ══════════════════════════════════════
+
+  /**
+   * Compact post-action page state. One in-page pass (no full observation), bounded
+   * payload — the model uses it to choose the next dependent action without a
+   * separate observe round trip. When `before` is supplied it also reports whether
+   * the URL/document changed since that snapshot.
+   */
+  async pageFeedback(
+    e: BrowserEngine,
+    before?: PageFeedback | null,
+    opts: { settled?: boolean; includeLists?: boolean } = {},
+  ): Promise<PageFeedback> {
+    const script = `(() => {
+      try {
+        const visible = (n) => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(n).visibility !== 'hidden'; };
+        const bodyLen = document.body ? (document.body.innerText || '').trim().length : 0;
+        const interactiveCount = document.querySelectorAll("button,a,input,select,textarea,[role=button],[role=link],[role=textbox],[role=option],[role=menuitem]").length;
+        let mutations = 0;
+        try { const f = window.__p1MutationCount; if (typeof f === 'function') mutations = f(); } catch (e) {}
+        const out = {
+          url: location.href,
+          title: document.title,
+          document_id: performance.timeOrigin,
+          focus: (document.activeElement && (document.activeElement.id || document.activeElement.getAttribute('data-testid') || document.activeElement.tagName || null)) || null,
+          signature: bodyLen + ':' + mutations + ':' + interactiveCount,
+          interactive_added: [],
+          appeared_text: [],
+        };
+        if (${opts.includeLists !== false}) {
+          out.interactive_added = Array.from(document.querySelectorAll("button,a,input,select,textarea,[role=button],[role=link],[role=textbox],[role=option],[role=menuitem]"))
+            .filter(visible)
+            .slice(0, 12)
+            .map(n => ((n.getAttribute('aria-label') || (n.textContent || '').trim()).slice(0, 60)).trim())
+            .filter(s => s.length > 0 && s.length < 60);
+          out.appeared_text = (document.body ? document.body.innerText.split('\\n').map(s => s.trim()).filter(s => s.length > 2 && s.length < 90).slice(0, 8) : []);
+        }
+        return out;
+      } catch (e) { return { url: '', title: '', document_id: 0, focus: null, signature: '', interactive_added: [], appeared_text: [] }; }
+    })()`;
+    const r = await e.evaluate(script).catch(() => ({ ok: false as const }));
+    const v = r.ok ? (r.result as any) : null;
+    const clip = (s: string, n: number) => (typeof s === "string" && s.length > n ? s.slice(0, n) + "…" : s ?? "");
+    const fb: PageFeedback & { signature?: string } = {
+      url: clip(v?.url ?? "", 300),
+      title: clip(v?.title ?? "", 200),
+      document_id: typeof v?.document_id === "number" ? Math.round(v.document_id) : undefined,
+      focus: v?.focus ?? null,
+    };
+    (fb as any).signature = v?.signature ?? "";
+    if (opts.includeLists !== false) {
+      fb.interactive_added = (v?.interactive_added ?? []).map((s: string) => clip(s, 120));
+      fb.appeared_text = (v?.appeared_text ?? []).map((s: string) => clip(s, 120));
+    }
+    if (before) {
+      fb.url_changed = !!before.url && fb.url !== before.url;
+      fb.document_changed = !!before.document_id && fb.document_id !== before.document_id;
+      // Only echo the previous URL when it actually changed — a 200-char data:/query
+      // URL duplicated on every mutate would otherwise dominate the payload.
+      if (fb.url_changed) fb.old_url = clip(before.url, 300);
+      fb.dom_changed = fb.url_changed || fb.document_changed ||
+        (fb as any).signature !== (before as any).signature ||
+        JSON.stringify({ t: fb.title, f: fb.focus }) !== JSON.stringify({ t: before.title, f: before.focus });
+      fb.navigation = (fb.url_changed || fb.document_changed) ? "completed" : "none_observed";
+      // §20C/§27: explicit mutation verdict (parity with state.dom_changed) so callers
+      // can gate on a single obvious field.
+      fb.page_mutated = fb.dom_changed;
+    }
+    if (opts.settled !== undefined) fb.settled = opts.settled;
+    return fb;
+  }
+
+  /**
+   * Candidates for a target, minted as REAL refs through the shared registry.
+   *
+   * This used to hand the model synthetic `c1..cN` labels produced inside a
+   * throwaway evaluate, which no action tool could resolve (manual report Bugs
+   * 1-3). Every candidate here is registered in the same identity system the
+   * actions read, so `page.click({ref})` on a returned candidate just works.
+   *
+   * It also runs the SAME matcher the action path uses, so a candidate that is
+   * reported here is an element a click could actually land on.
+   */
+  private async targetCandidates(
+    e: BrowserEngine,
+    target: Target,
+    fallback?: Fallback,
+    scope?: string,
+    limit = 6,
+    producer: "ambiguity" | "probe" = "ambiguity",
+  ): Promise<Array<Record<string, unknown>>> {
+    const spec = specFromTarget(target, fallback, scope);
+    if (spec.strategy === "none") return [];
+    const m = await runMatch(e, spec, 40);
+    if (m.error) return [];
+    await this.refreshIdentity(e);
+    const registry = this.refs();
+    // Actionable candidates first: for an agent, a visible+enabled element is
+    // what it can act on. Hidden matches are still reported, but honestly
+    // labelled, so "probe saw it" can never imply "you can click it".
+    const ordered = [...m.matches].sort((a, b) => Number(b.actionable) - Number(a.actionable));
+    return ordered.slice(0, limit).map((h) => {
+      const entry = registry.mint(producer, h, {
+        pageId: this.activePageId, documentId: this.docIdCache, frameId: "main",
+        spec, scope, revision: this.revisionCache,
+      });
+      return {
+        ref: entry.ref,
+        role: h.role,
+        name: h.name,
+        href: h.href ?? undefined,
+        context: h.context ?? undefined,
+        visible: h.visible,
+        enabled: h.enabled,
+        in_viewport: h.in_viewport,
+        actionable: h.actionable,
+        blocked_reason: h.blocked_reason ?? undefined,
+      };
+    });
+  }
+
+  /** Compact candidate list for an ambiguous target (P1-C), bounded. */
+  private async ambiguityCandidates(
+    e: BrowserEngine,
+    target: Target,
+    fallback?: Fallback,
+    scope?: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    return this.targetCandidates(e, target, fallback, scope, 6, "ambiguity");
+  }
+
+  /**
+   * page.probe — "what matches the CURRENT DOM right now?".
+   *
+   * Never waits (spec 26). Reports count, actionable_count, and per-candidate
+   * actionability, so the model can tell matched-but-hidden apart from
+   * actionable, and every candidate carries a usable ref.
+   */
+  async probeTarget(e: BrowserEngine, target: Target, fallback?: Fallback, scope?: string): Promise<{
+    count: number; actionable_count: number; strategy: string; candidates: Array<Record<string, unknown>>;
+    _timing?: { probe_ms: number }; error?: string;
+  }> {
+    const spec = specFromTarget(target, fallback, scope);
+    if (spec.strategy === "none") {
+      return { count: 0, actionable_count: 0, strategy: "none", candidates: [] };
+    }
+    const started = Date.now();
+    const m = await runMatch(e, spec, 40);
+    const candidates = await this.targetCandidates(e, target, fallback, scope, 8, "probe");
+    return {
+      count: m.count,
+      actionable_count: m.actionable_count,
+      strategy: spec.strategy ?? "none",
+      candidates,
+      // Never hide a matcher failure behind a bare 0: "nothing matched" and
+      // "the check itself failed" are different answers, and conflating them is
+      // how a page gets misdiagnosed as empty.
+      ...(m.error ? { error: m.error } : {}),
+      _timing: { probe_ms: Date.now() - started },
+    };
   }
 
   // ═══ KEYBOARD & TEXT ═════════════════════════════════════════════════════
 
   async type(target: Target, text: string, fallback?: Fallback, scope?: string, delayMs?: number, clear = false, timeoutMs = 5000): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
-    try {
+    // Recovery ladder, executed by the shared retry policy: on a resolution or
+    // actionability failure, re-observe (SPA churn invalidates refs) and retry the
+    // value write directly, which is the path that survives React controlled
+    // inputs that ignore synthesised key events.
+    const reobserve = async (): Promise<boolean> => {
+      const s = this.getActiveSession();
+      if (!s?.engine) return false;
+      await s.observer.observe(s.engine, scope, "minimal", true);
+      return true;
+    };
+    const writeDirectly = async (): Promise<boolean> => {
+      // Escalation grace, not a second full budget: an impossible target must not
+      // pay timeout_ms once per escalation (measured 3x = 15s at the default).
+      const grace = Math.min(timeoutMs, 800);
+      const { el } = await this.resolve(target, fallback, scope, grace);
+      await e.waitForSelector(el.target, { state: "visible", timeoutMs: grace });
+      await e.fill(el, text, { timeoutMs });
+      return true;
+    };
+
+    const attempt = async (): Promise<ActionResult> => {
       const { el } = await this.resolve(target, fallback, scope, timeoutMs);
       await e.waitForSelector(el.target, { state: "visible", timeoutMs });
       await e.fill(el, "", { timeoutMs }).catch(() => {});
       await e.type(el, text, { delayMs, clear, timeoutMs });
-      // Verify the value actually registered (React/ATS controlled inputs sometimes
-      // ignore key events). If not, fall back to fill() which sets value directly.
+      // Verify the value actually registered (React/ATS controlled inputs
+      // sometimes ignore key events). If not, fall back to fill() directly.
       try {
         const got = await e.inputValue(el).catch(() => "");
         if (got !== text) { await e.fill(el, text, { timeoutMs }); }
       } catch { /* non-input element; skip verification */ }
       this.bump();
       return { ok: true };
+    };
+
+    try {
+      return await withRetry(attempt, {
+        retryOn: [ErrCode.TARGET_NOT_FOUND, ErrCode.ELEMENT_NOT_FOUND, ErrCode.STALE_ELEMENT, ErrCode.ELEMENT_NOT_VISIBLE],
+        escalations: [{ name: "re-observe", run: reobserve }, { name: "direct-fill", run: writeDirectly }],
+      });
     } catch (err) {
-      if (target.ref || target.role || target.name || target.text) { try { const s = this.getActiveSession(); if (s?.engine) { await s.observer.observe(this.engine() as any, scope, "minimal", true); const { el } = await this.resolve(target, fallback, scope, timeoutMs); await e.waitForSelector(el.target, { state: "visible", timeoutMs }); await e.fill(el, text, { timeoutMs }); this.bump(); return { ok: true }; } } catch { /* fall through */ } }
-      return this.err("page.type", `Type failed for ${this.desc(target)}: ${err}`, true);
+      const env = kruzErrorFromThrown(err, { subsystem: "controller" });
+      return this.err(env.code, `Type failed for ${this.desc(target)}: ${env.message}`, env.retryable, { subsystem: env.subsystem, help: env.help });
     }
   }
 
   async fill(target: Target, value: string, fallback?: Fallback, scope?: string, timeoutMs = 5000, opts: { force?: boolean; ignoreVisibility?: boolean } = {}): Promise<ActionResult> {
+    const t0 = Date.now();
     const e = this.engine(); if (!e) return this.noSession();
 
     // BUG-G2 fix: Support force/ignoreVisibility for hidden inputs
     const forceFill = opts.force || opts.ignoreVisibility;
 
     try {
-      let { el } = await this.resolve(target, fallback, scope, timeoutMs, forceFill);
+      await this.refreshIdentity(e);
+      // `fillable` mode: the resolver itself now distinguishes "no match" from
+      // "matched but not an input", so a probe ref for a textbox and a click ref
+      // for a button are resolved by the same code with a different bar.
+      const r = await resolveForAction(
+        { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+        target, fallback, scope, "fillable",
+        { allowHidden: forceFill, waitMs: Math.min(timeoutMs, 1500) },
+      );
+      if (!r.ok) {
+        return {
+          ok: false,
+          timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - t0, action_ms: 0 },
+          error: kruzError(r.code, {
+            subsystem: "controller",
+            message: `Fill failed for ${this.desc(target)}: ${r.message}`,
+            retryable: r.retryable,
+            help: r.help,
+          }).toJSON(),
+          result: r.candidates ? { count: r.candidates.length, candidates: r.candidates } : r.evidence,
+        };
+      }
+      const tResolved = Date.now() - t0;
+      this.lastResolveTiming = { resolve_ms: tResolved };
+      let el = r.el;
 
       // BUG-G2: Try to reveal hidden elements before filling
       if (!forceFill) {
@@ -262,37 +598,122 @@ export class BrowserController {
       let editable = editableRes?.ok ? !!editableRes.result : false;
       if (!editable) {
         // Twin-element recovery (spotted live in Canva): frameworks render an
-        // editable field plus a readonly mirror twin; queryOne may return the
-        // wrong twin while the editable sibling sits next to it. Scan the
+        // editable field plus a readonly mirror twin; the resolver may land on
+        // the wrong twin while the editable sibling sits next to it. Scan the
         // sibling matches for the first actually-editable one before failing.
         try {
           const cands = await e.queryAll(target, fallback, scope);
           for (const cand of cands.slice(0, 5)) {
-            const r = await e.evaluateOn(cand, "(() => { const n = this; if (n instanceof HTMLInputElement) return n.type !== 'hidden' && !n.disabled && !n.readOnly; if (n instanceof HTMLTextAreaElement) return !n.disabled && !n.readOnly; return !!n.isContentEditable; })()").catch(() => ({ ok: false as const }));
-            if (r?.ok && !!r.result) { el = cand; editable = true; break; }
+            const r2 = await e.evaluateOn(cand, "(() => { const n = this; if (n instanceof HTMLInputElement) return n.type !== 'hidden' && !n.disabled && !n.readOnly; if (n instanceof HTMLTextAreaElement) return !n.disabled && !n.readOnly; return !!n.isContentEditable; })()").catch(() => ({ ok: false as const }));
+            if (r2?.ok && !!r2.result) { el = cand; editable = true; break; }
           }
         } catch { /* keep original element, fail below */ }
       }
       if (!editable) {
-        return this.err("page.fill", `Fill failed for ${this.desc(target)}: target resolved to a non-editable element (hidden/disabled/containers are not fillable). Try a target that resolves to an <input>, <textarea>, or [contenteditable].`, false);
+        return this.err(ErrCode.ELEMENT_NOT_EDITABLE, `Fill failed for ${this.desc(target)}: target resolved to a non-editable element (hidden/disabled/containers are not fillable). Try a target that resolves to an <input>, <textarea>, or [contenteditable].`, false, { subsystem: "controller" });
       }
       await e.fill(el, value, { timeoutMs, force: forceFill });
       this.bump();
-      return { ok: true };
+      return { ok: true, timing: { total_ms: Date.now() - t0, resolve_ms: tResolved, action_ms: Date.now() - t0 - tResolved }, result: { ref: r.ref, effect_token: r.token } };
     } catch (err) {
-      if (target.ref || target.role || target.name || target.text) { try { const s = this.getActiveSession(); if (s?.engine) { await s.observer.observe(this.engine() as any, scope, "minimal", true); const { el } = await this.resolve(target, fallback, scope, timeoutMs, forceFill); const editableRes = await e.evaluateOn(el, "(() => (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable))()").catch(() => ({ ok: false as const })); const editable = editableRes?.ok ? !!editableRes.result : false; if (!editable) return this.err("page.fill", `Fill failed for ${this.desc(target)}: target is not an editable input.`, false); await e.fill(el, value, { timeoutMs, force: forceFill }); this.bump(); return { ok: true }; } } catch { /* fall through */ } }
-      return this.err("page.fill", `Fill failed for ${this.desc(target)}: ${err}`, true);
+      // Recovery ladder via the shared retry policy: re-observe to refresh refs
+      // (SPA churn), then re-resolve and write. A non-editable target is terminal
+      // and must NOT be retried into a wrong-element write.
+      const reobserve = async (): Promise<boolean> => {
+        const s = this.getActiveSession();
+        if (!s?.engine) return false;
+        await s.observer.observe(s.engine, scope, "minimal", true);
+        // Escalation budget: re-observe already refreshed refs, so the element is
+        // either there now or it isn't. Re-spending the caller's full budget here
+        // made an impossible target cost 2x timeout_ms (10s at the default).
+        await this.refreshIdentity(e);
+        const again = await resolveForAction(
+          { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+          target, fallback, scope, "fillable", { allowHidden: forceFill, waitMs: Math.min(timeoutMs, 800) },
+        );
+        if (!again.ok) return false;
+        const editable2 = await e.evaluateOn(again.el, "(() => (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable))()").catch(() => ({ ok: false as const }));
+        if (!(editable2?.ok && !!editable2.result)) return false;
+        await e.fill(again.el, value, { timeoutMs, force: forceFill });
+        this.bump();
+        return true;
+      };
+      try {
+        return await withRetry(async () => { throw err; }, {
+          retryOn: [ErrCode.TARGET_NOT_FOUND, ErrCode.ELEMENT_NOT_FOUND, ErrCode.STALE_ELEMENT, ErrCode.ELEMENT_NOT_VISIBLE, ErrCode.STALE_REFERENCE, ErrCode.DOCUMENT_CHANGED],
+          escalations: [{ name: "re-observe-and-fill", run: reobserve }],
+        });
+      } catch (final) {
+        const env = kruzErrorFromThrown(final, { subsystem: "controller" });
+        return this.err(env.code, `Fill failed for ${this.desc(target)}: ${env.message}`, env.retryable, { subsystem: env.subsystem, help: env.help });
+      }
     }
   }
+
 
   async press(key: string, target?: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
     try {
-      if (target) { const { el } = await this.resolve(target, fallback, scope, timeoutMs); await e.press(el, key, { timeoutMs }); }
+      // P1-A correction: an Enter that submits a form (or activates a link) commits
+      // its navigation asynchronously. Capturing feedback the instant the key lands
+      // reports url_changed=false for a navigation that really is happening — which
+      // teaches the model the key "did nothing". Gate on HTML implicit-submission
+      // semantics so Enters that CANNOT navigate (textarea newline, non-submittable
+      // form, plain typing) pay zero cost, then wait only until the URL actually moves.
+      let grace = false;
+      let graceFrom = "";
+      let resolved: { el: KruzElement } | undefined;
+      if (target) resolved = await this.resolve(target, fallback, scope, timeoutMs);
+      if (/enter/i.test(key)) {
+        grace = resolved ? await this.enterCanNavigate(e, resolved.el) : await this.enterCanNavigate(e);
+        if (grace) graceFrom = await e.evaluate("location.href").then(r => (r.ok ? String(r.result) : "")).catch(() => "");
+      }
+      if (resolved) await e.press(resolved.el, key, { timeoutMs });
       else await e.keyboardPress(key);
       this.bump();
+      if (grace && graceFrom) await this.awaitUrlChange(e, graceFrom, 1000);
       return { ok: true };
-    } catch (err) { return this.err("page.press", `Press failed for "${key}": ${err}`, true); }
+    } catch (err) { return this.actionErr(`Press "${key}"`, err); }
+  }
+
+  /**
+   * True when an Enter on this element can navigate, per HTML implicit submission:
+   * link activation, submit-button activation, Enter in a text field of a form that
+   * has a submit button, or the single-field no-button case. TEXTAREA (newline) and
+   * non-submittable forms return false so they never pay the effect-grace window.
+   */
+  private async enterCanNavigate(e: BrowserEngine, on?: KruzElement): Promise<boolean> {
+    const js = `(() => { try {
+      const ae = ${on ? "this" : "document.activeElement"};
+      if (!ae) return false;
+      if (ae.tagName === 'A' && ae.hasAttribute('href')) return true;
+      if (ae.tagName !== 'INPUT' && ae.tagName !== 'BUTTON') return false;
+      const type = (ae.type || '').toLowerCase();
+      if (ae.tagName === 'INPUT' && ['hidden','checkbox','radio','file','reset','button','image','range','color'].includes(type)) return false;
+      const form = ae.form || (ae.closest && ae.closest('form'));
+      if (!form) return false;
+      if (ae.tagName === 'BUTTON' || type === 'submit' || type === 'image') return true;
+      const hasSubmit = !!form.querySelector('input[type=submit], input[type=image], button[type=submit], button:not([type])');
+      if (hasSubmit) return true;
+      const fields = Array.from(form.querySelectorAll('input, textarea, select')).filter(el => { const t = ((el as any).type || '').toLowerCase(); return t !== 'hidden' && !(el as any).disabled; });
+      return fields.length === 1;
+    } catch { return false; } })()`;
+    if (on) { const r = await e.evaluateOn(on, js).catch(() => null); return (r as any)?.result === true; }
+    const r = await e.evaluate(js).catch(() => null);
+    return (r as any)?.result === true;
+  }
+
+  /** Poll until the document URL leaves `initial` (or the cap expires). Best-effort. */
+  private async awaitUrlChange(e: BrowserEngine, initial: string, capMs: number): Promise<void> {
+    const deadline = Date.now() + capMs;
+    while (Date.now() < deadline) {
+      const r = await e.evaluate("location.href").catch(() => null);
+      const href = r && (r as any).ok ? String((r as any).result) : null;
+      // A throwing evaluate during teardown still means a navigation is underway —
+      // keep polling; the new document will answer with the committed URL.
+      if (href && href !== initial) return;
+      await e.waitMs(40);
+    }
   }
 
   async pressSequence(keys: string, delayMs = 50): Promise<ActionResult> {
@@ -304,7 +725,7 @@ export class BrowserController {
       }
       this.bump();
       return { ok: true };
-    } catch (err) { return this.err("page.pressSequence", `Key sequence failed: ${err}`, true); }
+    } catch (err) { return this.actionErr("Key sequence", err); }
   }
 
   // ═══ FORM ═══════════════════════════════════════════════════════════════
@@ -326,7 +747,7 @@ export class BrowserController {
       if (options.value !== undefined) await e.selectOption(el, options.value);
       else if (options.label !== undefined) await e.selectOption(el, options.label);
       else if (options.index !== undefined) {
-        const picked = await e.evaluateOn(el, `(() => { const s = this; if (!(s instanceof HTMLSelectElement)) return null; const o = s.options[${options.index}]; if (!o || o.disabled) return null; s.selectedIndex = ${options.index}; s.dispatchEvent(new Event("input", { bubbles: true })); s.dispatchEvent(new Event("change", { bubbles: true })); return s.selectedIndex === ${options.index}; })()`).catch(() => ({ ok: false as const }));
+        const picked = await e.evaluateOn(el, `(() => { const s = this; if (!(s instanceof HTMLSelectElement)) return null; const w = window; w.__kruzAutomationBypass = true; try { const o = s.options[${options.index}]; if (!o || o.disabled) return null; s.selectedIndex = ${options.index}; s.dispatchEvent(new Event("input", { bubbles: true })); s.dispatchEvent(new Event("change", { bubbles: true })); return s.selectedIndex === ${options.index}; } finally { w.__kruzAutomationBypass = false; } })()`).catch(() => ({ ok: false as const }));
         if (!picked?.ok || !(picked.result)) throw new Error(`Option index ${options.index} not found`);
       }
       return true;
@@ -382,33 +803,39 @@ export class BrowserController {
     };
 
     try {
-      const { el } = await this.resolve(target, fallback, scope, timeoutMs);
-      if (await applyNative(el)) { this.bump(); return { ok: true }; }
+      const sel = await this.unified(target, fallback, scope, "clickable", timeoutMs);
+      if (!sel.ok) return sel.result;
+      const el = sel.el;
+      if (await applyNative(el)) { this.bump(); return { ok: true, result: { ref: sel.ref } }; }
       if (await applySpa(el)) return { ok: true, result: { method: "spa-option-click" } };
       const tagRes = await e.tagName(el).catch(() => "");
-      return this.err("page.select", `Select failed: target resolved to ${tagRes}; no matching visible option or radio/check menu item was found.`, true);
+      return this.actionErr("Select", `target resolved to ${tagRes}; no matching visible option or radio/check menu item was found.`);
     } catch (err) {
-      return this.err("page.select", `Select failed: ${err}`, true);
+      return this.actionErr("Select", err);
     }
   }
 
   async check(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
     try {
-      const { el } = await this.resolve(target, fallback, scope, timeoutMs);
-      await e.check(el, { timeoutMs });
+      // Same resolver as click/fill: a probe ref for a checkbox is actionable here.
+      const r = await this.unified(target, fallback, scope, "clickable", timeoutMs);
+      if (!r.ok) return r.result;
+      await e.check(r.el, { timeoutMs });
       this.bump();
-      return { ok: true };
+      return { ok: true, result: { ref: r.ref } };
     } catch (err) {
-      if (target.ref || target.role || target.name || target.text) { try { const s = this.getActiveSession(); if (s?.engine) { await s.observer.observe(this.engine() as any, scope, "minimal", true); const { el } = await this.resolve(target, fallback, scope, timeoutMs); await e.check(el, { timeoutMs }); this.bump(); return { ok: true }; } } catch { /* fall through */ } }
-      return this.err("page.check", `Check failed: ${err}. Tip: if this is a custom SPA checkbox (not <input type=checkbox>), try page_click instead.`, true);
+      if (target.ref || target.role || target.name || target.text) { try { const s = this.getActiveSession(); if (s?.engine) { await s.observer.observe(this.engine() as any, scope, "minimal", true); const r = await this.unified(target, fallback, scope, "clickable", timeoutMs); if (r.ok) { await e.check(r.el, { timeoutMs }); this.bump(); return { ok: true, result: { ref: r.ref } }; } } } catch { /* fall through */ } }
+      return this.actionErr("Check", err, "Tip: if this is a custom SPA checkbox (not <input type=checkbox>), try page_click instead.");
     }
   }
 
   async uncheck(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
     try {
-      const { el } = await this.resolve(target, fallback, scope, timeoutMs);
+      const un = await this.unified(target, fallback, scope, "clickable", timeoutMs);
+      if (!un.ok) return un.result;
+      const el = un.el;
       // Try native uncheck first; if it fails (non-native checkbox like custom SPAs),
       // fall back to click + visual toggle detection.
       try {
@@ -434,7 +861,7 @@ export class BrowserController {
       return { ok: true };
     } catch (err) {
       if (target.ref || target.role || target.name || target.text) { try { const s = this.getActiveSession(); if (s?.engine) { await s.observer.observe(this.engine() as any, scope, "minimal", true); const { el } = await this.resolve(target, fallback, scope, timeoutMs); await e.uncheck(el, { timeoutMs }); this.bump(); return { ok: true }; } } catch { /* fall through */ } }
-      return this.err("page.uncheck", `Uncheck failed: ${err}. Tip: if this is a custom SPA checkbox (not <input type=checkbox>), try page_click instead.`, true);
+      return this.actionErr("Uncheck", err, "Tip: if this is a custom SPA checkbox (not <input type=checkbox>), try page_click instead.");
     }
   }
 
@@ -485,6 +912,7 @@ export class BrowserController {
   // ═══ SCROLL ═════════════════════════════════════════════════════════════
 
   async scroll(direction: "up" | "down" | "left" | "right" = "down", amount?: number, target?: Target, fallback?: Fallback): Promise<ActionResult> {
+    const t0 = Date.now();
     const e = this.engine(); if (!e) return this.noSession();
     try {
       const amt = amount ?? 500;
@@ -492,13 +920,17 @@ export class BrowserController {
         // Scroll the target's container (itself or nearest scrollable ancestor),
         // not just into view — portal result lists live in inner scroll panes
         // where window scrolling and scroll-into-view do nothing.
-        const el = await e.queryOne(target, fallback);
-        if (!el) return this.err("page.scroll", `Scroll target not found: ${this.desc(target)}`, true);
-        await e.scrollElement(el, direction, amt);
-      } else {
-        await e.scrollPage(direction, amt);
+        // "query" mode: a scroll target must merely exist, not be clickable, so a
+        // probe ref for an off-screen element works here exactly as it does for a
+        // click that will scroll to it.
+        const sc = await this.unified(target, fallback, undefined, "query", 5000, true);
+        if (!sc.ok) return sc.result;
+        const tResolved = Date.now() - t0;
+        await e.scrollElement(sc.el, direction, amt);
+        return { ok: true, timing: { total_ms: Date.now() - t0, resolve_ms: tResolved, action_ms: Date.now() - t0 - tResolved } };
       }
-      return { ok: true };
+      await e.scrollPage(direction, amt);
+      return { ok: true, timing: { total_ms: Date.now() - t0, action_ms: Date.now() - t0 } };
     } catch (err) { return this.err("page.scroll", `Scroll failed: ${err}`, true); }
   }
 
@@ -643,12 +1075,29 @@ export class BrowserController {
           await e.waitForLoadState(effectiveCondition as any, effectiveTimeout); break;
         case "content": {
           // K30: poll-for-real-content — repeatedly evaluate a JS predicate in-page every
-          // `intervalMs` until truthy or timeout. This is WHAT OUGHT TO BE DEFAULT because it
-          // checks the actual rendered thing ("is the result list visible") instead of a
-          // lifecycle proxy. Predicate runs in a try so a transient missing element can't throw.
+          // `intervalMs` until truthy or timeout.
+          // P0-A: settled-aware. If the predicate stays false while the page has stopped
+          // mutating (document interactive + no DOM mutations for the settle window), fail
+          // EARLY instead of burning the full budget — the page is not transitioning toward
+          // the requested state. The hard timeout is now the last resort, not the norm.
           const js = predicate || "document.body?.innerText?.trim().length > 10";
-          const reached = await e.waitFor(js, timeoutMs, intervalMs);
-          if (!reached) throw new Error(`Content predicate not satisfied within ${timeoutMs}ms: ${js}`);
+          const r = await e.waitForSettled(js, { timeoutMs, intervalMs, settleMs: 700, minWaitMs: 1500 });
+          if (!r.met) {
+            if (r.settled) {
+              return {
+                ok: false,
+                error: kruzError(ErrCode.CONDITION_NOT_MET, {
+                  subsystem: "controller",
+                  retryable: false,
+                  message: `Content predicate not met after ${r.elapsedMs}ms and the page has settled (no DOM mutations for 700ms): ${js}`,
+                  help: "The page is not transitioning toward this condition. Re-observe what IS present, or use page.probe to check the current DOM. Do not re-wait for the same predicate.",
+                  trace: ["controller"],
+                }).toJSON(),
+                result: { attempts: r.attempts, elapsed_ms: r.elapsedMs, settled: true },
+              };
+            }
+            throw new Error(`Content predicate not satisfied within ${timeoutMs}ms: ${js}`);
+          }
           break;
         }
         case "element": {
@@ -837,12 +1286,12 @@ export class BrowserController {
     const e = this.engine(); if (!e) return this.noSession();
     try {
       const frame = await this.getFrame(e, frameName, frameUrl);
-      if (!frame) return this.err("page.frameEvaluate", "No matching frame found", true);
+      if (!frame) return this.err(ErrCode.TARGET_NOT_FOUND, "No matching frame found. Call page.observe to list frames, then pass frame_name or frame_url.", true, { subsystem: "engine" });
       const r = await e.evaluateInFrame(frame.id, expression);
       this.bump();
       return { ok: true, result: { value: r.ok ? r.result : undefined, frame: { name: frame.name, url: frame.url } } };
     } catch (err) {
-      return this.err("page.frameEvaluate", `Frame evaluate failed: ${err}`, true);
+      return this.actionErr("Frame evaluate", err);
     }
   }
 
@@ -853,14 +1302,14 @@ export class BrowserController {
     const e = this.engine(); if (!e) return this.noSession();
     try {
       const frame = await this.getFrame(e, frameName, frameUrl);
-      if (!frame) return this.err("page.frameExtractLinks", "No matching frame found", true);
+      if (!frame) return this.err(ErrCode.TARGET_NOT_FOUND, "No matching frame found. Call page.observe to list frames, then pass frame_name or frame_url.", true, { subsystem: "engine" });
       const filterJson = JSON.stringify(filter || "");
       const r = await e.evaluateInFrame(frame.id, `(() => { const filt = ${filterJson}; const anchors = Array.from(document.querySelectorAll('a[href]')); return anchors.filter(a => !filt || (a.getAttribute('href') || '').includes(filt)).map(a => ({ text: (a.textContent || '').trim().split('\\n')[0].substring(0, 200), href: a.getAttribute('href') || '', visible: a.offsetParent !== null })); })()`);
       const links = r.ok && Array.isArray(r.result) ? (r.result as any[]) : [];
       this.bump();
       return { ok: true, result: { links, count: links.length, frame: { name: frame.name, url: frame.url } } };
     } catch (err) {
-      return this.err("page.frameExtractLinks", `Frame extract links failed: ${err}`, true);
+      return this.actionErr("Frame extract links", err);
     }
   }
 
@@ -871,13 +1320,13 @@ export class BrowserController {
     const e = this.engine(); if (!e) return this.noSession();
     try {
       const frame = await this.getFrame(e, frameName, frameUrl);
-      if (!frame) return this.err("page.frameObserve", "No matching frame found", true);
+      if (!frame) return this.err(ErrCode.TARGET_NOT_FOUND, "No matching frame found. Call page.observe to list frames, then pass frame_name or frame_url.", true, { subsystem: "engine" });
       const r = await e.evaluateInFrame(frame.id, `(() => { const els = Array.from(document.querySelectorAll('a, button, input, select, textarea, [role], h1, h2, h3')); return els.slice(0, 80).map(el => ({ tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', text: (el.textContent || '').trim().substring(0, 120), href: el.href || '', type: el.type || '', name: el.getAttribute('name') || '', visible: el.offsetParent !== null })); })()`);
       const data = r.ok && Array.isArray(r.result) ? (r.result as any[]) : [];
       this.bump();
       return { ok: true, result: { elements: data, count: data.length, frame: { name: frame.name, url: frame.url } } };
     } catch (err) {
-      return this.err("page.frameObserve", `Frame observe failed: ${err}`, true);
+      return this.actionErr("Frame observe", err);
     }
   }
 
@@ -897,7 +1346,11 @@ export class BrowserController {
 
   async clickAt(x: number, y: number, button: "left" | "right" | "middle" = "left"): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
-    try { await e.mouseClick(x, y, { button }); return { ok: true }; }
+    try {
+      await (e as any).rememberCursor?.({ x, y });
+      await e.mouseClick(x, y, { button });
+      return { ok: true };
+    }
     catch (err) { return this.err("page.clickAt", `Click at (${x},${y}) failed: ${err}`, true); }
   }
 
@@ -1000,68 +1453,201 @@ export class BrowserController {
     }
   }
 
-  /** Explicit bounded overlay dismissal; reports confirmed state. */
-  async handleOverlays(opts: { close_cookie_banner?: boolean; close_newsletter_popup?: boolean; close_chat_widget?: boolean; close_app_prompt?: boolean; handle_js_alerts?: boolean } = {}): Promise<ActionResult> {
+  /**
+   * Explicit bounded overlay dismissal with coherent, evidence-backed reporting.
+   *
+   * Rewritten after the manual report found the old scanner structurally blind:
+   * it recognised a banner only by class/id tokens and a fixed English label
+   * regex, so a page whose consent banner never says "cookie" in a class name
+   * produced "no safe dismiss control" 9 times, "still visible after dismissal"
+   * 6 times and "scan budget reached" 6 times — three contradictory stories in a
+   * single response, with no candidates to pivot to.
+   *
+   * Now:
+   *   - discovery is SEMANTIC and shares the observer's notion of an element
+   *   - the strategy escalates; it never re-runs a failed one
+   *   - a dismissal counts only when the control or its overlay root actually
+   *     disappears (so no follow-up `page.probe` is needed)
+   *   - a failure returns the candidates it DID find, with real refs
+   */
+  async handleOverlays(opts: {
+    close_cookie_banner?: boolean;
+    close_newsletter_popup?: boolean;
+    close_chat_widget?: boolean;
+    close_app_prompt?: boolean;
+    handle_js_alerts?: boolean;
+    /** Optional hint: restrict discovery to a region (e.g. a container selector). */
+    scope?: string;
+    /** Optional hint: the exact control the model already knows about. */
+    target?: Target;
+  } = {}): Promise<ActionResult> {
     const e = this.engine();
     if (!e) return this.noSession();
 
-    const closeConfig = {
-      cookie: opts.close_cookie_banner !== false,
-      newsletter: opts.close_newsletter_popup !== false,
-      chat: opts.close_chat_widget !== false,
-      app: opts.close_app_prompt !== false,
-      alerts: opts.handle_js_alerts !== false,
-    };
+    const kinds: string[] = [];
+    if (opts.close_cookie_banner !== false) kinds.push("cookie");
+    if (opts.close_newsletter_popup !== false) kinds.push("newsletter");
+    if (opts.close_chat_widget !== false) kinds.push("chat");
+    if (opts.close_app_prompt !== false) kinds.push("app");
+    if (kinds.length === 0) kinds.push("cookie");
 
+    const started = Date.now();
     try {
-      const { overlayScript } = await import("./overlays.js");
-      const dialogs: string[] = [];
-      if (closeConfig.alerts) {
+      const { discoverOverlays, dismissViaControl } = await import("./overlays.js");
+      const dismissed: string[] = [];
+      const dismissedControls: string[] = [];
+      const failed: string[] = [];
+      const attempts: Array<{ strategy: string; control: string; intent: string; outcome: string; note?: string }> = [];
+      let candidates: Array<Record<string, unknown>> = [];
+      let terminalReason: string | null = null;
+      let region: string | null = null;
+
+      if (opts.handle_js_alerts !== false) {
         const pending = await e.nextDialog();
         if (pending) {
           await e.handleDialog("dismiss");
-          dialogs.push(`JS dialog dismissed: ${pending.message}`);
+          dismissed.unshift(`JS dialog dismissed: ${pending.message}`);
         }
       }
-      const scan = await e.evaluate(overlayScript(closeConfig));
-      if (!scan.ok || !scan.result) return this.err("page.handleOverlays", scan.error || "Overlay scan failed", false);
-      const result = scan.result as { dismissed: string[]; failed: string[]; summary: string };
-      result.dismissed.unshift(...dialogs);
-      result.summary = `Dismissed ${result.dismissed.length} overlays, ${result.failed.length} unresolved`;
-      return { ok: result.failed.length === 0, result };
+
+      // An explicit hint is an escalation, not a replacement: it only runs when
+      // automatic discovery came up empty or could not close anything.
+      const hinted: string[] = [];
+      if (opts.target) {
+        const r = await this.unified(opts.target, undefined, opts.scope, "clickable", 1200, true);
+        if (r.ok) {
+          const label = opts.target.name || opts.target.text || opts.target.css || opts.target.role || "hinted control";
+          const out = await dismissViaControl(e, label, "close", "hint");
+          attempts.push(...out.attempts);
+          if (out.dismissed) { dismissed.push("hint"); dismissedControls.push(label); }
+          else failed.push(label);
+        }
+      } else {
+        const discovery = await discoverOverlays(e, kinds);
+        region = discovery.region;
+        candidates = discovery.candidates as unknown as Array<Record<string, unknown>>;
+        const clearedRegions = new Set<string>();
+
+        // Bounded escalation. Each candidate is a DIFFERENT control, so a failure
+        // escalates to new information rather than repeating a strategy that
+        // already failed. A control that has vanished means its region is already
+        // gone, which closes that region out.
+        const usable = candidates.filter((c) => (c as any).actionable !== false).slice(0, 6);
+        for (let i = 0; i < usable.length; i++) {
+          const c = usable[i];
+          const label = String(c.label ?? c.name ?? "");
+          if (!label) continue;
+          const out = await dismissViaControl(e, label, (c.intent as any) ?? "close", region, i);
+          attempts.push(...out.attempts);
+          if (out.dismissed) {
+            // Report the overlay KIND (the stable contract consumers rely on) and
+            // keep the control label alongside it, so the result is both
+            // compatible and more useful.
+            const kind = kindOfIntent((c.intent as any) ?? "close", (c as any).region_kind);
+            if (!dismissed.includes(kind)) dismissed.push(kind);
+            dismissedControls.push(label);
+            clearedRegions.add(String((c as any).container ?? kind));
+            continue;
+          }
+          if (attempts[attempts.length - 1]?.outcome === "control_not_found") {
+            clearedRegions.add(String((c as any).container ?? ""));
+          }
+          // A control that was clicked and did not dismiss anything is NOT pushed
+          // here: the region-level accounting below reports every region still
+          // standing, exactly once, so the counts cannot contradict each other.
+        }
+
+        // One failure entry per overlay region that is still present, whether or
+        // not it exposed a usable control. Keeping the old per-region accounting
+        // makes "0 dismissed, N unresolved" mean something.
+        for (const r of discovery.regions) {
+          if (!clearedRegions.has(r.label) && r.label) failed.push(r.label || r.kind);
+        }
+
+        if (dismissed.length === 0 && candidates.length === 0) {
+          terminalReason = discovery.detected
+            ? "An overlay region was detected but none of its controls has a safe, recognisable dismissal intent (reject / close / dismiss / manage preferences). Nothing was clicked."
+            : "No cookie, consent, newsletter, chat or app overlay is present in the current DOM. Nothing was clicked.";
+        } else if (dismissed.length === 0) {
+          terminalReason = `Found ${candidates.length} overlay control(s) but none of the ${attempts.length} attempted click(s) removed the control or its overlay region.`;
+        }
+      }
+
+      const discoveryMs = attempts.length ? 0 : 0;
+      const summary = `Dismissed ${dismissed.length} overlay(s), ${failed.length} unresolved`;
+      return {
+        ok: dismissed.length > 0 || (failed.length === 0 && candidates.length === 0),
+        result: {
+          dismissed,
+          dismissed_controls: dismissedControls,
+          failed,
+          summary,
+          detected_overlay: region !== null || candidates.length > 0,
+          attempts,
+          candidates,
+          terminal_reason: terminalReason,
+          region,
+          discovery_attempts: attempts.length,
+          timing: { discovery_ms: discoveryMs, dismissal_ms: Date.now() - started, total_ms: Date.now() - started },
+        },
+      };
     } catch (err) {
       return this.err("page.handleOverlays", `Overlay handling failed: ${err}`, false);
     }
   }
 
+
   /**
    * Enhanced pagination handler specifically for job portals and search results.
    * Handles both infinite scroll and traditional pagination patterns.
    */
-  async paginate(opts: { max_pages?: number; wait_ms?: number; load_more_selector?: string; next_selector?: string; infinite_scroll?: boolean } = {}): Promise<ActionResult> {
+  async paginate(opts: { max_pages?: number; wait_ms?: number; load_more_selector?: string; next_selector?: string; infinite_scroll?: boolean; budget_ms?: number } = {}): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
     const maxPages = opts.max_pages ?? 10;
     const waitMs = opts.wait_ms ?? 1000;
     const useInfiniteScroll = opts.infinite_scroll !== false;
+    // P0-C/P1-E: bounded by the caller's route budget, and steps are effect-verified
+    // (the interaction snapshot must change) instead of blindly clicking + sleeping.
+    const budgetMs = Math.max(1000, opts.budget_ms ?? 20000);
+    const started = Date.now();
+    const remaining = () => budgetMs - (Date.now() - started);
 
     try {
       let currentPage = 1;
       const clickedElements: string[] = [];
       let totalResults = 0;
+      let reason: "max_pages" | "no_more_content" | "budget_exhausted" | "step_failed" = "no_more_content";
+
+      const interactionSnapshot = async (): Promise<string> => {
+        const r = await e.evaluate(`(() => { const b = document.body; return (b ? b.innerText.length : 0) + ':' + document.querySelectorAll('a,button,li,[role="listitem"],[role="row"],tr').length; })()`).catch(() => ({ ok: false as const }));
+        return r.ok ? String(r.result) : "unknown";
+      };
+      const effectConfirmed = async (before: string): Promise<boolean> => {
+        const deadline = Date.now() + Math.max(600, waitMs);
+        while (Date.now() < deadline) {
+          await e.waitMs(150).catch(() => {});
+          if (await interactionSnapshot() !== before) return true;
+        }
+        return false;
+      };
 
       while (currentPage <= maxPages) {
+        if (remaining() < (waitMs + 800)) { reason = "budget_exhausted"; break; }
+        const before = await interactionSnapshot();
+
         // Try specific load more selector first
         if (opts.load_more_selector) {
           try {
             const loadMore = await e.queryOne({ css: opts.load_more_selector });
             if (loadMore && await e.isVisible(loadMore)) {
               await e.click(loadMore, { timeoutMs: 3000 });
+              const changed = await effectConfirmed(before);
               clickedElements.push(`Load More (${opts.load_more_selector})`);
-              await e.waitMs(Math.max(waitMs, 1500));
               currentPage++;
+              if (!changed) { reason = "no_more_content"; break; }
               continue;
             }
-          } catch {}
+          } catch { /* fall through to generic detection */ }
         }
 
         // Try specific next selector
@@ -1073,13 +1659,14 @@ export class BrowserController {
               const isEnabled = enabledRes.ok && !!enabledRes.result;
               if (isEnabled) {
                 await e.click(next, { timeoutMs: 3000 });
+                const changed = await effectConfirmed(before);
                 clickedElements.push(`Next (${opts.next_selector})`);
-                await e.waitMs(Math.max(waitMs, 2000));
                 currentPage++;
+                if (!changed) { reason = "no_more_content"; break; }
                 continue;
               }
             }
-          } catch {}
+          } catch { /* fall through to generic detection */ }
         }
 
         // Generic pagination detection
@@ -1122,17 +1709,20 @@ export class BrowserController {
         const paginationResult = paginationResultRes?.ok ? (paginationResultRes.result as any) : { clicked: false, element: '', method: '' };
 
         if (paginationResult?.clicked) {
+          const changed = await effectConfirmed(before);
           clickedElements.push(`${paginationResult.element} (${paginationResult.method})`);
-          await e.waitMs(Math.max(waitMs, 2000));
           currentPage++;
+          if (!changed) { reason = "no_more_content"; break; }
         } else {
           if (useInfiniteScroll && currentPage === 1) {
             const scrollResult = await this.scrollToBottom(undefined, 5, waitMs);
             if (scrollResult.ok) break;
           }
+          reason = "no_more_content";
           break;
         }
       }
+      if (currentPage > maxPages) reason = "max_pages";
 
       return {
         ok: true,
@@ -1140,7 +1730,10 @@ export class BrowserController {
           pagesProcessed: currentPage - 1,
           totalInteractions: clickedElements.length,
           clickedElements,
-          terminated: currentPage > maxPages ? 'max_pages_reached' : 'no_more_pages',
+          terminated: reason,
+          partial: reason === "budget_exhausted",
+          elapsed_ms: Date.now() - started,
+          remaining_budget_ms: Math.max(0, remaining()),
         },
       };
     } catch (err) {
@@ -1734,11 +2327,11 @@ export class BrowserController {
   }
 
   /** Phase 3 — stable pagination to a terminal "no more results" state. */
-  async atsPaginate(o: { max_scrolls?: number; wait_ms?: number; load_more_selector?: string; next_selector?: string } = {}): Promise<ActionResult> {
+  async atsPaginate(o: { max_scrolls?: number; wait_ms?: number; load_more_selector?: string; next_selector?: string; budget_ms?: number } = {}): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
     try {
       const { paginate } = await import("./ats-tools.js");
-      const r = await paginate(e as any, { maxScrolls: o.max_scrolls, waitMs: o.wait_ms, loadMoreSelector: o.load_more_selector, nextSelector: o.next_selector });
+      const r = await paginate(e as any, { maxScrolls: o.max_scrolls, waitMs: o.wait_ms, loadMoreSelector: o.load_more_selector, nextSelector: o.next_selector, budgetMs: o.budget_ms });
       this.bump();
       return { ok: true, result: r };
     } catch (err) { return this.err("ats.paginate", `Paginate failed: ${err}`, true); }
@@ -1897,12 +2490,30 @@ export class BrowserController {
 
   /** No active session — standard error result. */
   private noSession(): ActionResult {
-    return { ok: false, error: { code: "NO_SESSION", message: "No active browser session. Start one with browser.new or page.open.", retryable: true } };
+    return { ok: false, error: kruzError(ErrCode.NO_SESSION, { subsystem: "session", message: "No active browser session. Start one with session.create.", trace: ["controller"] }).toJSON() };
+  }
+  /** Build a standard error ActionResult — one shape for every controller failure. */
+  private err(code: string, message: string, retryable: boolean, extra?: { help?: string; subsystem?: Subsystem }): ActionResult {
+    return {
+      ok: false,
+      error: kruzError(code, {
+        message,
+        subsystem: extra?.subsystem,
+        retryable,
+        help: extra?.help,
+        trace: ["controller"],
+      }).toJSON(),
+    };
   }
 
-  /** Build a standard error ActionResult. */
-  private err(code: string, message: string, retryable: boolean): ActionResult {
-    return { ok: false, error: { code, message, retryable } };
+  /** Classify a caught action failure into the unified taxonomy (D5) instead of
+   *  stamping the tool name as the code. The caller's remediation tip is kept. */
+  private actionErr(verb: string, err: unknown, tip?: string): ActionResult {
+    const env = kruzErrorFromThrown(err, { subsystem: "engine", trace: ["controller"] });
+    return this.err(env.code, `${verb} failed: ${env.message}${tip ? ` ${tip}` : ""}`, env.retryable, {
+      subsystem: env.subsystem,
+      help: env.help ?? tip,
+    });
   }
 
   /** Whether a target (or its fallback) carries any locator criterion. */
@@ -1930,13 +2541,102 @@ export class BrowserController {
     return parts.length === 0 ? "element" : parts.join(" ");
   }
 
+  /**
+   * The session's ref authority — the single mint/consume point for refs.
+   *
+   * `page.observe`, `page.probe`, ambiguity candidates and the action results all
+   * mint into this one instance, and every action resolves from it. There is no
+   * second allocator: two registries would mean two independent `e` counters and
+   * refs that no action can resolve.
+   */
+  private fallbackRefs = new RefRegistry();
+  private refs(): RefRegistry {
+    const s = this.getActiveSession();
+    // A controller built with a stub session (tests) still shares ONE identity
+    // system. Returning a fresh `new RefRegistry()` per call would look the same
+    // here but would silently make every ref unresolvable on the next call.
+    if (s?.refs) return s.refs;
+    return (s?.observer as any)?.getRegistry?.() ?? this.fallbackRefs;
+  }
+
+  private docIdCache = "nodoc";
+  private revisionCache = 0;
+  /** Last resolution timing, so the next response can report it. Diagnostic only. */
+  private lastResolveTiming: ActionTiming = {};
+
+  /**
+   * Refresh page/document identity before a resolution burst.
+   *
+   * Refs are only meaningful inside the document that minted them, so the
+   * action path must know which document it is in before it can honestly answer
+   * "this ref is stale" versus "this element is gone".
+   *
+   * The tab id matters as much as the document id and was the second half of the
+   * observe-ref P0: the Observer mints refs against the REAL active tab id it
+   * gets from `engine.listTabs()` (e.g. "tab-1"), while the controller resolved
+   * against its hardcoded `activePageId` default of "p1". Once the refs were in
+   * the shared registry at all, every single observe ref failed the
+   * document/page identity check and came back as DOCUMENT_CHANGED. Both sides
+   * must derive the tab id the same way, so it is read here from the same source
+   * the Observer uses.
+   */
+  private async refreshIdentity(e: BrowserEngine): Promise<void> {
+    const tabs = await e.listTabs().catch(() => null);
+    const activeTab = tabs?.find((t) => t.isActive);
+    if (activeTab?.id) this.activePageId = activeTab.id;
+    const r = await e.evaluate("String(performance && performance.timeOrigin || 'nodoc')").catch(() => null);
+    this.docIdCache = r?.ok ? String(r.result) : "nodoc";
+    const s = this.getActiveSession();
+    const obs = s?.observer as any;
+    if (obs?.getRevision) {
+      const rev = await obs.getRevision(e).catch(() => 0);
+      if (typeof rev === "number") this.revisionCache = rev;
+    }
+  }
+
+  /**
+   * Shared entry point for the remaining target-bearing actions (select,
+   * check, uncheck, scroll-to-target). Identity comes from the same matcher and
+   * the same ref registry as click/fill/probe; only the actionability bar varies.
+   */
+  private async unified(
+    target: Target, fallback: Fallback | undefined, scope: string | undefined,
+    mode: MatchMode, timeoutMs = 5000, allowHidden = false,
+  ): Promise<{ ok: true; el: KruzElement; token: string; ref: string } | { ok: false; result: ActionResult }> {
+    const t0 = Date.now();
+    const e = this.engine();
+    if (!e) return { ok: false, result: this.noSession() };
+    await this.refreshIdentity(e);
+    const tIdentity = Date.now();
+    const r = await resolveForAction(
+      { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+      target, fallback, scope, mode, { allowHidden, waitMs: Math.min(timeoutMs, 1500) },
+    );
+    // Diagnostic metadata only — never a decision input.
+    this.lastResolveTiming = { resolve_ms: Date.now() - t0, identity_ms: tIdentity - t0 };
+    if (!r.ok) {
+      return {
+        ok: false,
+        result: {
+          ok: false,
+          timing: { total_ms: Date.now() - t0, ...this.lastResolveTiming },
+          error: kruzError(r.code, { subsystem: "controller", message: r.message, retryable: r.retryable, help: r.help }).toJSON(),
+          result: r.candidates ? { count: r.candidates.length, candidates: r.candidates } : r.evidence,
+        },
+      };
+    }
+    return { ok: true, el: r.el, token: r.token, ref: r.ref };
+  }
+
   /** Resolve a target to a KruzElement via refMap / semantic re-match. Throws if not found. */
   private async resolve(target: Target, fallback?: Fallback, scope?: string, _timeoutMs = 3000, _force = false): Promise<{ el: KruzElement }> {
     const e = this.engine();
     if (!e) throw new Error("no active session");
     const rm = this.getRefMap();
     const fb = fallback;
-    const { el } = await resolveElementWithRef(e, target, rm, fb, scope);
+    // P2-A: propagate the caller's budget into plain-CSS resolution so a current-state
+    // lookup fails fast instead of consuming the fixed resolver timeout.
+    const { el } = await resolveElementWithRef(e, target, rm, fb, scope, _timeoutMs);
     if (el) return { el };
     throw new Error(`Element not found (${this.desc(target)})`);
   }

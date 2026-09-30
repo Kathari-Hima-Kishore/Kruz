@@ -65,6 +65,12 @@ export interface PaginateResult {
   terminal: boolean;
   urls: string[];
   method: "scroll" | "next" | "load-more";
+  /** P0-C/P1-E: why the loop stopped, and whether the work was partial. */
+  reason?: "terminal" | "no_new_content" | "budget_exhausted" | "max_rounds" | "selector_gone" | "error" | "step_failed";
+  partial?: boolean;
+  iterations?: number;
+  items_added?: number;
+  remaining_budget_ms?: number;
 }
 
 const WORD = 200;
@@ -437,51 +443,87 @@ export async function summarize(engine: BrowserEngine): Promise<SummarizeResult>
  * stabilizes (terminal "no more results"), collecting newly-visible posting links.
  * Optionally click a "next"/"load more" control repeatedly.
  */
-export async function paginate(engine: BrowserEngine, opts: { maxScrolls?: number; waitMs?: number; loadMoreSelector?: string; nextSelector?: string } = {}): Promise<PaginateResult> {
+export async function paginate(engine: BrowserEngine, opts: { maxScrolls?: number; waitMs?: number; loadMoreSelector?: string; nextSelector?: string; budgetMs?: number } = {}): Promise<PaginateResult> {
   const maxScrolls = opts.maxScrolls ?? 40;
   const waitMs = opts.waitMs ?? 800;
+  // P0-C: the loop must never outlive the caller's route budget. Default 20s leaves a
+  // 5s safety margin inside the 25s non-nav route timeout, so we return a partial
+  // result instead of being killed with outcome:unknown.
+  const budgetMs = Math.max(1000, opts.budgetMs ?? 20000);
+  const started = Date.now();
+  const remaining = () => budgetMs - (Date.now() - started);
+  const estimatedIteration = waitMs + 500;
+  const withMeta = (r: PaginateResult, iterations: number, terminal: boolean): PaginateResult => ({
+    ...r,
+    iterations,
+    partial: !terminal,
+    remaining_budget_ms: Math.max(0, remaining()),
+  });
+
   try {
     if (opts.loadMoreSelector || opts.nextSelector) {
       const sel = opts.loadMoreSelector || opts.nextSelector!;
-      const urls: string[] = [];
-      let clicked = 0;
+      let urls: string[] = [];
+      let iterations = 0;
+      let reason: NonNullable<PaginateResult["reason"]> = "terminal";
       for (let i = 0; i < maxScrolls; i++) {
+        if (remaining() < estimatedIteration) { reason = "budget_exhausted"; break; }
         const before = new Set(await collectPostingUrls(engine));
         const foundCount = await engine.countElements({ css: sel });
-        if (foundCount === 0) break;
+        if (foundCount === 0) { reason = "selector_gone"; iterations = i; break; }
         const btn = await engine.queryOne({ css: sel });
-        if (btn) {
-          await engine.scrollIntoView(btn).catch(() => {});
-          await engine.click(btn, { force: true, timeoutMs: 1500 }).catch(() => {});
-        }
-        await engine.waitMs(waitMs).catch(() => {});
-        clicked++;
-        const after = new Set(await collectPostingUrls(engine));
-        urls.length = 0; urls.push(...after);
-        if (after.size === before.size) break;
+        // P1-E: a step that cannot even resolve is a step failure, not a green light to
+        // keep clicking blind. Stop and report partial progress.
+        if (!btn) { reason = "step_failed"; iterations = i; break; }
+        const clickRes = await engine.scrollIntoView(btn).then(() => engine.click(btn, { force: true, timeoutMs: 1500 })).then(() => ({ ok: true })).catch(() => ({ ok: false }));
+        if (!clickRes.ok) { reason = "step_failed"; iterations = i; break; }
+        // P1-E: verify the EFFECT of this step (new items appeared) before the next one.
+        const after = await waitForNewItems(engine, before, waitMs);
+        iterations = i + 1;
+        urls = [...after];
+        if (after.size === before.size) { reason = "no_new_content"; break; }
       }
-      return { loaded: urls.length, terminal: true, urls, method: opts.loadMoreSelector ? "load-more" : "next" };
+      const terminal = reason === "terminal" || reason === "selector_gone";
+      return withMeta({ loaded: urls.length, terminal, urls, method: opts.loadMoreSelector ? "load-more" : "next", reason }, iterations, terminal);
     }
 
     let prevH = -1;
     let stableRounds = 0;
     let urls: string[] = [];
+    let iterations = 0;
+    let reason: NonNullable<PaginateResult["reason"]> = "terminal";
     for (let i = 0; i < maxScrolls; i++) {
+      if (remaining() < estimatedIteration) { reason = "budget_exhausted"; break; }
       await engine.evaluate(`window.scrollTo(0, document.body.scrollHeight)`);
       await engine.waitMs(waitMs).catch(() => {});
       const hResult = await engine.evaluate(`document.body.scrollHeight`).catch(() => ({ ok: false as const }));
       const h = hResult.ok ? (hResult.result as number) : 0;
       urls = await collectPostingUrls(engine);
+      iterations = i + 1;
       if (h === prevH) {
         stableRounds++;
-        if (stableRounds >= 2) break;
+        if (stableRounds >= 2) { reason = "terminal"; break; }
+        reason = "no_new_content";
       } else stableRounds = 0;
       prevH = h;
     }
-    return { loaded: urls.length, terminal: stableRounds >= 2 || maxScrolls === 1, urls, method: "scroll" };
+    if (iterations >= maxScrolls && reason !== "terminal") reason = reason === "budget_exhausted" ? reason : "max_rounds";
+    const terminal = reason === "terminal";
+    return withMeta({ loaded: urls.length, terminal, urls, method: "scroll", reason }, iterations, terminal);
   } catch (e) {
-    return { loaded: 0, terminal: false, urls: [], method: "scroll", note: `paginate failed: ${e}` } as PaginateResult;
+    return { loaded: 0, terminal: false, urls: [], method: "scroll", note: `paginate failed: ${e}`, reason: "error", partial: true, iterations: 0, remaining_budget_ms: Math.max(0, remaining()) } as PaginateResult;
   }
+}
+
+/** P1-E: wait (bounded by waitMs) until the collected URL set grows past `before`. */
+async function waitForNewItems(engine: BrowserEngine, before: Set<string>, waitMs: number): Promise<Set<string>> {
+  const deadline = Date.now() + Math.max(300, waitMs);
+  let after = new Set(await collectPostingUrls(engine));
+  while (after.size <= before.size && Date.now() < deadline) {
+    await engine.waitMs(150).catch(() => {});
+    after = new Set(await collectPostingUrls(engine));
+  }
+  return after;
 }
 
 async function collectPostingUrls(engine: BrowserEngine): Promise<string[]> {

@@ -1,0 +1,26 @@
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Runtime browser state (regenerable; holds cookies/logins for the persistent profile)
+browser-profile/
+downloads/
+
+# Local env
+.env
+.env.local
+config.local.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+npm-debug.log*
+qa/
+*.tsbuildinfo

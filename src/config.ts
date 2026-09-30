@@ -18,7 +18,6 @@ export interface P1Config {
   logLevel: "debug" | "info" | "warn" | "error";
   safetyPolicy: "strict" | "lenient" | "off";
   observationCacheSize: number;
-  extensionPath: string | null;
 }
 
 // Project root — always the directory where this source file lives (../ = project root)
@@ -96,7 +95,6 @@ export function loadConfig(): P1Config {
     } catch { /* ignore */ }
   }
 
-  const configuredExtension = envStr("BROWSER_EXTENSION_PATH", fileConfig.extensionPath ?? null);
   _config = {
     browserPath: env("BROWSER_PATH", fileConfig.browserPath || findChromePath()),
     headless: envBool("BROWSER_HEADLESS", fileConfig.headless ?? false),
@@ -113,7 +111,6 @@ export function loadConfig(): P1Config {
     logLevel: (env("LOG_LEVEL", fileConfig.logLevel || "info") as P1Config["logLevel"]),
     safetyPolicy: (env("SAFETY_POLICY", fileConfig.safetyPolicy || "off") as P1Config["safetyPolicy"]),
     observationCacheSize: envInt("OBSERVATION_CACHE_SIZE", fileConfig.observationCacheSize ?? 100),
-    extensionPath: configuredExtension ? resolveFromRoot(configuredExtension) : null,
   };
 
   return _config;

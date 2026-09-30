@@ -1,7 +1,7 @@
 import { cvEnhancedClick, createKruzCVBridge } from "../browser/azure-cv.js";
 import { captureClickState, completeClick } from '../browser/click-completion.js';
 import { randomUUID } from "node:crypto";
-import { KRUZ_VERSION } from "../version.js";
+import { KRUZ_VERSION, buildInfo } from "../version.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { SessionManager } from "../session/manager.js";
 import { BrowserController } from "../browser/controller.js";
@@ -9,8 +9,76 @@ import { SafetyLayer } from "../safety/layer.js";
 import { loadConfig } from "../config.js";
 import { sanitizeToolName, KNOWN_TOOLS } from "./tool-names.js";
 import type { BrowserEngine } from "../browser/engine.js";
+import { toErrorEnvelope, kruzError, kruzErrorFromThrown, ErrCode, classify, isRetryableCode, KruzError, withRetry, type KruzErrorEnvelope } from "../errors.js";
+
+/**
+ * Error codes the click recovery ladder retries (D4: ELEMENT_NOT_VISIBLE is
+ * included — a hidden first match can resolve to the visible twin after the
+ * re-observe escalation, matching the type/fill ladders in controller.ts).
+ */
+/**
+ * Error codes the click recovery ladder retries. ELEMENT_NOT_VISIBLE is included so a
+ * hidden first match can resolve to its visible twin after re-observe.
+ * P1-D / §28: TARGET_NOT_FOUND is deliberately NOT retried — a genuinely missing target
+ * must return quickly so the model can reconsider the plan instead of waiting through a
+ * recovery ladder that cannot possibly succeed.
+ */
+export const CLICK_RETRY_CODES = [
+  ErrCode.ELEMENT_OBSCURED,
+  ErrCode.STALE_ELEMENT,
+  ErrCode.ELEMENT_NOT_FOUND,
+  ErrCode.ELEMENT_NOT_VISIBLE,
+];
+
+/**
+ * Session-lifecycle tools that own the indicator themselves and skip the
+ * per-action lock (create installs it hidden, close removes it, pause/resume
+ * drive the takeover handoff explicitly).
+ */
+const NO_LOCK_TOOLS = new Set([
+  "server.info", "session.status", "session.create", "session.close",
+  "session.pause", "session.resume", "human.takeover",
+]);
 
 const KRUZ_START_MS = (globalThis as any).__KRUZ_START__ ?? Date.now();
+
+/**
+ * Single choke point for error shaping. Every tool result passes through here so
+ * each error reaches the model with a stable code, the subsystem that produced
+ * it, a retry verdict, and the provenance chain. Subsystems that predate the
+ * unified error module (or that build bare `{code,message,retryable}` literals)
+ * are enriched here rather than at each call site.
+ */
+function shapeError(error: unknown, tool: string): KruzErrorEnvelope {
+  // Already typed by the unified module.
+  if (error instanceof KruzError) return error.at(`tool:${tool}`).at("router").toJSON();
+
+  // A plain error literal: `{code, message, retryable, subsystem?, help?, trace?}`.
+  if (error && typeof error === "object" && "code" in (error as any)) {
+    const e = error as Record<string, any>;
+    const code = String(e.code ?? ErrCode.INTERNAL_ERROR);
+    return {
+      code,
+      message: String(e.message ?? code),
+      retryable: e.retryable ?? isRetryableCode(code),
+      subsystem: e.subsystem ?? classify(code),
+      ...(e.help ? { help: e.help } : {}),
+      trace: [`tool:${tool}`, "router", ...(Array.isArray(e.trace) ? e.trace : [])],
+    };
+  }
+
+  // A thrown Error/string that escaped a subsystem — classify it.
+  const env = toErrorEnvelope(error);
+  return { ...env, subsystem: env.subsystem ?? "router", trace: [`tool:${tool}`, "router", ...(env.trace ?? [])] };
+}
+
+/** Tag an ok:false result with provenance. Mutates in place (results are per-call). */
+function shapeResult(result: any, tool: string): any {
+  if (result && result.ok === false && result.error) {
+    result.error = shapeError(result.error, tool);
+  }
+  return result;
+}
 
 export class ToolRouter {
   private readonly instanceId = randomUUID();
@@ -20,6 +88,75 @@ export class ToolRouter {
     const s = this.sm.getActive();
     return { server_instance_id: this.instanceId, process_id: process.pid, session_id: s?.id ?? null, browser_connected: s?.engine?.connected ?? false, session_creating: this.sm.isCreating };
   }
+
+  /**
+   * Model control, one rule: WHILE the blue overlay is alive the page belongs to
+   * the model and accepts no outside input; when the model goes idle the overlay
+   * (and the input lock) disappear and the page is the user's again.
+   *
+   * This is REALTIME and heartbeat-driven: `beginControl` starts a ~200 ms ping
+   * loop that runs for as long as the tool call is in flight; the in-page layer
+   * (visual-cursor.ts) keeps the overlay visible only while pings arrive within
+   * its own IDLE window. The moment the call ends — i.e. the model is back to
+   * thinking/deciding, not acting — pings stop and the overlay turns itself off,
+   * even if this Node process is killed mid-call. No paired on/off state, no
+   * reliance on a server timer for the off transition.
+   */
+  private idleReleaseTimer?: ReturnType<typeof setTimeout>;
+  private pingTimer?: ReturnType<typeof setTimeout>;
+
+  /** Stop the heartbeat and (after `graceMs`) force the overlay down. */
+  private endControl(graceMs = 600): void {
+    if (this.pingTimer) { clearTimeout(this.pingTimer); this.pingTimer = undefined; }
+    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
+    this.idleReleaseTimer = setTimeout(() => {
+      this.idleReleaseTimer = undefined;
+      void this.setControlLock(false).catch(() => {});
+    }, graceMs);
+    (this.idleReleaseTimer as any)?.unref?.();
+  }
+
+  /** Heartbeat ON for the duration of a call; overlay visible while it beats. */
+  private async beginControl(): Promise<void> {
+    if (this.idleReleaseTimer) { clearTimeout(this.idleReleaseTimer); this.idleReleaseTimer = undefined; }
+    await this.setControlPing();
+    this.schedulePing();
+  }
+
+  /**
+   * Ping the in-page layer so its realtime IDLE window stays open. Uses a
+   * self-rescheduling timeout (not setInterval) so a slow renderer cannot pile
+   * up concurrent evaluates, and `unref()` so it never holds the process open.
+   */
+  private schedulePing(): void {
+    if (this.pingTimer) clearTimeout(this.pingTimer);
+    this.pingTimer = setTimeout(async () => {
+      this.pingTimer = undefined;
+      // A call is still in flight only if endControl has not run; it clears
+      // pingTimer, so reaching here means control is ongoing.
+      await this.setControlPing();
+      if (!this.idleReleaseTimer) this.schedulePing();
+    }, 200);
+    (this.pingTimer as any)?.unref?.();
+  }
+
+  /** Realtime heartbeat: extends the overlay's visibility window. */
+  private async setControlPing(): Promise<void> {
+    try {
+      const engine = this.sm.getActiveEngine();
+      if (!engine) return;
+      await engine.evaluate(`(() => { try { const v = window.__kruzVisual; if (v && v.ping) return v.ping(); return "no-layer"; } catch (e) { return "error"; } })()`).catch(() => null);
+    } catch { /* best-effort; never fail an action on the indicator */ }
+  }
+
+  /** Toggle the in-page control layer. Best-effort: never fails an action. */
+  private async setControlLock(on: boolean): Promise<void> {
+    try {
+      const engine = this.sm.getActiveEngine();
+      if (!engine) return;
+      await engine.evaluate(`(() => { try { const v = window.__kruzVisual; if (v && v.setLock) return v.setLock(${on ? "true" : "false"}); return "no-layer"; } catch (e) { return "error"; } })()`).catch(() => null);
+    } catch { /* best-effort; never fail an action on the indicator */ }
+  }
   private ctrl: BrowserController;
   private safety: SafetyLayer;
 
@@ -27,6 +164,44 @@ export class ToolRouter {
     this.sm = new SessionManager();
     this.ctrl = new BrowserController(this.sm);
     this.safety = new SafetyLayer(loadConfig().safetyPolicy);
+  }
+
+  /** Pre-action state shape reused to avoid an extra CDP round trip (P1-A). */
+  private stateOf(v: any): { url: string; title: string; document_id?: number; signature?: string; focus?: string | null } | null {
+    if (!v || typeof v !== "object") return null;
+    return { url: v.url ?? "", title: v.title ?? "", document_id: v.document_id, signature: v.signature, focus: v.focus ?? null };
+  }
+
+  /**
+   * P1-A: wrap a mutating action so its result carries a compact post-action state
+   * delta. `before` (a snapshot from the pre-action capture) is reused when supplied
+   * to avoid an extra CDP round trip; observation is best-effort and never fails the
+   * action itself.
+   */
+  private async withFeedback<T extends Record<string, any>>(
+    engine: BrowserEngine | null,
+    action: () => Promise<T>,
+    opts: { before?: any; includeLists?: boolean } = {},
+  ): Promise<T> {
+    if (!engine) return action();
+    const before = opts.before ?? (await this.ctrl.pageFeedback(engine, null, { includeLists: false }).catch(() => null));
+    const result = await action();
+    if (!result || typeof result !== "object" || result.ok !== true) return result;
+    const after = await this.ctrl.pageFeedback(engine, this.stateOf(before), { includeLists: opts.includeLists }).catch(() => null);
+    if (!after) return result;
+    return { ...result, state: after };
+  }
+
+  /** P1-B: cheap, non-mutating existence probe over the current DOM. */
+  private async probeTarget(a: Record<string, any>) {
+    const engine = this.sm.getActiveEngine();
+    if (!engine) return this.noSess();
+    const target = a.target ?? {};
+    if (!target || typeof target !== "object" || Object.keys(target).length === 0) {
+      return { ok: false, error: kruzError(ErrCode.INVALID_TARGET, { subsystem: "router", message: "page.probe needs a target, e.g. {\"target\":{\"css\":\"#submit\"}} or {\"target\":{\"text\":\"Careers\"}}.", trace: ["router"] }).toJSON() };
+    }
+    const candidates = await this.ctrl.probeTarget(engine, target, a.fallback, a.scope);
+    return { ok: true, result: candidates };
   }
 
   async route(name: string, args: Record<string, any>): Promise<CallToolResult> {
@@ -55,14 +230,18 @@ export class ToolRouter {
     const NAV_TOOLS = new Set(["session.create", "page.open", "page.goto", "page.reload", "page.iCIMSSearch", "ats.verifyPosting"]);
     const ROUTE_TIMEOUT_MS = NAV_TOOLS.has(name) ? 55000 : 25000; // BUG-1: stay under MCP SDK -32001 default (30s) to avoid false timeouts
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // Model control is tied to ACTIVITY: overlay + input lock go on for the
+    // duration of the call and are released shortly after the model goes idle.
+    const isLifecycle = NO_LOCK_TOOLS.has(name);
     try {
+      if (!isLifecycle && this.sm.getActive()?.id) await this.beginControl();
       const result = await Promise.race([
         this.handle(name, args),
         new Promise<never>((_, reject) =>
           timer = setTimeout(() => reject(new Error("ROUTE_TIMEOUT")), ROUTE_TIMEOUT_MS)
         ),
       ]);
-      return { content: [{ type: "text", text: JSON.stringify({ ...result, ...this.diagnostics() }) }], isError: result.ok === false };
+      return { content: [{ type: "text", text: JSON.stringify({ ...shapeResult(result, name), ...this.diagnostics() }) }], isError: result.ok === false };
     } catch (err) {
       if (String(err) === "Error: ROUTE_TIMEOUT") {
         // A timeout cannot establish success or cancel an in-flight browser action.
@@ -70,19 +249,26 @@ export class ToolRouter {
         return {
           content: [{ type: "text", text: JSON.stringify({
             ok: false,
-            error: { code: "ACTION_TIMEOUT", retryable: false },
+            error: kruzError(ErrCode.ACTION_TIMEOUT, {
+              subsystem: "router",
+              message: `Action '${name}' exceeded ${ROUTE_TIMEOUT_MS}ms. Completion is unknown and work may still be running.`,
+              trace: [`tool:${name}`, "router"],
+            }).toJSON(),
             ...this.diagnostics(),
             outcome: "unknown",
-            message: `Action '${name}' exceeded ${ROUTE_TIMEOUT_MS}ms. Completion is unknown and work may still be running. Inspect page/session state before retrying.`,
             retry_safe: false,
             hint: "Wait 2-3 seconds, then call page_observe or session.status to check current state.",
           }) }],
           isError: true,
         };
       }
-      return { content: [{ type: "text", text: JSON.stringify({ ok: false, ...this.diagnostics(), error: { code: (err as any)?.code ?? "INTERNAL_ERROR", message: `Unexpected error: ${err}`, retryable: false } }) }], isError: true };
+      const env = shapeError(err, name);
+      return { content: [{ type: "text", text: JSON.stringify({ ok: false, ...this.diagnostics(), error: env }) }], isError: true };
     } finally {
       if (timer) clearTimeout(timer);
+      // The model is no longer acting on the page: stop the heartbeat so the
+      // overlay turns itself off (unless the user holds control).
+      if (!isLifecycle && this.sm.getActive()?.id) this.endControl();
     }
   }
 
@@ -91,6 +277,11 @@ export class ToolRouter {
     if (a.target?.fallback && !a.fallback) a.fallback = a.target.fallback;
     if (a.target?.scope && !a.scope) a.scope = a.target.scope;
 
+    // P1-A: post-action feedback is attached after mutating actions. A single snapshot
+    // taken here is reused as the "before" baseline (no extra round trip) by actions
+    // that don't already capture their own pre-state.
+    const engine = this.sm.getActiveEngine();
+
     switch (name) {
       // Server
       case "server.info": return this.serverInfo();
@@ -98,17 +289,20 @@ export class ToolRouter {
       // Session
       case "session.create": return this.mkSession(a);
       case "session.status": return this.status();
-      case "session.pause": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); return { ok: true, status: "paused", message: a.message || "Automation paused.", session_id: s.id }; }
-      case "session.resume": { const r = await this.sm.resume(); return r ? { ok: true, status: "active" } : { ok: false, error: { code: "RESUME_FAILED", message: "Failed to resume", retryable: false } }; }
-      case "session.close": { const c = await this.sm.close(undefined, a.graceful !== false); return { ok: c, status: c ? "closed" : "error" }; }
-      case "session.attach": return this.ctrl.attachBrowser(a.endpoint);
+      case "session.pause": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); await this.setControlLock(false); return { ok: true, status: "paused", message: a.message || "Automation paused; the page is yours until session.resume.", session_id: s.id }; }
+      case "session.resume": {
+        const r = await this.sm.resume();
+        const s = this.sm.getActive();
+        if (!s) return { ok: false, error: kruzError(ErrCode.RESUME_FAILED, { subsystem: "session", message: "No active session to resume", trace: ["router"] }).toJSON() };
+        // Idempotent: resuming an already-active session is a no-op success.
+        await this.setControlLock(false);   // overlay returns with the next action
+        return { ok: true, status: "active", was_paused: r };
+      }
+
+      case "session.close": { const prev = this.sm.getActive(); const c = await this.sm.close(undefined, a.graceful !== false); if (c && prev?.engine) await (prev.engine as any).removeControlIndicator?.()?.catch?.(() => {}); return { ok: c, status: c ? "closed" : "error" }; }
 
       // Navigation
       case "page.open": return this.openWithRetry(a.url, a.wait_for, a.timeout_ms, 1, a.detect_redirect);
-      case "page.goto": { const r = await this.openWithRetry(a.url, a.wait_for || "domcontentloaded", a.timeout_ms, 1, a.detect_redirect); if (r.ok) { const s = this.sm.getActive(); const pid = this.pid(); const url = await s?.engine?.url().catch(() => ""); if (s && url !== undefined) this.sm.trace(s.id, "goto", url ?? "", pid); } return r; }
-      case "page.back": return this.ctrl.back();
-      case "page.forward": return this.ctrl.forward();
-      case "page.reload": return this.ctrl.reload(a.wait_for);
 
       // Multi-tab (parallel boards / keep-JD-open while verifying)
       case "page.newTab": return this.ctrl.newTab(a.url);
@@ -116,9 +310,8 @@ export class ToolRouter {
       case "page.listTabs": return this.ctrl.listTabs();
       case "page.closeTab": return this.ctrl.closeTab(a.page_id);
 
-      // Observe & Find
+      // Observe
       case "page.observe": return this.obs(a);
-      case "page.find": return this.find(a);
 
       // Click - semantic target click (preferred) + coordinate fallback
       case "page.click": return this.click(a);
@@ -128,60 +321,40 @@ export class ToolRouter {
       // Computer-use (text-only CUA bridge — see src/browser/computer-use.ts)
       case "page.computerUseList": return this.ctrl.computerUseList();
       case "page.computerUseSnapshot": return this.ctrl.computerUseSnapshot();
-      case "page.computerUseMark": return this.ctrl.computerUseMark();
-      case "page.computerUseClearMarks": return this.ctrl.computerUseClearMarks();
-      case "page.computerUseScrollTo": return this.ctrl.computerUseScrollTo(a.i);
 
-      // Keyboard
-      case "page.type": return this.ctrl.type(a.target, a.text, a.fallback, a.scope, a.delay_ms, a.clear, a.timeout_ms);
-      case "page.fill": return this.ctrl.fill(a.target, a.value, a.fallback, a.scope, a.timeout_ms, { force: a.force, ignoreVisibility: a.ignore_visibility });
-      case "page.press": return this.ctrl.press(a.key, a.target, a.fallback, a.scope, a.timeout_ms);
-      case "page.pressSequence": return this.ctrl.pressSequence(a.keys, a.delay_ms);
+      // Keyboard — mutating actions carry a compact post-action state delta (P1-A).
+      case "page.fill": return this.withFeedback(engine, () => this.ctrl.fill(a.target, a.value, a.fallback, a.scope, a.timeout_ms, { force: a.force, ignoreVisibility: a.ignore_visibility }), { includeLists: false });
+      case "page.press": return this.withFeedback(engine, () => this.ctrl.press(a.key, a.target, a.fallback, a.scope, a.timeout_ms), { includeLists: true });
+
+      // Probe — cheap, non-mutating "what matches now?" (P1-B)
+      case "page.probe": return this.probeTarget(a);
 
       // Form
-      case "page.select": return this.ctrl.select(a.target, { value: a.value, label: a.label, index: a.index }, a.fallback, a.scope, a.timeout_ms);
-      case "page.check": return this.ctrl.check(a.target, a.fallback, a.scope, a.timeout_ms);
-      case "page.uncheck": return this.ctrl.uncheck(a.target, a.fallback, a.scope, a.timeout_ms);
-      case "page.submit": return this.ctrl.submit(a.target, a.fallback, a.scope);
-      case "page.setSlider": return this.ctrl.setSliderValue(a.target, a.value, a.fallback, a.scope, a.timeout_ms);
-      case "page.stepper": return this.ctrl.stepper(a.target, a.direction, a.fallback, a.scope, a.timeout_ms);
+      case "page.select": return this.withFeedback(engine, () => this.ctrl.select(a.target, { value: a.value, label: a.label, index: a.index }, a.fallback, a.scope, a.timeout_ms), { includeLists: true });
+      case "page.check": return this.withFeedback(engine, () => this.ctrl.check(a.target, a.fallback, a.scope, a.timeout_ms), { includeLists: false });
+      case "page.uncheck": return this.withFeedback(engine, () => this.ctrl.uncheck(a.target, a.fallback, a.scope, a.timeout_ms), { includeLists: false });
 
       // Scroll
-      case "page.scroll": return this.ctrl.scroll(a.direction, a.amount, a.target, a.fallback);
-      case "page.scrollToBottom": return this.ctrl.scrollToBottom(a.sentinel_selector, a.max_scrolls, a.wait_ms);
-      case "page.paginate": return this.ctrl.paginate({ max_pages: a.max_pages, wait_ms: a.wait_ms, load_more_selector: a.load_more_selector, next_selector: a.next_selector, infinite_scroll: a.infinite_scroll });
-      case "page.scrollAll": return this.ctrl.scrollAll({ max_steps: a.max_steps, step_px: a.step_px, wait_ms: a.wait_ms, sentinel_selector: a.sentinel_selector });
-      case "page.handleOverlays": return this.ctrl.handleOverlays({ close_cookie_banner: a.close_cookie_banner, close_newsletter_popup: a.close_newsletter_popup, close_chat_widget: a.close_chat_widget, close_app_prompt: a.close_app_prompt, handle_js_alerts: a.handle_js_alerts });
-      case "page.setDialogPolicy": return this.ctrl.setDialogPolicy(a.action, a.value);
+      case "page.scroll": return this.withFeedback(engine, () => this.ctrl.scroll(a.direction, a.amount, a.target, a.fallback), { includeLists: false });
+      case "page.paginate": return this.withFeedback(engine, () => this.ctrl.paginate({ max_pages: a.max_pages, wait_ms: a.wait_ms, load_more_selector: a.load_more_selector, next_selector: a.next_selector, infinite_scroll: a.infinite_scroll, budget_ms: a.budget_ms }));
+      case "page.handleOverlays": return this.ctrl.handleOverlays({ close_cookie_banner: a.close_cookie_banner, close_newsletter_popup: a.close_newsletter_popup, close_chat_widget: a.close_chat_widget, close_app_prompt: a.close_app_prompt, handle_js_alerts: a.handle_js_alerts, scope: a.scope, target: a.target });
 
-      // Hover & Wait
-      case "page.hover": return this.ctrl.hover(a.target, a.fallback, a.scope, a.timeout_ms, a.dwell_ms);
+      // Wait
       case "page.wait": return this.ctrl.wait(a.condition, a.target, a.fallback, a.scope, a.timeout_ms, a.predicate, a.interval_ms);
 
-      // Drag
-      case "page.drag": {
-        let s: any, d: any;
-        try { s = typeof a.source === "string" ? JSON.parse(a.source) : a.source; d = typeof a.dest === "string" ? JSON.parse(a.dest) : a.dest; } catch { return { ok: false, error: { code: "INVALID_INPUT", message: "Invalid JSON in source/dest. Pass an object like {\"ref\": \"e1\"} or valid JSON string.", retryable: false } }; }
-        return this.ctrl.drag(s, d, a.source_fallback, a.dest_fallback, a.scope, a.timeout_ms);
-      }
       // Dialogs
       case "page.dialog": return this.ctrl.dialog(a.action, a.value);
 
-      // JS
-      case "page.evaluate": return this.ctrl.evaluate(a.expression);
-      case "page.readVariable": return this.ctrl.readVariable(a.name);
+      // JS — P2-C: report whether the (possibly multi-step) expression mutated the page.
+      case "page.evaluate": return this.withFeedback(engine, async () => {
+        const res = await this.ctrl.evaluate(a.expression);
+        if (res.ok && res.result !== undefined) return { ok: true, result: res.result };
+        return res;
+      }, { includeLists: false }).then((r: any) => r.ok ? { ...r, page_mutated: !!(r.state?.page_mutated) } : r);
 
       // Frame-scoped tools
       case "page.frameEvaluate": return this.ctrl.frameEvaluate(a.expression, a.frame_name, a.frame_url);
       case "page.frameObserve": return this.ctrl.frameObserve(a.frame_name, a.frame_url, a.detail);
-
-      // Pickers & Upload
-      case "page.uploadFile": return this.ctrl.uploadFile(a.target, a.file_paths, a.fallback, a.scope, a.timeout_ms);
-      case "page.setDate": return this.ctrl.setDate(a.target, a.date, a.fallback, a.scope, a.timeout_ms);
-      case "page.setColor": return this.ctrl.setColor(a.target, a.color, a.fallback, a.scope, a.timeout_ms);
-
-      // Screenshot
-      case "page.screenshot": return this.ctrl.screenshot(a.target, a.fallback, a.scope, a.path, a.full_page);
 
       // ATS JSON harvesters (v11 medium-product — direct API feeds)
       case "ats.greenhouseHarvest": return this.ctrl.atsGreenhouseHarvest(a.company, a.query);
@@ -191,13 +364,11 @@ export class ToolRouter {
       case "ats.workdayHarvest": return this.ctrl.atsWorkdayHarvest(a.tenant, a.site, a.query);
       case "ats.bulkHarvest": return this.ctrl.atsBulkHarvest(a.companies);
       case "ats.discoverHandle": return this.ctrl.atsDiscoverHandle(a.ats, a.company);
-      // ATS-specific helpers (tailored to job-finder-v9 / v11 medium-product)
-      case "ats.detect": return this.ctrl.detectATS();
       case "ats.enumerate": return this.ctrl.atsEnumerate(a.ats, a.portal_url, a.company);
       case "ats.verifyPosting": return this.ctrl.atsVerifyPosting(a.url);
       case "ats.summarize": return this.ctrl.atsSummarize();
-      case "ats.paginate": return this.ctrl.atsPaginate({ max_scrolls: a.max_scrolls, wait_ms: a.wait_ms, load_more_selector: a.load_more_selector, next_selector: a.next_selector });
-      case "network.body": { const b = this.ctrl.getNetworkBody(a.filter || ""); return b ? { ok: true, result: b } : { ok: false, error: { code: "NO_MATCH", message: `No network request matched filter '${a.filter}'. Navigate/reload so the ATS feed is captured, then retry.`, retryable: true } }; }
+      case "ats.paginate": return this.withFeedback(engine, () => this.ctrl.atsPaginate({ max_scrolls: a.max_scrolls, wait_ms: a.wait_ms, load_more_selector: a.load_more_selector, next_selector: a.next_selector, budget_ms: a.budget_ms }));
+      case "network.body": { const b = this.ctrl.getNetworkBody(a.filter || ""); return b ? { ok: true, result: b } : { ok: false, error: kruzError(ErrCode.NO_MATCH, { subsystem: "router", message: `No network request matched filter '${a.filter}'. Navigate/reload so the ATS feed is captured, then retry.`, trace: ["router"] }).toJSON() }; }
       case "network.capture" : this.ctrl.setCaptureBodies(a.on !== false); return { ok: true, capturing_bodies: this.ctrl.getCaptureBodies() };
       case "page.oracleHCMSearch": return this.ctrl.oracleHCMSearch(a.keyword, a.wait_ms);
       case "page.iCIMSSearch": return this.ctrl.iCIMSSearch(a.keyword, a.country_path, a.wait_ms);
@@ -206,20 +377,18 @@ export class ToolRouter {
 
       // Extract
       case "extract.text": return this.extText(a);
-      case "extract.target": return this.extTarget(a);
 
       // Safety
-      case "human.takeover": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); return { ok: true, status: "needs_human", message: a.message || "Human intervention required.", session_id: s.id, hint: "Call session.resume when done." }; }
-      case "action.confirm": return this.confirm(a);
+      case "human.takeover": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); await this.setControlLock(false); return { ok: true, status: "needs_human", message: a.message || "Human intervention required. The blue overlay is off and the page is yours.", session_id: s.id, hint: "Interact freely, then call session.resume to hand the browser back to the model." }; }
 
-      default: return { ok: false, error: { code: "UNKNOWN_TOOL", message: `Unknown tool: ${name}`, retryable: false } };
+      default: return { ok: false, error: kruzError(ErrCode.UNKNOWN_TOOL, { subsystem: "router", message: `Unknown tool: ${name}`, trace: ["router"] }).toJSON() };
     }
   }
 
   // ── Handlers ───────────────────────────────────────────────────────────
 
   private async mkSession(a: Record<string, any>) {
-    if (a.headless === true) return { ok: false, error: { code: "HEADED_REQUIRED", message: "Kruz sessions require a visible browser. Use headless:false.", retryable: false } };
+    if (a.headless === true) return { ok: false, error: kruzError(ErrCode.HEADED_REQUIRED, { subsystem: "session", message: "Kruz sessions require a visible browser. Use headless:false.", trace: ["router"] }).toJSON() };
     const reused = this.sm.isCreating || !!this.sm.getActive()?.engine?.connected;
     if (!reused) this.ctrl.clearCapture();
     const s = await this.sm.create({ headless: a.headless, profileDir: a.profile_dir, viewportWidth: a.viewport_width, viewportHeight: a.viewport_height, userAgent: a.user_agent, locale: a.locale, proxy: a.proxy, downloadDir: a.download_dir, startupUrl: a.startup_url });
@@ -236,7 +405,17 @@ export class ToolRouter {
       s.config = { ...s.config, viewportWidth: actualW, viewportHeight: actualH };
     }
     const url = await s.engine?.url().catch(() => "about:blank") ?? "about:blank";
-    return { ok: true, reused, ...(reused ? { message: "Reused the existing session; launch options and startup_url were not applied. Use page.open to navigate, or session.close before changing launch settings." } : {}), session_id: s.id, status: s.status, browser: { headless: s.config.headless, viewport: { width: s.config.viewportWidth, height: s.config.viewportHeight } }, page_id: "p1", url };
+    // The control layer is injected over CDP and re-applies
+    // on every navigation. Installed hidden: the blue overlay + input lock
+    // engage only around mutating tool calls (route()), so the window is clean
+    // whenever the model is not acting.
+    const indicator = a.control_indicator !== false;
+    if (indicator) {
+      await (s.engine as any)?.installControlIndicator?.()?.catch?.(() => {});
+      // The layer lives for the whole session, but the overlay is shown only
+      // while the model operates (see beginControl/endControl heartbeat).
+    }
+    return { ok: true, reused, ...(reused ? { message: "Reused the existing session; launch options and startup_url were not applied. Use page.open to navigate, or session.close before changing launch settings." } : {}), session_id: s.id, status: s.status, control_indicator: indicator, browser: { headless: s.config.headless, viewport: { width: s.config.viewportWidth, height: s.config.viewportHeight } }, page_id: "p1", url };
   }
 
   private async status() {
@@ -256,51 +435,16 @@ export class ToolRouter {
     return { ok: true, ...observation, is_delta: isDelta, captured_at: ts };
   }
 
-  private async find(a: Record<string, any>) {
-    const s = this.sm.getActive();
-    const engine = s?.engine;
-    if (!engine) return this.noSess();
-    const t = a.target || {};
-
-    const candidates: { strategy: string; target: any }[] = [];
-
-    if (t.css) candidates.push({ strategy: "css", target: { css: t.css } });
-    if (t.id) candidates.push({ strategy: "id", target: { id: t.id } });
-    if (t.testid) candidates.push({ strategy: "testid", target: { testid: t.testid } });
-    if (t.nameAttr) candidates.push({ strategy: "nameAttr", target: { nameAttr: t.nameAttr } });
-    if (t.name) candidates.push({ strategy: "role+name", target: { role: t.role || "button", name: t.name } });
-    if (t.label) candidates.push({ strategy: "label", target: { label: t.label } });
-    if (t.text) candidates.push({ strategy: "text", target: { text: t.text } });
-    if (a.fallback?.css) candidates.push({ strategy: "fallback.css", target: { css: a.fallback.css } });
-    if (a.fallback?.text) candidates.push({ strategy: "fallback.text", target: { text: a.fallback.text } });
-    if (a.fallback?.xpath) candidates.push({ strategy: "fallback.xpath", target: { css: `xpath=${a.fallback.xpath}` } });
-
-    for (const c of candidates.slice(0, 8)) {
-      try {
-        const el = await engine.queryOne(c.target, undefined, a.scope).catch(() => null);
-        if (el) {
-          const count = 1;
-          const rawText = (await engine.textContent(el).catch(() => ""))?.trim() ?? "";
-          const capped = rawText.length > 500 ? rawText.substring(0, 500) + "..." : rawText;
-          const visible = await engine.isVisible(el).catch(() => false);
-          const tag = await engine.tagName(el).catch(() => "unknown");
-          return { ok: true, found: true, count, strategy: c.strategy, visible, text: capped, tag };
-        }
-      } catch { /* next */ }
-    }
-    return { ok: false, error: { code: "ELEMENT_NOT_FOUND", message: `No element found matching ${JSON.stringify(t)}`, retryable: true } };
-  }
-
   private async click(a: Record<string, any>) {
     // Issue 5: Validate target parameter — provide helpful error when missing
     if (!a.target || (typeof a.target === "object" && Object.keys(a.target).length === 0)) {
       return {
         ok: false,
-        error: {
-          code: "INVALID_TARGET",
+        error: kruzError(ErrCode.INVALID_TARGET, {
+          subsystem: "router",
           message: "Missing or empty 'target' parameter. You must wrap the ref in a target object: {\"target\": {\"ref\": \"e...\"}}. Other valid fields: css, role, name, text, testid, id.",
-          retryable: false,
-        },
+          trace: ["router"],
+        }).toJSON(),
       };
     }
     const engine = this.sm.getActiveEngine();
@@ -309,55 +453,108 @@ export class ToolRouter {
     const finish = async (response: any) => {
       if (!response.ok || response.result?.dialog_pending) return response;
       try {
-        const completion = await completeClick(engine, before, a);
+        const completion = await completeClick(engine, before, { ...a, effect_token: response.result?.effect_token });
         return { ...response, result: { ...response.result, ...completion } };
       } catch (error) {
         return { ...response, result: { ...response.result, clicked:true, verified:false, completion_error:String(error), retry_safe:false } };
       }
     };
     if (a.ocr === true) {
-      const engine = this.sm.getActiveEngine();
-      if (!engine) return this.noSess();
-      if (!a.target.text || a.scope || a.button && a.button !== "left" || a.click_count && a.click_count !== 1) return { ok: false, error: { code: "INVALID_OCR_OPTIONS", message: "OCR requires target.text, no scope, and a single left click.", retryable: false } };
+      if (!a.target.text || a.scope || a.button && a.button !== "left" || a.click_count && a.click_count !== 1) {
+        return { ok: false, error: kruzError(ErrCode.INVALID_OCR_OPTIONS, { subsystem: "ocr", message: "OCR requires target.text, no scope, and a single left click.", trace: ["router"] }).toJSON() };
+      }
       try { return await finish(await cvEnhancedClick(createKruzCVBridge(engine), a.target.text, { timeout: Math.min(a.timeout_ms ?? 5000, 10000) })); }
-      catch (error) { return { ok: false, error: { code: "OCR_CLICK_FAILED", message: String(error), retryable: false }, retry_safe: false }; }
+      catch (error) { return { ok: false, error: kruzError(ErrCode.OCR_CLICK_FAILED, { subsystem: "ocr", message: String(error), cause: error, trace: ["router"] }).toJSON(), retry_safe: false }; }
     }
     const sd = this.safety.classify("click", a.target);
     // NOTE: Safety confirmation gating removed so the browser agent is fully
     // autonomous (e.g. accepting cookie-consent banners). If any restrictive
     // severity is (re)introduced, it is surfaced here for logging only and the
     // click is NOT blocked.
-    if (sd.severity === "human") {
-      process.stderr.write(`[kruz] safety(off): ${sd.reason} — proceeding automatically.\n`);
-    }
-    if (sd.severity === "confirm") {
+    if (sd.severity === "human" || sd.severity === "confirm") {
       process.stderr.write(`[kruz] safety(off): ${sd.reason} — proceeding automatically.\n`);
     }
 
     // Preserve the site's click semantics, including preventDefault and SPA menus.
     // Never infer a second navigation from an unchanged URL after a click.
-    const dispatch = () => this.ctrl.click(a.target, a.fallback, a.scope, a.timeout_ms, a.strict, a.button, a.click_count, { force: a.force, ignoreVisibility: a.ignore_visibility });
-    let response = await dispatch();
+    //
+    // The recovery ladder is declared here and executed by the shared retry
+    // policy so the escalation order lives in one place:
+    //   1. dispatch
+    //   2. overlay is covering the target -> dismiss known overlays, re-observe
+    //      (refs are invalidated by the DOM churn an overlay removal causes), retry
+    //   3. a transient re-render race -> re-observe to refresh refs, retry
+    //   4. final dispatch attempt
+    const dispatch = (overrides: Record<string, any> = {}) =>
+      this.ctrl.click(a.target, a.fallback, a.scope, a.timeout_ms, a.strict, a.button, a.click_count, {
+        force: a.force || overrides.force,
+        ignoreVisibility: a.ignore_visibility,
+        visual: overrides.visual ?? a.visual,
+        speed: overrides.speed ?? a.speed,
+      });
+
+    const reobserve = async (): Promise<boolean> => {
+      const s = this.sm.getActive();
+      if (!s?.engine) return false;
+      await s.observer.observe(s.engine, undefined, "minimal", true);
+      return true;
+    };
+
+    const dismissOverlays = async (): Promise<boolean> => {
+      if (a.dismiss_overlays === false) return false;
+      const handled = await this.ctrl.handleOverlays({ handle_js_alerts: false });
+      return !!(handled.result as any)?.dismissed?.length;
+    };
+
+    /**
+     * Visual-cursor leverage: when the deterministic click path fails, the next
+     * dispatch glides a real cursor to the target and clicks with trusted input.
+     * It hit-tests an 11-point probe grid and carries a genuine press/hold/
+     * release, so it lands on badge-covered or layered targets (and on pages
+     * that distrust raw synthetic clicks). `fast` keeps the cost to a few
+     * hundred ms, and it is the LAST rung: the fast path still runs first.
+     */
+    let useVisual = false;
+    const visualClick = async (): Promise<boolean> => {
+      if (a.visual === true) return false;      // caller already asked for it
+      if (a.force === true) return false;       // force already bypasses guards
+      useVisual = true;
+      visualFallback = { used: true, speed: "fast" };
+      return true;
+    };
+
+    const escalations = [
+      { name: "dismiss-overlays", run: dismissOverlays },
+      { name: "re-observe", run: reobserve },
+      { name: "visual-click", run: visualClick },
+    ];
+
     let overlays: unknown;
-    // This engine error is issued before input dispatch. Only that case can
-    // safely dismiss an overlay and retry the original action once.
-    if (!response.ok && response.error?.message.includes('ELEMENT_OBSCURED') && a.dismiss_overlays !== false) {
-      const handled = await this.ctrl.handleOverlays({handle_js_alerts:false});
-      overlays = handled;
-      if ((handled.result as any)?.dismissed?.length) response = await dispatch();
+    let visualFallback: { used: boolean; speed: string } | undefined;
+    let response: any;
+    try {
+      response = await withRetry(() => dispatch(useVisual ? { visual: true, speed: "fast" } : {}), {
+        retryOn: CLICK_RETRY_CODES,
+        delayMs: 150,
+        escalations,
+        // P1-D: the ladder is bounded so a recoverable failure can't become a stall.
+        budgetMs: 12000,
+      });
+    } catch (err) {
+      // withRetry exhausted the ladder. Surface the classified error, but keep
+      // the overlay report so the model can see what was (and wasn't) dismissed.
+      try {
+        const handled = await this.ctrl.handleOverlays({ handle_js_alerts: false });
+        overlays = handled.result;
+      } catch { /* ignore */ }
+      response = { ok: false, error: shapeError(toErrorEnvelope(err), "page.click") };
     }
+
     if (!response.ok && a.ocr_fallback === true && a.target.text && !a.scope && (!a.button || a.button==='left') && (!a.click_count || a.click_count===1) && response.error?.code==='TARGET_NOT_FOUND') {
       try { return await finish({...await cvEnhancedClick(createKruzCVBridge(engine), a.target.text, {timeout:Math.min(a.timeout_ms??5000,10000)}), method:'azure-ocr-fallback'}); }
-      catch(error){return {ok:false,error:{code:'OCR_CLICK_FAILED',message:String(error),retryable:false},retry_safe:false};}
+      catch(error){return {ok:false,error:kruzError(ErrCode.OCR_CLICK_FAILED,{subsystem:'ocr',message:String(error),cause:error,trace:['router']}).toJSON(),retry_safe:false};}
     }
-    return finish({...response, ...(overlays ? {overlay_handling:overlays} : {})});
-  }
-
-  private async frames() {
-    const s = this.sm.getActive();
-    if (!s?.engine) return this.noSess();
-    const fr = await s.engine.frames();
-    return { ok: true, frames: fr.map((f, i) => ({ index: i, name: f.name, url: f.url, isMain: f.isMain })) };
+    return finish({...response, ...(overlays ? {overlay_handling:overlays} : {}), ...(visualFallback ? {visual_fallback:visualFallback} : {})});
   }
 
   private async extText(a: Record<string, any>) {
@@ -379,32 +576,14 @@ export class ToolRouter {
       if (len > 10) return;
     }
   }
-  private extTable(a: Record<string, any>) { const s = this.sm.getActive(); if (!s?.engine) return this.noSess(); return s.extractor.extractTable(s.engine, a.target, a.fallback, a.scope, this.pid(), "tab1"); }
-  private extLinks(a: Record<string, any>) { const s = this.sm.getActive(); if (!s?.engine) return this.noSess(); return s.extractor.extractLinks(s.engine, a.scope, a.filter, this.pid(), "tab1"); }
-  private extForm(a: Record<string, any>) { const s = this.sm.getActive(); if (!s?.engine) return this.noSess(); return s.extractor.extractForm(s.engine, a.target, a.fallback, a.scope, this.pid(), "tab1", s.observer.getRefMap()); }
-  private extTarget(a: Record<string, any>) { const s = this.sm.getActive(); if (!s?.engine) return this.noSess(); return s.extractor.extractTarget(s.engine, a.target, a.fallback, a.scope, a.verify ?? false, this.pid(), "tab1"); }
-
-  private async confirm(a: Record<string, any>) {
-    if (a.confirmed === true) {
-      let r: any;
-      switch (a.action || "click") {
-        case "click": r = await this.ctrl.click(a.target || {}); break;
-        case "fill": r = await this.ctrl.fill(a.target || {}, a.value || ""); break;
-        case "submit": r = await this.ctrl.submit(a.target); break;
-        default: r = { ok: true };
-      }
-      return { ...r, status: "executed", action: a.action, message: `Confirmed action '${a.action}' executed.` };
-    }
-    return { ok: true, status: "needs_confirmation", action: a.action, target: a.target, website: a.website, reversible: a.reversible ?? true, message: `Confirmation requested for: ${a.action}.`, hint: "Re-call with confirmed=true to proceed." };
-  }
 
   // Issue 1 & 7: Auto-retry with new session on browser crash
   private async openWithRetry(url: string, waitFor?: string, timeoutMs?: number, retries = 1, detectRedirect?: boolean): Promise<any> {
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      // K1: networkidle NEVER resolves on SPAs with WebSockets (Oracle HCM, etc.)
-      // Convert to domcontentloaded which always completes. The internal fallback
-      // in ctrl.open() will handle the rest.
-      const effectiveWait = (waitFor === "networkidle") ? "domcontentloaded" : (waitFor as any);
+    // K1: networkidle NEVER resolves on SPAs with WebSockets (Oracle HCM, etc.)
+    // Convert to domcontentloaded which always completes. The internal fallback
+    // in ctrl.open() will handle the rest.
+    const effectiveWait = (waitFor === "networkidle") ? "domcontentloaded" : (waitFor as any);
+    const attempt = async (): Promise<any> => {
       const result = await this.ctrl.open(url, effectiveWait, timeoutMs);
       if (result.ok) {
         // Deep-link redirect detection (Accenture-style: jobdetails → search page)
@@ -426,25 +605,36 @@ export class ToolRouter {
         }
         return result;
       }
+      // A non-crash failure is terminal — do not burn the retry budget.
+      if (result.error?.code !== ErrCode.BROWSER_CRASHED) throw kruzErrorFromThrown(result.error, { subsystem: "session" });
+      throw kruzError(ErrCode.BROWSER_CRASHED, { subsystem: "session", message: result.error?.message ?? "Browser disconnected during navigation.", cause: result.error });
+    };
 
-      // Check if browser crashed — auto-create new session and retry
-      if (result.error?.code === "BROWSER_CRASHED" && attempt < retries) {
-        process.stderr.write(`[kruz] Browser crashed during page.open, auto-recreating session (attempt ${attempt + 1}/${retries})\n`);
-        try { await this.sm.close(undefined, false); } catch { /* ignore */ }
-        try { await this.sm.create(); } catch { /* ignore */ }
-        continue;
+    const recreateSession = async (): Promise<boolean> => {
+      process.stderr.write("[kruz] Browser crashed during page.open, recreating session\n");
+      try { await this.sm.close(undefined, false); } catch { /* ignore */ }
+      try { await this.sm.create(); return true; } catch { return false; }
+    };
+
+    const escalations = retries > 0 ? [{ name: "recreate-session", run: recreateSession }] : [];
+    try {
+      return await withRetry(attempt, { retryOn: [ErrCode.BROWSER_CRASHED], escalations });
+    } catch (err) {
+      const env = toErrorEnvelope(err);
+      // Preserve the original navigation failure; only report exhaustion when the
+      // ladder ran out of attempts on a genuinely retryable cause.
+      if (env.code === ErrCode.BROWSER_CRASHED && retries > 0) {
+        return { ok: false, error: kruzError(ErrCode.RETRY_EXHAUSTED, { subsystem: "router", message: "All navigation retry attempts exhausted after browser crashes.", cause: err, trace: ["router"] }).toJSON() };
       }
-
-      return result;
+      return { ok: false, error: shapeError(env, url.includes("jobdetails") ? "page.open" : "page.goto") };
     }
-    return { ok: false, error: { code: "RETRY_EXHAUSTED", message: "All retry attempts exhausted", retryable: false } };
   }
 
   private pid(): string {
     const s = this.sm.getActive();
     return s?.engine ? "p1" : "p1";
   }
-  private noSess() { return { ok: false, error: { code: "NO_SESSION", message: "No active session in this MCP server instance. Compare server_instance_id with previous responses; call session.create here to start a session.", retryable: true } }; }
+  private noSess() { return { ok: false, error: kruzError(ErrCode.NO_SESSION, { subsystem: "session", message: "No active session in this MCP server instance. Compare server_instance_id with previous responses; call session.create here to start a session.", trace: ["router"] }).toJSON() }; }
   getSessionManager() { return this.sm; }
 
   // ── Server diagnostics (no session required) ───────────────────────────
@@ -456,10 +646,14 @@ export class ToolRouter {
     const pages = s?.engine ? (await s.engine.listTabs().catch(() => [])).length : 0;
     return {
       ok: true,
-      server: { name: "kruz", version: KRUZ_VERSION, uptime: Math.round((Date.now() - KRUZ_START_MS) / 1000) },
+      server: { name: "kruz", version: KRUZ_VERSION, uptime: Math.round((Date.now() - KRUZ_START_MS) / 1000), build: buildInfo() },
       session: s ? { status: s.status, session_id: s.id, browser_connected: this.ctrl.isBrowserConnected(), active_page: activePage, pages } : null,
-      config: { engine: s?.engine?.kind ?? null, extension_configured: !!config.extensionPath, extension_ready: s?.engine ? (await s.engine.evaluate("!!window.__kruz_extension_ready__").catch(() => ({ result: false }))).result === true : false, headless: config.headless, viewport: { width: config.viewportWidth, height: config.viewportHeight }, safety_policy: config.safetyPolicy, locale: config.locale },
+      config: { engine: s?.engine?.kind ?? null, headless: config.headless, viewport: { width: config.viewportWidth, height: config.viewportHeight }, safety_policy: config.safetyPolicy, locale: config.locale },
       tools_count: KNOWN_TOOLS.size,
+      docs: {
+        skill: "kruz://skill",
+        instruction: "Read kruz://skill before using tools. It contains everything about Kruz MCP: what it is, how it works, and how to use it.",
+      },
       message: "Kruz MCP server is connected and operational.",
     };
   }

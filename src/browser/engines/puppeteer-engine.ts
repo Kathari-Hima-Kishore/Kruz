@@ -10,9 +10,6 @@
  *   1. Kruz launcher spawns Chrome with the right flags.
  *   2. PuppeteerEngine connects to Chrome's CDP WebSocket.
  *   3. Every `page.*` action in Kruz goes through this engine.
- *   4. When the Kruz Extension is loaded, query operations that need
- *      `document_start` timing or closed-shadow-piercing are routed
- *      through the extension's content-script portal (via page.evaluate).
  *
  * Element handles:
  *   KruzElement is just an opaque `{ handle, strategy, target, resolvedAt }`.
@@ -21,13 +18,14 @@
  */
 
 import puppeteer, { type Page, type Browser, type ElementHandle, type Dialog } from "puppeteer-core";
-import { resolve } from "node:path";
 import type {
   BrowserEngine, KruzElement, KruzFrame, EvalResult, NetworkEvent,
   ConsoleEvent, DialogEvent, KruzTab, EngineCapability,
 } from "../engine.js";
 import type { Target, Fallback } from "../../types/schema.js";
 import type { P1Config } from "../../config.js";
+import { computePath, stepDelaysMs, visualLayerScript } from "../visual-cursor.js";
+import { stealthScript } from "../stealth.js";
 
 /* ── tiny helpers ──────────────────────────────────────────────────── */
 
@@ -69,6 +67,8 @@ export class PuppeteerEngine implements BrowserEngine {
   private _dialogPolicy?: { action: "accept" | "dismiss"; value?: string };
   private _config: P1Config | null = null;
   private evaluateTimeoutMs = 5000;
+  /** Last point the visible cursor acted on, so a later glide starts there. */
+  private _lastCursor?: { x: number; y: number };
 
   constructor(private readonly launchBrowser: boolean, private readonly cdpEndpoint?: string) {}
 
@@ -80,12 +80,14 @@ export class PuppeteerEngine implements BrowserEngine {
     this._config = config;
     if (this.launchBrowser) {
       const chromeFlags = [
-        "--disable-blink-features=AutomationControlled",
+        // NOTE: --disable-blink-features=AutomationControlled was removed on
+        // purpose. Chrome shows the "You are using an unsupported command-line
+        // flag ... Stability and security will suffer" infobar for it, which is
+        // both a UX wart and a tell in front of the user. The automation tells
+        // it protects are neutralised in-page instead (see stealthScript(),
+        // injected at document_start in the MAIN world): navigator.webdriver,
+        // the missing window.chrome.runtime and the CDP/plugin query leaks.
         "--allow-file-access-from-files",
-        // Required for extensions (incl. manually-installed ones) to run in
-        // a Puppeteer-launched Chrome — Puppeteer's defaults disable them.
-        "--disable-features=DisableLoadExtensionCommandLineSwitch",
-        ...(config.extensionPath ? ["--enable-unsafe-extension-debugging"] : []),
         ...(config.headless ? [] : ["--start-maximized"]),
       ];
       this._browser = await puppeteer.launch({
@@ -94,7 +96,6 @@ export class PuppeteerEngine implements BrowserEngine {
         userDataDir: profileDir,
         args: chromeFlags,
         defaultViewport: null,
-        pipe: !!config.extensionPath,
         ignoreDefaultArgs: ["--enable-automation", "--disable-extensions", "--disable-component-extensions-with-background-pages"],
       });
     } else if (this.cdpEndpoint) {
@@ -102,15 +103,13 @@ export class PuppeteerEngine implements BrowserEngine {
     } else {
       throw new Error("PuppeteerEngine: either launchBrowser=true or cdpEndpoint required");
     }
-    if (this.launchBrowser && config.extensionPath) {
-      const cdp = await this._browser.target().createCDPSession();
-      try { await cdp.send("Extensions.loadUnpacked" as any, { path: resolve(config.extensionPath) }); }
-      catch (error) { await this.shutdown(); throw new Error(`Kruz extension could not be loaded through Chrome extension debugging: ${error}`); }
-      finally { await cdp.detach().catch(() => {}); }
-    }
     const pages = await this._browser.pages();
     this._page = pages[0] ?? (await this._browser.newPage());
     this.attachHandlers(this._page);
+    // Automation tells are removed in-page at document_start (see stealth.ts) —
+    // this replaces the --disable-blink-features=AutomationControlled flag, which
+    // Chrome answers with an "unsupported command-line flag" infobar.
+    await this.installStealth().catch(() => {});
     // K31+: If Chrome dies (renderer OOM, hard crash on a hostile page) puppeteer fires
     // "disconnected" — without this, `connected` stays true and callers would think the
     // session is alive while every call hangs. Marking it false lets the router's
@@ -261,6 +260,69 @@ export class PuppeteerEngine implements BrowserEngine {
     }
   }
 
+  /**
+   * Settled-aware poll (P0-A). Like waitFor, but distinguishes "the page is still
+   * materially changing, keep waiting" from "the page has stopped changing and the
+   * predicate is still false — stop now". The page is considered settled once the
+   * document is interactive AND the DOM has produced no mutations for `settleMs`.
+   * §36b: the in-page tracker accumulates a mutation count in the MAIN world; if it
+   * is unavailable the resolver is conservative and reports "never settled" so an
+   * early failure can never be declared without positive evidence of stability.
+   */
+  async waitForSettled(
+    predicateJs: string,
+    opts: { timeoutMs?: number; intervalMs?: number; settleMs?: number; minWaitMs?: number } = {},
+  ): Promise<{ met: boolean; settled: boolean; attempts: number; elapsedMs: number }> {
+    const timeoutMs = opts.timeoutMs ?? 10000;
+    const intervalMs = opts.intervalMs ?? 200;
+    const settleMs = opts.settleMs ?? 700;
+    // §5: never declare an early failure before this floor. Short bounded work —
+    // hydration bursts, one-shot setTimeout renders, XHR-then-render — regularly
+    // produces a quiet DOM for a second or so BEFORE the awaited content appears.
+    // Without the floor the settle detector would reject exactly the case it exists
+    // to catch. The floor is what keeps early failure honest.
+    const minWaitMs = Math.max(0, Math.min(opts.minWaitMs ?? 1500, timeoutMs));
+    const started = Date.now();
+    const deadline = started + timeoutMs;
+    const floor = started + minWaitMs;
+    let lastCount = -1;
+    let lastChangeAt = started;
+    let attempts = 0;
+    // P0-A: guarantee the in-page mutation tracker exists for THIS document. The
+    // Observer installs it lazily on observe, but a wait may be the first tool call
+    // after a navigation (fresh document, tracker gone). Installing it here makes the
+    // settled detector self-sufficient — and if it cannot be installed we never
+    // declare an early failure (the conservative branch below requires numeric data).
+    await this.evaluate(`(() => { try { if (typeof window.__p1MutationCount !== 'function') { let c = 0; new MutationObserver(() => c++).observe(document.documentElement, { childList: true, subtree: true, attributes: true }); window.__p1MutationCount = () => c; } return true; } catch (e) { return false; } })()`).catch(() => null);
+    for (;;) {
+      attempts++;
+      const probe = `(() => {
+        let met = false;
+        try { met = !!((${predicateJs})); } catch (e) { met = false; }
+        let mutations = null;
+        try { const f = window.__p1MutationCount; if (typeof f === 'function') mutations = f(); } catch (e) { mutations = null; }
+        const ready = document.readyState !== 'loading';
+        const complete = document.readyState === 'complete';
+        return { met, mutations, ready, complete };
+      })()`;
+      const r = await this.evaluate(probe).catch(() => ({ ok: false as const }));
+      const res = r.ok ? (r.result as { met: boolean; mutations: number | null; ready: boolean; complete?: boolean } | null) : null;
+      if (res?.met) return { met: true, settled: false, attempts, elapsedMs: Date.now() - started };
+      const now = Date.now();
+      // §36b: only trust the tracker when it is actually available.
+      if (res && typeof res.mutations === "number") {
+        if (res.mutations !== lastCount) { lastCount = res.mutations; lastChangeAt = now; }
+        const stableFor = now - lastChangeAt;
+        // Early failure requires: past the floor, document fully loaded, and a quiet DOM.
+        if (now >= floor && res.ready && res.complete !== false && stableFor >= settleMs) {
+          return { met: false, settled: true, attempts, elapsedMs: now - started };
+        }
+      }
+      if (now >= deadline) return { met: false, settled: false, attempts, elapsedMs: now - started };
+      await sleep(intervalMs);
+    }
+  }
+
   /* ── tabs ───────────────────────────────────────────────────── */
 
   /** Stable id for a page — survives navigation, unlike URL-as-id. */
@@ -307,6 +369,9 @@ export class PuppeteerEngine implements BrowserEngine {
     try { if (viewport) await p.setViewport(viewport); }
     catch (error) { await p.close().catch(() => {}); throw error; }
     this.attachHandlers(p);
+    // A new tab is a new document: give it the same automation-tell masking.
+    await p.evaluateOnNewDocument(stealthScript()).catch(() => {});
+    await p.evaluate(stealthScript()).catch(() => {});
     // K32: the old code never assigned this._page to the new tab, so the
     // "switch to it" contract was broken — controller.newTab brought the OLD
     // tab to front and every subsequent action ran against the wrong page.
@@ -469,8 +534,92 @@ export class PuppeteerEngine implements BrowserEngine {
     return `${scope ? `${scope} ` : "body "}>>> ${inner}`;
   }
 
+  /**
+   * P0-A/QF: budgeted waitForSelector that stops early when the document is loaded
+   * and the DOM has been mutation-quiet. A quiet document cannot produce the
+   * element, so an impossible selector fails in ~1.5s instead of burning the whole
+   * budget (the "impossible target" cost this replaces was 3-5s per miss).
+   * Conservative by construction: without numeric tracker data we never stop early,
+   * and the caller's budget is always the hard ceiling.
+   */
+  private async waitForSelectorQuiet(sel: string, timeoutMs: number): Promise<boolean> {
+    const started = Date.now();
+    const deadline = started + timeoutMs;
+    // Same floor rationale as waitForSettled: hydration bursts regularly go quiet
+    // for ~1s BEFORE the awaited node appears, so early failure needs a floor.
+    const floor = started + Math.min(1500, timeoutMs);
+    const settleMs = 600;
+    const installed = await this.evaluate(`(() => { try { if (typeof window.__p1MutationCount !== 'function') { let c = 0; new MutationObserver(() => c++).observe(document.documentElement, { childList: true, subtree: true, attributes: true }); window.__p1MutationCount = () => c; } return true; } catch (e) { return false; } })()`).catch(() => null);
+    const tracked = installed?.ok === true && (installed as any).result === true;
+    let lastCount = -1;
+    let lastChangeAt = started;
+    for (;;) {
+      const remain = deadline - Date.now();
+      if (remain <= 0) return false;
+      const hit = await this.page.waitForSelector(sel, { timeout: Math.min(250, remain) }).catch(() => null);
+      if (hit) { await hit.dispose().catch(() => {}); return true; }
+      // No tracker → no positive evidence of stability → wait the full budget.
+      if (!tracked) continue;
+      const r = await this.evaluate(`(() => { try { const f = window.__p1MutationCount; return { mutations: typeof f === 'function' ? f() : null, ready: document.readyState !== 'loading', complete: document.readyState === 'complete' }; } catch (e) { return null; } })()`).catch(() => ({ ok: false as const }));
+      const info = r.ok ? (r.result as { mutations: number | null; ready: boolean; complete?: boolean } | null) : null;
+      const now = Date.now();
+      if (info && typeof info.mutations === "number") {
+        if (info.mutations !== lastCount) { lastCount = info.mutations; lastChangeAt = now; }
+        if (now >= floor && info.ready && info.complete !== false && now - lastChangeAt >= settleMs) return false;
+      }
+      if (now >= deadline) return false;
+    }
+  }
+
+  /**
+   * Wrap the node stashed in-page by the marker's `markScript`.
+   *
+   * The node object is the strongest handle available: it survives shadow roots
+   * (no CSS selector reaches into one), and it cannot drift onto a different
+   * node the way a re-run `page.$(selector)` can. Falls back to the selector
+   * when the stash is unavailable.
+   */
+  async takeMarkedNode(fallbackCss: string, target: Target): Promise<KruzElement | null> {
+    const js = await this.page
+      .evaluateHandle(() => {
+        try { return (window as any).__kruzMarkedNode ?? null; } catch { return null; }
+      })
+      .catch(() => null);
+    const node = js?.asElement?.() ?? null;
+    if (node) {
+      return { handle: fallbackCss, strategy: "pinned-node", target, resolvedAt: Date.now(), node };
+    }
+    await js?.dispose?.().catch(() => {});
+    return await this.queryOne({ css: fallbackCss }, undefined, undefined, 500).catch(() => null);
+  }
+
+  /**
+   * Wrap a pinned node so per-operation cleanup cannot invalidate it.
+   *
+   * A KruzElement carrying `node` is used by several engine calls in one action
+   * (evaluate, attribute, click, ...), and each of those disposes the handle it
+   * was given. Disposing the pinned node on the first call made every later call
+   * fail with "JSHandle is disposed!". The pinned node outlives the action and
+   * is owned by the KruzElement, so disposal is suppressed here and left to
+   * the garbage collector.
+   */
+  private pinnedHandle(node: ElementHandle): ElementHandle {
+    return new Proxy(node, {
+      get(target, prop, receiver) {
+        if (prop === "dispose") return async () => { /* owned by the KruzElement */ };
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as unknown as ElementHandle;
+  }
+
   async queryOne(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 3000): Promise<KruzElement | null> {
     const sel = this.selectorFor(target, fallback, scope);
+    // P2-A: plain-CSS resolution respects the caller's remaining budget instead of a
+    // fixed 3s. The controller propagates its action timeout here so a "does this exist
+    // now?" click on a small budget fails fast (the caller can still request a longer
+    // wait via page.wait when it genuinely expects the element to appear).
+    timeoutMs = Math.max(0, Math.min(timeoutMs, 5000));
     // K31: Puppeteer's custom pseudo-selectors (:text(), :has-text(), :xpath/) run through its
     // own selector engine and can keep waiting the full timeout (3s) even when the match is
     // split across nodes/shadow DOM/iframes — which, when looped (observer text probes,
@@ -489,8 +638,20 @@ export class PuppeteerEngine implements BrowserEngine {
         }
         return this.queryChildFrame(target, fallback, scope, sel);
       }
+      // P2-A: when the budget is effectively zero, don't wait at all — just check now.
+      if (timeoutMs <= 100) {
+        const hit = await this.page.$(sel).catch(() => null);
+        if (hit) { await hit.dispose(); return { handle: sel, strategy: "selector", target, fallback, scope, resolvedAt: Date.now() }; }
+        const deep = this.deepSelector(target, fallback, scope);
+        if (deep) {
+          const hitDeep = await this.page.$(deep).catch(() => null);
+          if (hitDeep) { await hitDeep.dispose(); return { handle: deep, strategy: "deep-selector", target, fallback, scope, resolvedAt: Date.now() }; }
+        }
+        return this.queryChildFrame(target, fallback, scope, sel);
+      }
       try {
-        await this.page.waitForSelector(sel, { timeout: timeoutMs });
+        const found = await this.waitForSelectorQuiet(sel, timeoutMs);
+        if (!found) throw new Error("not found");
         return { handle: sel, strategy: "selector", target, fallback, scope, resolvedAt: Date.now() };
       } catch {
         // Plain CSS that the document can't see may live inside an (open) shadow
@@ -544,6 +705,9 @@ export class PuppeteerEngine implements BrowserEngine {
   /** Re-resolve a KruzElement handle to a live Puppeteer ElementHandle. */
   private async resolveHandle(el: KruzElement): Promise<ElementHandle | null> {
     try {
+      // A pinned node is authoritative — see KruzElement.node. Re-querying by
+      // handle here could silently resolve to a different node.
+      if (el.node) return this.pinnedHandle(el.node as ElementHandle);
       if (el.handle.startsWith('frame:')) {
         const [url, selector] = JSON.parse(el.handle.slice(6));
         const frames = this.page.frames().filter(f => f.url() === url);
@@ -576,7 +740,10 @@ export class PuppeteerEngine implements BrowserEngine {
 
   /* ── element operations ──────────────────────────────────────── */
 
-  async click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number }): Promise<void> {
+  async click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow" }): Promise<void> {
+    // Open the dispatch window BEFORE any waiting: the obscured check, the
+    // scroll and Puppeteer's actionability wait are all part of this click.
+    await this.expectInput(Math.max(3000, opts?.timeoutMs ?? 5000));
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
     try {
@@ -585,11 +752,53 @@ export class PuppeteerEngine implements BrowserEngine {
       const visible = await handle.isVisible();
       if (!visible && !opts?.force) throw new Error('ELEMENT_NOT_VISIBLE');
       await this.scrollHandleIntoView(handle);
+
+      // Native built-in controls are opened correctly by a real mouse click at
+      // their box centre but are unreliable under a synthesized/element click
+      // (file pickers, date pickers, and especially <select>). Playwright/
+      // Puppeteer semantics only apply when the caller did not force or opt
+      // into the visual-cursor glide.
+      const tag = await handle.evaluate((n: any) => n.tagName).catch(() => "");
+      const nativeClick = !opts?.force && !opts?.visual && (tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA");
+      if (nativeClick) {
+        const box = await handle.boundingBox().catch(() => null);
+        if (box && box.width > 0 && box.height > 0) {
+          await this.rememberCursor({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
+          await handle.click({ button: opts?.button, clickCount: opts?.clickCount });
+          return;
+        }
+      }
+
+      if (opts?.visual) {
+        // Virtual-cursor path: glide a human-like trajectory and dispatch real
+        // CDP input, so the click is trusted AND visibly verifiable. The
+        // obscured guard still applies — the cursor must never click through an
+        // overlay the page put there on purpose.
+        const point = await this.computeClickPoint(handle, !!opts.force);
+        if (point) { await this.glideAndClick(point, opts); return; }
+      }
+      // W7: when the centre is covered but an alternate probe point is clear,
+      // click the clear point with trusted CDP input instead of failing.
+      let probeClick: { x: number; y: number } | null = null;
       if (!opts?.force) {
         const covered = await handle.evaluate((node: any) => {
           const r = node.getBoundingClientRect();
+          const inViewport = (x: number, y: number) => x >= 0 && y >= 0 && x <= innerWidth && y <= innerHeight;
           const x = r.left + r.width / 2, y = r.top + r.height / 2;
+          // D6: an offscreen or zero-size centre cannot be hit-tested — that is
+          // a visibility problem, not an overlay. Report it as such instead of
+          // "obscured by null".
+          if (r.width === 0 || r.height === 0 || !inViewport(x, y)) return "OFFSCREEN";
+          // A frame is a container, not an obstruction: everything inside it is
+          // the target's own content. Hit-testing an <iframe> with
+          // elementFromPoint in the parent document retargets to the frame's
+          // inner node (a SPAN in TinyMCE, a DIV in a video player), which made
+          // every iframe on a real page report ELEMENT_OBSCURED.
+          if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') return false;
           let hit = node.ownerDocument.elementFromPoint(x, y);
+          // A hit that lives in a different document is inside a child frame, so
+          // it is not an overlay covering this element.
+          if (hit && hit.ownerDocument !== node.ownerDocument) return false;
           const seen = new Set();
           // document.elementFromPoint retargets slotted controls to a shadow host.
           // Descend through the composed hit tree before declaring an obstruction.
@@ -604,21 +813,192 @@ export class PuppeteerEngine implements BrowserEngine {
           for (let current = hit; current; current = current.assignedSlot || current.parentElement || current.getRootNode()?.host) {
             if (current === node || node.contains(current)) return false;
           }
+          // A blocker that is itself a frame is not covering us either.
+          if (hit?.tagName === 'IFRAME' || hit?.tagName === 'FRAME') return false;
           return { target: node.tagName, hit: hit?.tagName ?? null, hit_id: hit?.id ?? null, x, y };
         });
-        if (covered) throw new Error(`ELEMENT_OBSCURED: ${JSON.stringify(covered)}`);
+        if (covered === "OFFSCREEN") throw new Error("ELEMENT_NOT_VISIBLE");
+        if (covered) {
+          probeClick = await this.computeClickPoint(handle, false).catch(() => null);
+          if (!probeClick) throw new Error(`ELEMENT_OBSCURED: ${JSON.stringify(covered)}`);
+        }
       }
       const page = this.page;
       let listener: ((dialog: Dialog) => void) | undefined;
       const dialogOpened = new Promise<void>(resolve => { listener = () => resolve(); page.once('dialog', listener); });
       try {
-        const action = opts?.force ? handle.evaluate((node: any) => node.click()) : handle.click({button: opts?.button, clickCount: opts?.clickCount});
+        // The probe path dispatches trusted CDP input at a clear point — move
+        // the visible cursor there first so the user sees where it lands.
+        if (probeClick) await this.rememberCursor(probeClick);
+        const action = opts?.force
+          // Force path synthesizes untrusted DOM events — mark them as the
+          // model's own so the control lock's untrusted-input filter lets them
+          // through (synchronous dispatch, so the flag cannot leak to user input).
+          ? handle.evaluate((node: any) => { const w = window; w.__kruzAutomationBypass = true; try { node.click(); } finally { w.__kruzAutomationBypass = false; } })
+          : probeClick
+            ? this.page.mouse.click(probeClick.x, probeClick.y, { button: opts?.button ?? "left", clickCount: opts?.clickCount ?? 1 })
+            : (async () => {
+                // Default handle.click path: move cursor to the element center so the
+                // visible cursor always tracks the model's actions.
+                const box = await handle.boundingBox().catch(() => null);
+                if (box && box.width > 0 && box.height > 0) {
+                  await this.rememberCursor({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
+                }
+                return handle.click({ button: opts?.button, clickCount: opts?.clickCount });
+              })();
         await Promise.race([action, dialogOpened]);
       } finally { if (listener) page.off('dialog', listener); }
     } finally {
       // Disposal waits on renderer execution while a native dialog is open.
       if (!this._dialogQueue.some(d => d.page === this.page)) await handle.dispose().catch(() => {});
+      this.endInput();
     }
+  }
+
+  /** Remember where the visible cursor last acted, purely in memory. */
+  private async rememberCursor(point: { x: number; y: number }): Promise<void> {
+    this._lastCursor = point;
+    await this.page.evaluate((x: number, y: number) => { try { (window as any).__kruzVisual?.setPos(x, y); } catch { /* no layer */ } }, point.x, point.y).catch(() => {});
+  }
+
+  /**
+   * Pick a reliable click point for an element.
+   *
+   * The geometric centre is wrong surprisingly often: a badge, a spinner, or a
+   * sticky sibling can sit exactly on top of it. Probe a small inset grid and
+   * return the first point that hit-tests back to the element (or a descendant),
+   * so a click still lands when the centre is covered.
+   */
+  private async computeClickPoint(handle: ElementHandle, force: boolean): Promise<{ x: number; y: number } | null> {
+    const probe = await handle.evaluate((node: any, force: boolean) => {
+      const r = node.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return null;
+      const w = r.width, h = r.height;
+      const inset = (fx: number, fy: number) => ({ x: r.left + w * fx, y: r.top + h * fy });
+      // Centre first, then an inset ring, then the corners.
+      const pts = [
+        inset(0.5, 0.5), inset(0.5, 0.35), inset(0.35, 0.5), inset(0.65, 0.5), inset(0.5, 0.65),
+        inset(0.3, 0.3), inset(0.7, 0.3), inset(0.3, 0.7), inset(0.7, 0.7), inset(0.5, 0.8), inset(0.5, 0.2),
+      ];
+      const inViewport = (p: any) => p.x >= 0 && p.y >= 0 && p.x <= innerWidth && p.y <= innerHeight;
+      if (force) { const c = pts[0]; return inViewport(c) ? c : null; }
+      for (const p of pts) {
+        if (!inViewport(p)) continue;
+        let hit = document.elementFromPoint(p.x, p.y);
+        const seen = new Set();
+        while (hit?.shadowRoot && !seen.has(hit)) { seen.add(hit); const d = hit.shadowRoot.elementFromPoint(p.x, p.y); if (!d || d === hit) break; hit = d; }
+        if (!hit) continue;
+        for (let cur: any = hit; cur; cur = (cur as any).assignedSlot || cur.parentElement || (cur.getRootNode() as any)?.host) {
+          if (cur === node || node.contains(cur)) return p;
+        }
+        // An <iframe> never covers its own interior.
+        if (hit.tagName === 'IFRAME' && (node.tagName === 'IFRAME' || node.contains(hit))) return p;
+      }
+      return null;
+    }, force).catch(() => null);
+    if (probe) return probe as { x: number; y: number };
+    // A null probe in non-force mode means FULLY COVERED (every in-viewport
+    // point failed the hit-test) — never fall back to the covered centre.
+    // Force mode keeps the legacy box-centre fallback: it bypasses
+    // actionability by design.
+    if (force) {
+      const box = await handle.boundingBox().catch(() => null);
+      if (box) return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    }
+    return null;
+  }
+
+  /**
+   * Glide the virtual cursor to a point and click with real CDP input.
+   *
+   * Each step updates the visual and dispatches a trusted `Input.dispatchMouseEvent`
+   * move, so what the operator watches is exactly what the page receives. The
+   * press/hold/release gap is real (not zero-duration) because a mousedown and
+   * mouseup in the same millisecond is a strong automation tell.
+   */
+  private async glideAndClick(point: { x: number; y: number }, opts: { button?: "left" | "right" | "middle"; clickCount?: number; speed?: "instant" | "fast" | "normal" | "slow" }): Promise<void> {
+    const speed = opts.speed ?? "normal";
+    const from = await this.virtualCursorPos();
+    const path = computePath(from, point, { speed });
+    const delays = stepDelaysMs(path, { speed });
+    const button = opts.button ?? "left";
+
+    const dialogOpened = new Promise<void>((resolve) => {
+      const l = () => resolve();
+      this.page.once("dialog", l);
+      (this as any)._pendingDialogCleanup = () => this.page.off("dialog", l);
+    });
+
+    try {
+      for (let i = 0; i < path.length; i++) {
+        const p = path[i];
+        // Visual and trusted input advance together, step for step.
+        await this.page.evaluate((x: number, y: number) => { try { (window as any).__kruzVisual?.setPos(x, y); } catch { /* layer absent */ } }, p.x, p.y).catch(() => {});
+        await this.page.mouse.move(p.x, p.y);
+        const d = delays[i] ?? 0;
+        if (d > 0) await sleep(d);
+      }
+      await this.page.evaluate(() => { try { (window as any).__kruzVisual?.press(true); } catch { /* layer absent */ } }).catch(() => {});
+      await this.page.mouse.down({ button: button as any });
+      // A human press is not instantaneous.
+      const hold = speed === "instant" ? 0 : 35 + Math.round(Math.random() * 45);
+      if (hold) await sleep(hold);
+      await this.page.mouse.up({ button: button as any });
+      for (let i = 0; i < (opts.clickCount ?? 1) - 1; i++) {
+        await this.page.mouse.down({ button: button as any, clickCount: i + 2 as any });
+        await this.page.mouse.up({ button: button as any, clickCount: i + 2 as any });
+      }
+      await this.page.evaluate(() => {
+        try { const v = (window as any).__kruzVisual; v?.press(false); v?.ripple(); } catch { /* layer absent */ }
+      }).catch(() => {});
+      await Promise.race([sleep(0), dialogOpened]);
+    } finally {
+      (this as any)._pendingDialogCleanup?.();
+      (this as any)._pendingDialogCleanup = undefined;
+    }
+  }
+
+  /** Neutralise Chrome's automation tells in the page (MAIN world, every
+   *  document). Deliberately not a command-line flag — that one is fingerprinted
+   *  and triggers Chrome's "unsupported command-line flag" infobar. */
+  async installStealth(): Promise<void> {
+    const src = stealthScript();
+    await this.page.evaluateOnNewDocument(src).catch(() => {});
+    await this.page.evaluate(src).catch(() => {});
+  }
+
+  /** Install the visual control layer on this page and every future navigation. */
+  async installControlIndicator(opts: { status?: string | null; glow?: boolean } = {}): Promise<void> {
+    const src = visualLayerScript();
+    // Persist across navigations so a SPA route change does not drop the cursor.
+    await this.page.evaluateOnNewDocument(src).catch(() => {});
+    await this.page.evaluate(src).catch(() => {});
+    // Restore the last cursor position so it survives navigation.
+    if (this._lastCursor) {
+      await this.page.evaluate((x: number, y: number) => { try { (window as any).__kruzVisual?.setPos(x, y); } catch { /* ignore */ } }, this._lastCursor.x, this._lastCursor.y).catch(() => {});
+    }
+    if (opts.status !== undefined) {
+      await this.page.evaluate((s: string | null) => { try { (window as any).__kruzVisual?.setStatus(s); } catch { /* ignore */ } }, opts.status).catch(() => {});
+    }    if (opts.glow !== undefined) {
+      await this.page.evaluate((g: boolean) => { try { (window as any).__kruzVisual?.setGlow(g); } catch { /* ignore */ } }, opts.glow).catch(() => {});
+    }
+  }
+
+  async removeControlIndicator(): Promise<void> {
+    await this.page.evaluate(() => { try { (window as any).__kruzVisual?.destroy(); } catch { /* ignore */ } }).catch(() => {});
+  }
+
+  async virtualCursorPos(): Promise<{ x: number; y: number }> {
+    const r = await this.page.evaluate(() => {
+      const v = (window as any).__kruzVisual;
+      if (v?.getPos) { const q = v.getPos(); if (q && q.x > -50) return { x: q.x, y: q.y }; }
+      return null;
+    }).catch(() => null) as { ok: boolean; result?: { x: number; y: number } | null } | null;
+    if (r?.ok && r.result) return r.result;
+    // The layer is not installed yet (or was just re-injected on navigation):
+    // continue from wherever the cursor last acted so a glide does not jump.
+    if (this._lastCursor) return this._lastCursor;
+    return { x: 0, y: 0 };
   }
 
   async dblclick(el: KruzElement, opts?: { timeoutMs?: number }): Promise<void> {
@@ -632,6 +1012,8 @@ export class PuppeteerEngine implements BrowserEngine {
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
     await handle.hover();
+    const box = await handle.boundingBox().catch(() => null);
+    if (box) await this.rememberCursor({ x: box.x + box.width / 2, y: box.y + box.height / 2 });
     if (opts?.dwellMs) await sleep(opts.dwellMs);
     await handle.dispose().catch(() => {});
   }
@@ -686,15 +1068,6 @@ export class PuppeteerEngine implements BrowserEngine {
       return true;
     }, dir);
     await handle.dispose().catch(() => {});
-  }
-
-  /** Build a unique CSS selector for an already-resolved element (id-first,
-   *  else nth-of-type chain). Lets callers address the exact node via the
-   *  extension portal's trusted-event click instead of re-querying. */
-  async uniqueSelector(el: KruzElement): Promise<string | null> {
-    const r = await this.evaluateOn(el, `(() => { const n = this; if (!n || !n.tagName) return null; if (n.id) return '#' + CSS.escape(n.id); const parts = []; let cur = n; while (cur && cur !== document.body && parts.length < 6) { let seg = cur.tagName.toLowerCase(); const parent = cur.parentElement; if (parent) { const sibs = Array.from(parent.children).filter((c) => c.tagName === cur.tagName); if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')'; } parts.unshift(seg); cur = parent; } parts.unshift('body'); return parts.join(' > '); })()`).catch(() => ({ ok: false as const }));
-    const sel = r?.ok ? (r.result as string | null) : null;
-    return sel && sel.length < 500 ? sel : null;
   }
 
   async boundingBox(el: KruzElement): Promise<{ x: number; y: number; width: number; height: number } | null> {
@@ -774,11 +1147,19 @@ export class PuppeteerEngine implements BrowserEngine {
   /* ── form interactions ──────────────────────────────────────── */
 
   async fill(el: KruzElement, value: string, opts?: { force?: boolean; timeoutMs?: number }): Promise<void> {
+    await this.expectInput(Math.max(2000, opts?.timeoutMs ?? 5000));
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
     try {
       if (!opts?.force) { await this.scrollHandleIntoView(handle); await handle.focus(); }
+      // Focus the field even on the instant path too: a following page.press
+      // (e.g. Enter to submit a search) must reach the input, and an unfocused
+      // field silently drops it.
+      else { await this.scrollHandleIntoView(handle).catch(() => {}); await handle.focus().catch(() => {}); }
       await handle.evaluate((node: any, v: string) => {
+        // Model-synthesized input/change events — bypass the control lock filter.
+      const w = window; w.__kruzAutomationBypass = true;
+      try {
         if (node.disabled || node.readOnly) throw new Error("Cannot fill a disabled or readonly field");
         if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
           if (node instanceof HTMLInputElement && /^(checkbox|radio|file|submit|button|reset|image)$/.test(node.type)) throw new Error("Target is not a text field");
@@ -790,21 +1171,30 @@ export class PuppeteerEngine implements BrowserEngine {
         else throw new Error("Target is not editable");
         node.dispatchEvent(new Event("input", { bubbles: true }));
         node.dispatchEvent(new Event("change", { bubbles: true }));
+        } finally { w.__kruzAutomationBypass = false; }
       }, value);
       // Framework handlers may reject or transform the value. A resolved event
       // dispatch is not sufficient evidence of a successful replacement.
       await sleep(50);
       const actual = await handle.evaluate((node: any) => node.isContentEditable ? node.textContent : node.value);
       if (actual !== value) throw new Error("Fill did not retain the requested value");
-    } finally { await handle.dispose().catch(() => {}); }
+    } finally { await handle.dispose().catch(() => {}); this.endInput(); }
   }
 
   async type(el: KruzElement, text: string, opts?: { delayMs?: number; clear?: boolean; timeoutMs?: number }): Promise<void> {
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
     if (opts?.clear) await handle.evaluate((n: any) => { n.value = ""; });
-    await handle.type(text, { delay: opts?.delayMs ?? 0 });
-    await handle.dispose().catch(() => {});
+    // P2-B: element-level typing emits real key events, so it MUST run inside the
+    // dispatch window. Without it the in-page input lock cancels each keydown in the
+    // capture phase and the characters never reach the field.
+    await this.expectInput(2000 + text.length * ((opts?.delayMs ?? 0) + 20));
+    try {
+      await handle.type(text, { delay: opts?.delayMs ?? 0 });
+    } finally {
+      await handle.dispose().catch(() => {});
+      this.endInput();
+    }
   }
 
   async press(el: KruzElement | undefined, key: string, opts?: { timeoutMs?: number }): Promise<void> {
@@ -821,12 +1211,21 @@ export class PuppeteerEngine implements BrowserEngine {
     if (el) {
       const handle = await this.resolveHandle(el);
       if (handle) {
-        await handle.press(key as any);
-        await handle.dispose().catch(() => {});
+        // P2-B: ElementHandle.press dispatches trusted key events. The in-page input
+        // lock (visual-cursor.ts) cancels those events in the capture phase unless the
+        // model-dispatch window is open — which is why Enter never reached the input's
+        // own handlers and never triggered implicit form submission. Open it here.
+        await this.expectInput(Math.max(2000, opts?.timeoutMs ?? 0));
+        try {
+          await handle.press(key as any);
+        } finally {
+          await handle.dispose().catch(() => {});
+          this.endInput();
+        }
         return;
       }
     }
-    await this.page.keyboard.press(key as any);
+    await this.keyboardPress(key as any);
   }
 
   async selectOption(el: KruzElement, value: string | string[]): Promise<void> {
@@ -878,7 +1277,7 @@ export class PuppeteerEngine implements BrowserEngine {
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
     const tag = await handle.evaluate((n: Element) => n.tagName.toLowerCase());
     if (tag === "input") {
-      try { await handle.click(); } catch { await handle.evaluate((n: any) => { n.checked = false; n.dispatchEvent(new Event("change", { bubbles: true })); }); }
+      try { await handle.click(); } catch { await handle.evaluate((n: any) => { const w = window; w.__kruzAutomationBypass = true; try { n.checked = false; n.dispatchEvent(new Event("change", { bubbles: true })); } finally { w.__kruzAutomationBypass = false; } }); }
     } else {
       await handle.click();
     }
@@ -903,22 +1302,48 @@ export class PuppeteerEngine implements BrowserEngine {
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
     await handle.evaluate((node: any, v: number) => {
-      node.value = String(v);
-      node.dispatchEvent(new Event("input", { bubbles: true }));
-      node.dispatchEvent(new Event("change", { bubbles: true }));
+      const w = window; w.__kruzAutomationBypass = true;
+      try {
+        node.value = String(v);
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+        node.dispatchEvent(new Event("change", { bubbles: true }));
+      } finally { w.__kruzAutomationBypass = false; }
     }, value);
     await handle.dispose().catch(() => {});
   }
 
   /* ── mouse / keyboard (page-level) ──────────────────────────── */
 
+  /**
+   * Mark a model-dispatch window so the in-page control layer does not read the
+   * model's OWN trusted input as a human handoff. Set at the START of an action
+   * (Puppeteer's own scroll/actionability wait can take seconds on a heavy page,
+   * so a short window set just before the mouse call expires mid-click), and
+   * cleared explicitly afterwards. The TTL is only a safety net for a throw path.
+   */
+  private async expectInput(ms = 3000): Promise<void> {
+    await this.page.evaluate((windowMs: number) => {
+      window.__kruzExpectingInput = true;
+      setTimeout(() => { window.__kruzExpectingInput = false; }, windowMs);
+    }, ms).catch(() => {});
+  }
+
+  /** Close the dispatch window. Fire-and-forget: a pending native dialog makes
+   *  evaluate() block, and the TTL already guarantees cleanup. */
+  private endInput(): void {
+    void this.page.evaluate(() => { window.__kruzExpectingInput = false; }).catch(() => {});
+  }
+
   async mouseClick(x: number, y: number, opts?: { button?: "left" | "right" | "middle"; clickCount?: number }): Promise<void> {
+    await this.expectInput(1500 + (opts?.clickCount ?? 1) * 150);
     await this.page.mouse.click(x, y, { button: opts?.button ?? "left", clickCount: opts?.clickCount ?? 1 });
+    this.endInput();
   }
   async mouseMove(x: number, y: number): Promise<void> { await this.page.mouse.move(x, y); }
   async mouseDown(): Promise<void> { await this.page.mouse.down(); }
   async mouseUp(): Promise<void> { await this.page.mouse.up(); }
   async keyboardPress(key: string): Promise<void> {
+    await this.expectInput(2000);
     // Combo support: "Control+a", "Control+Shift+s", "Alt+F4". Puppeteer's
     // press() only knows single keys ("Unknown key" otherwise), so hold the
     // modifiers around the final key.
@@ -929,9 +1354,11 @@ export class PuppeteerEngine implements BrowserEngine {
       for (const m of mods) await this.page.keyboard.down(m);
       try { await this.page.keyboard.press(main); }
       finally { for (const m of [...mods].reverse()) await this.page.keyboard.up(m).catch(() => {}); }
+      this.endInput();
       return;
     }
     await this.page.keyboard.press(key as any);
+    this.endInput();
   }
 
   private modKey(m: string): any {
@@ -944,7 +1371,9 @@ export class PuppeteerEngine implements BrowserEngine {
     }
   }
   async keyboardType(text: string, opts?: { delayMs?: number }): Promise<void> {
+    await this.expectInput(2000 + text.length * ((opts?.delayMs ?? 0) + 20));
     await this.page.keyboard.type(text, { delay: opts?.delayMs ?? 0 });
+    this.endInput();
   }
 
   /* ── scroll ──────────────────────────────────────────────────── */
@@ -1224,7 +1653,7 @@ export class PuppeteerEngine implements BrowserEngine {
   hasCapability(name: EngineCapability): boolean {
     switch (name) {
       case "closed-shadow-pierce": return true; // via CDP DOM.getDocument
-      case "document-start-injection": return false; // needs extension
+      case "document-start-injection": return false;
       case "bot-detection-evasion": return true; // launch flags
       case "native-input-os-level": return false;
       case "iframe-crossorigin-eval": return true; // Puppeteer handles this

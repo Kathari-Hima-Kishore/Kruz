@@ -32,6 +32,23 @@ export interface Observation {
   text: ObservedText[];
   changed: string[]; // refs that changed since last observation
   detail: "minimal" | "standard" | "full";
+  /** P1-F: set when a detail cap hid content (fields absent otherwise). */
+  truncated?: boolean;
+  returned_elements?: number;
+  total_elements_estimate?: number;
+  returned_text?: number;
+  total_text_estimate?: number;
+  truncation_hint?: string;
+  /**
+   * Diagnostic timing, measured inside the server process. Metadata only: never
+   * consulted when deciding what to do next, and omitted when not measured.
+   */
+  timing?: {
+    total_ms?: number;
+    /** How long the DOM capture itself took, excluding identity/settle work. */
+    generate_ms?: number;
+    cache_hit?: number;
+  };
 }
 
 /** Delta observation (only changes) */

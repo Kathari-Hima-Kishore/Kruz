@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Repro Fixture</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 0 0 400px 0; }
+  .hidden-el { display: none; }
+  /* Oracle-like consent banner: NO "cookie"/"consent"/"banner" tokens in class or id.
+     The legacy overlay scanner keys off those tokens, so it cannot see this. */
+  .o-CX-ui--f1kcz9 { position: fixed; left: 0; right: 0; bottom: 0; background: #161616;
+                     color: #fff; padding: 16px; display: flex; gap: 12px; z-index: 2147483000; }
+  .o-CX-ui--f1kcz9 button { padding: 8px 14px; cursor: pointer; }
+  .late { position: fixed; right: 0; bottom: 0; background: #123; color: #fff; padding: 12px; z-index: 2147483000; }
+  .push-down { height: 3000px; }
+</style>
+</head>
+<body>
+  <header>
+    <a href="/">Home</a>
+    <a id="cinemas" href="/chennai/cinemas">Cinemas in Chennai</a>
+  </header>
+
+  <main>
+    <h1>Repro fixture</h1>
+    <input id="search" type="text" placeholder="Search by cinema or area" />
+    <button id="visible-btn" onclick="document.getElementById('out').textContent='clicked'">Book Tickets</button>
+    <div id="out"></div>
+    <input id="chk" type="checkbox" />
+    <label for="chk">I agree</label>
+    <select id="sel"><option value="a">A</option><option value="b">B</option></select>
+  </main>
+
+  <footer>
+    <!-- Same href, hidden twin. Probe must distinguish visible from hidden. -->
+    <a class="hidden-el" href="/chennai/cinemas">Cinemas in Chennai (footer twin)</a>
+    <div class="push-down"></div>
+  </footer>
+
+  <!-- Oracle-shaped consent banner: the general observer sees these three controls,
+       the legacy overlay selector scanner cannot even find the container. -->
+  <div class="o-CX-ui--f1kcz9" id="consent">
+    <span>We use cookies to improve your experience.</span>
+    <button id="reject" onclick="this.parentNode.remove()">Reject All</button>
+    <button id="accept" onclick="this.parentNode.remove()">Accept All</button>
+    <a href="#prefs" onclick="return false">Manage Preferences</a>
+  </div>
+
+  <script>
+    // Asynchronous mount (SPA-style): appears well after navigation "ready".
+    setTimeout(() => {
+      const d = document.createElement('div');
+      d.className = 'late';
+      d.id = 'late-banner';
+      d.innerHTML = '<span>Late banner</span><button onclick="this.parentNode.remove()">Close</button>';
+      document.body.appendChild(d);
+    }, 1200);
+  </script>
+</body>
+</html>

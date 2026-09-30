@@ -1,6 +1,7 @@
 import type { BrowserEngine, KruzTab } from "../browser/engine.js";
 import { launchBrowser, closeBrowser } from "../browser/launcher.js";
 import { Observer } from "../extractor/observer.js";
+import { RefRegistry } from "../browser/ref-registry.js";
 import { FidelityExtractor } from "../extractor/fidelity.js";
 import type { P1Config } from "../config.js";
 
@@ -10,6 +11,9 @@ export interface SessionState {
   createdAt: string;
   engine: BrowserEngine | null;
   observer: Observer;
+  /** Single ref identity system for this session: observe, probe and the
+   *  ambiguity candidates all mint here, and every action consumes here. */
+  refs: RefRegistry;
   extractor: FidelityExtractor;
   config: P1Config;
   navigationTrace: NavigationTraceEntry[];
@@ -62,7 +66,12 @@ export class SessionManager {
     const id = `session_${++sessionCounter}`;
     const { engine, config } = await launchBrowser(overrides);
 
-    const observer = new Observer(config.observationCacheSize);
+    // ONE ref authority for the whole session. The Observer mints observe refs
+    // into this exact instance and the action tools resolve from it, so a ref
+    // returned by page.observe is by construction consumable by page.click.
+    const refs = new RefRegistry();
+
+    const observer = new Observer(config.observationCacheSize, refs);
     const extractor = new FidelityExtractor();
 
     const state: SessionState = {
@@ -71,6 +80,7 @@ export class SessionManager {
       createdAt: new Date().toISOString(),
       engine,
       observer,
+      refs,
       extractor,
       config,
       navigationTrace: [],
@@ -269,12 +279,14 @@ export class SessionManager {
       return null;
     }
 
-    const observer = new Observer(config.observationCacheSize ?? 1000);
+    // Same rule as launch(): one registry, shared with the Observer.
+    const refs = new RefRegistry();
+    const observer = new Observer(config.observationCacheSize ?? 1000, refs);
     const extractor = new FidelityExtractor();
 
     const state: SessionState = {
       id, status: "active", createdAt: new Date().toISOString(),
-      engine, observer, extractor, config, navigationTrace: [],
+      engine, observer, refs, extractor, config, navigationTrace: [],
     };
     this.sessions.set(id, state);
     this.activeSessionId = id;

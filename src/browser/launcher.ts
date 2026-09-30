@@ -1,5 +1,4 @@
 import { PuppeteerEngine } from "./engines/puppeteer-engine.js";
-import { ExtensionEngine } from "./engines/extension-engine.js";
 import { mkdirSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig, type P1Config } from "../config.js";
@@ -23,14 +22,12 @@ function buildConfig(overrides: NonNullable<Parameters<typeof launchBrowser>[0]>
     userAgent: overrides?.userAgent ?? base.userAgent,
     locale: overrides?.locale ?? base.locale,
     proxy: overrides?.proxy ?? base.proxy,
-    extensionPath: overrides?.extensionPath ?? (base as any).extensionPath,
   } as P1Config;
 }
 
 /**
  * Launch a headed Chrome browser using Puppeteer.
- * Uses Chrome's user data directory for persistent sessions, and optionally
- * loads the Kruz Ctrl MV3 extension for bot evasion on JS-heavy sites.
+ * Uses Chrome's user data directory for persistent sessions.
  */
 export async function launchBrowser(overrides?: {
   headless?: boolean;
@@ -41,7 +38,6 @@ export async function launchBrowser(overrides?: {
   locale?: string;
   proxy?: string;
   downloadDir?: string;
-  extensionPath?: string;
   startupUrl?: string;
 }): Promise<LaunchedBrowser> {
   const config = buildConfig(overrides);
@@ -69,10 +65,9 @@ export async function launchBrowser(overrides?: {
 
   // Configure the base P1Config so the engine knows the launch settings; the
   // boot() signature takes (config, profileDir) so we pass config + profileDir.
-  const engine = config.extensionPath ? new ExtensionEngine() : new PuppeteerEngine(true);
+  const engine = new PuppeteerEngine(true);
   try {
-    if (engine instanceof ExtensionEngine) await engine.boot(config, profileDir, config.extensionPath!);
-    else await engine.boot(config, profileDir);
+    await engine.boot(config, profileDir);
   } catch (cause) {
     await closeBrowser(engine);
     const error = new Error(`Could not start Chrome with profile '${profileDir}'. Another MCP process or Chrome may be using this profile; compare server_instance_id, or choose a separate profile_dir. No existing browser was attached or stopped. Cause: ${cause}`);

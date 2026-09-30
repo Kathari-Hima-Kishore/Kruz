@@ -2,16 +2,11 @@
  * BrowserEngine — the abstraction layer that sits between Kruz's BrowserController
  * and the underlying automation driver. Replaces Playwright's `Page` and `Locator`
  * types with Kruz-native handles so the rest of the codebase doesn't have to know
- * whether we're using Puppeteer-core, raw CDP, or the Kruz MV3 extension bridge.
+ * which driver is underneath.
  *
- * Two implementations ship in v2:
- *   1. PuppeteerEngine — default. Uses puppeteer-core connected to a Chrome
- *      launched with `--remote-debugging-port`. Same Chromium as before.
- *   2. CdpEngine      — direct CDP via chrome-remote-interface. Lower-level,
- *      fewer abstractions, useful for trusted automation.
- *
- * A future `ExtensionEngine` will use the Kruz MV3 extension's content scripts
- * to run DOM operations with `document_start` timing — defeats bot detection.
+ * The only implementation that ships is:
+ *   1. PuppeteerEngine — uses puppeteer-core connected to a Chrome launched with
+ *      `--remote-debugging-port`.
  *
  * The handle returned by `query*` is a `KruzElement`, NOT a Locator. Kruz
  * elements are stable across re-renders (resolved lazily on each action call),
@@ -35,6 +30,14 @@ export interface KruzElement {
   readonly scope?: string;
   /** Resolution timestamp — used for cache invalidation. */
   readonly resolvedAt: number;
+  /**
+   * Pre-resolved live node, when the element was pinned in-page.
+   *
+   * When present it is authoritative: re-resolving by `handle` would re-run a
+   * query and could land on a different node (or fail entirely inside a shadow
+   * root). Carrying the node removes that whole class of drift.
+   */
+  readonly node?: unknown;
 }
 
 export interface KruzFrame {
@@ -82,7 +85,7 @@ export interface ConsoleEvent {
  */
 export interface BrowserEngine {
   /** Identity + diagnostics. */
-  readonly kind: "puppeteer" | "cdp" | "extension";
+  readonly kind: "puppeteer" | "cdp";
   readonly connected: boolean;
 
   /** Page-level. */
@@ -102,6 +105,8 @@ export interface BrowserEngine {
   waitForLoadState(state: "load" | "domcontentloaded" | "networkidle", timeoutMs: number): Promise<void>;
   /** Poll-for-real-content wait: evaluate a JS predicate in-page every intervalMs until truthy or timeout (K30). */
   waitFor(predicateJs: string, timeoutMs?: number, intervalMs?: number): Promise<boolean>;
+  /** Settled-aware wait (P0-A): returns early when the predicate is false but the page has stopped mutating. */
+  waitForSettled(predicateJs: string, opts?: { timeoutMs?: number; intervalMs?: number; settleMs?: number; minWaitMs?: number }): Promise<{ met: boolean; settled: boolean; attempts: number; elapsedMs: number }>;
 
   /** Tab management. */
   newTab(url?: string): Promise<KruzTab>;
@@ -126,11 +131,26 @@ export interface BrowserEngine {
   /** Element queries (return opaque handles; resolve on action). */
   queryOne(target: Target, fallback?: Fallback, scope?: string, timeoutMs?: number): Promise<KruzElement | null>;
   queryAll(target: Target, fallback?: Fallback, scope?: string): Promise<KruzElement[]>;
+  /**
+   * Wrap the node the last `markScript` stashed on the page into a handle.
+   *
+   * An in-page `document.querySelector` cannot address a node inside an open
+   * shadow root, so a selector-based handle is not enough for component-rendered
+   * controls. Taking the live node object is the only route, and it also removes
+   * any index/selector drift between "found it" and "act on it".
+   */
+  takeMarkedNode(fallbackCss: string, target: Target): Promise<KruzElement | null>;
 
   /** Element operations (resolve-on-call). */
-  click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number }): Promise<void>;
+  click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow" }): Promise<void>;
   dblclick(el: KruzElement, opts?: { timeoutMs?: number }): Promise<void>;
   hover(el: KruzElement, opts?: { timeoutMs?: number; dwellMs?: number }): Promise<void>;
+  /** Install the virtual cursor + control glow (idempotent, survives navigation). */
+  installControlIndicator(opts?: { status?: string | null; glow?: boolean }): Promise<void>;
+  /** Remove the visual control layer. */
+  removeControlIndicator(): Promise<void>;
+  /** Last known virtual-cursor position, or the viewport centre on first use. */
+  virtualCursorPos(): Promise<{ x: number; y: number }>;
   scrollIntoView(el: KruzElement, opts?: { timeoutMs?: number }): Promise<void>;
   boundingBox(el: KruzElement): Promise<{ x: number; y: number; width: number; height: number } | null>;
   isVisible(el: KruzElement): Promise<boolean>;

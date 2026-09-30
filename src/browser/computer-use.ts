@@ -12,6 +12,7 @@
  */
 
 import type { ActionResult } from "./controller.js";
+import { kruzError, ErrCode } from "../errors.js";
 
 /** A single interactive target as returned by listTargets. */
 export interface ComputerUseTarget {
@@ -210,35 +211,35 @@ export async function listTargets(p: any): Promise<ActionResult> {
   try {
     const json = await evalInPage<string>(p, `(${listTargetsJS.toString()})()`);
     return { ok: true, result: JSON.parse(json) };
-  } catch (e) { return { ok: false, error: { code: "CU_LIST", message: String(e), retryable: true } }; }
+  } catch (e) { return { ok: false, error: kruzError(ErrCode.CU_LIST, { subsystem: "computer-use", message: String(e), cause: e, trace: ["computer-use"] }).toJSON() }; }
 }
 
 export async function snapshot(p: any): Promise<ActionResult> {
   try {
     const json = await evalInPage<string>(p, `(${snapshotJS.toString()})()`);
     return { ok: true, result: JSON.parse(json) };
-  } catch (e) { return { ok: false, error: { code: "CU_SNAPSHOT", message: String(e), retryable: true } }; }
+  } catch (e) { return { ok: false, error: kruzError(ErrCode.CU_SNAPSHOT, { subsystem: "computer-use", message: String(e), cause: e, trace: ["computer-use"] }).toJSON() }; }
 }
 
 export async function markTargets(p: any): Promise<ActionResult> {
   try {
     const count = await evalInPage<string>(p, `(${markTargetsJS.toString()})()`);
     return { ok: true, result: { message: count } };
-  } catch (e) { return { ok: false, error: { code: "CU_MARK", message: String(e), retryable: true } }; }
+  } catch (e) { return { ok: false, error: kruzError(ErrCode.CU_MARK, { subsystem: "computer-use", message: String(e), cause: e, trace: ["computer-use"] }).toJSON() }; }
 }
 
 export async function clearMarks(p: any): Promise<ActionResult> {
   try {
     const msg = await evalInPage<string>(p, `(${clearMarksJS.toString()})()`);
     return { ok: true, result: { message: msg } };
-  } catch (e) { return { ok: false, error: { code: "CU_CLEAR", message: String(e), retryable: true } }; }
+  } catch (e) { return { ok: false, error: kruzError(ErrCode.CU_CLEAR, { subsystem: "computer-use", message: String(e), cause: e, trace: ["computer-use"] }).toJSON() }; }
 }
 
 export async function scrollToTarget(p: any, i: number): Promise<ActionResult> {
   try {
     const json = await evalInPage<string>(p, `(${scrollToTargetJS.toString()})(${i})`);
     const parsed = JSON.parse(json);
-    if (parsed.error) return { ok: false, error: { code: "CU_NO_TARGET", message: parsed.error, retryable: false } };
+    if (parsed.error) return { ok: false, error: kruzError(ErrCode.CU_NO_TARGET, { subsystem: "computer-use", message: parsed.error, trace: ["computer-use"] }).toJSON() };
     return { ok: true, result: parsed };
-  } catch (e) { return { ok: false, error: { code: "CU_SCROLL", message: String(e), retryable: true } }; }
+  } catch (e) { return { ok: false, error: kruzError(ErrCode.CU_SCROLL, { subsystem: "computer-use", message: String(e), cause: e, trace: ["computer-use"] }).toJSON() }; }
 }

@@ -2,29 +2,56 @@ import type { BrowserEngine, KruzElement } from "../browser/engine.js";
 import type { Observation, ObservedElement, ObservedText } from "../types/observation.js";
 import { ObservationCache } from "./cache.js";
 import { detectDelta, observationsEqual } from "./delta.js";
+import { RefRegistry } from "../browser/ref-registry.js";
+import { specFromTarget, type MatchSpec } from "../browser/inpage-matcher.js";
 import type { DetailLevel } from "../types/schema.js";
 
-interface BatchedData { index: number; tag: string; role: string; name: string; value: string; enabled: boolean; href: string | null; checked: boolean | null; readonly: boolean; required: boolean; type: string | null; }
+interface BatchedData { index: number; tag: string; role: string; name: string; value: string; enabled: boolean; href: string | null; raw_href?: string | null; checked: boolean | null; readonly: boolean; required: boolean; type: string | null; path?: string; placeholder?: string | null; name_attr?: string | null; testid?: string | null; in_viewport?: boolean; editable?: boolean; container?: string | null; rect?: { x: number; y: number; w: number; h: number } | null; }
 
 export class Observer {
   private cache: ObservationCache;
   private refMap = new Map<string, any>();
+  private registry: RefRegistry;
   private mutationCount = 0;
   private mutationAttached = false;
   private elCounter = 0;
   private txtCounter = 0;
 
-  constructor(cacheSize = 100) { this.cache = new ObservationCache(cacheSize); }
+  /**
+   * `registry` is the SESSION's ref authority and must be the exact instance the
+   * action tools resolve against.
+   *
+   * This used to be `new RefRegistry()` in both the Observer and the SessionManager,
+   * which silently produced two registries with two independent `e` counters: the
+   * observer minted `e1..eN` into one, probe/actions minted into the other, and
+   * every ref `page.observe` handed the model came back as UNKNOWN_REFERENCE from
+   * `page.click`. Passing the session registry in makes it structurally impossible
+   * for the two to diverge again. The default is only for standalone use (tests
+   * that drive the Observer on its own).
+   */
+  constructor(cacheSize = 100, registry?: RefRegistry) {
+    this.cache = new ObservationCache(cacheSize);
+    this.registry = registry ?? new RefRegistry();
+  }
+
+  /** The session's ref authority — the one instance producers and consumers share. */
+  getRegistry(): RefRegistry { return this.registry; }
 
   async observe(engine: BrowserEngine, scope?: string, detail: DetailLevel = "minimal", forceFull = false): Promise<{ observation: Observation; isDelta: boolean }> {
+    const t0 = Date.now();
     const url = await engine.url();
     const tabs = await engine.listTabs();
     const activeTab = tabs.find(t => t.isActive);
     const pageId = activeTab?.id ?? "p1";
+    const documentId = await this.documentId(engine);
+    // A ref only means something inside the document that minted it. Dropping
+    // foreign refs here is what stops a pre-navigation ref from being
+    // re-resolved against the new page and landing on a stranger.
+    this.registry.invalidateForeign(pageId, documentId);
     const revision = await this.getRevision(engine);
     const key = { page_id: pageId, url, revision, scope: scope || "body", detail };
 
-    if (!forceFull) { const cached = this.cache.get(key); if (cached) return { observation: cached, isDelta: false }; }
+    if (!forceFull) { const cached = this.cache.get(key); if (cached) { cached.timing = { total_ms: Date.now() - t0, cache_hit: 1 }; return { observation: cached, isDelta: false }; } }
     const prev = this.cache.get({ page_id: pageId, url, revision: revision - 1, scope: scope || "body", detail });
     this.ensureMutation(engine);
 
@@ -40,7 +67,11 @@ export class Observer {
       }
     }
 
-    const obs = await this.generate(engine, pageId, url, revision, scope, detail);
+    const tGen = Date.now();
+    const obs = await this.generate(engine, pageId, url, revision, scope, detail, documentId);
+    // Diagnostic metadata: how long the observation actually took, measured
+    // inside the process rather than by the caller wrapping a timer.
+    obs.timing = { total_ms: Date.now() - t0, generate_ms: Date.now() - tGen };
     this.cache.set(key, obs);
     if (prev && observationsEqual(prev, obs)) obs.changed = [];
     return { observation: obs, isDelta: prev !== null && obs.changed.length > 0 };
@@ -52,9 +83,19 @@ export class Observer {
   }
 
   getRefMap() { return this.refMap; }
+  getRefs() { return this.registry; }
   clearCache() { this.cache.clear(); }
   invalidatePage(pid: string) { this.cache.invalidatePage(pid); }
   bumpMutation() { this.mutationCount++; }
+
+  /**
+   * Document identity. `performance.timeOrigin` is unique per document, so a
+   * ref minted in one document can never be silently re-resolved in the next.
+   */
+  private async documentId(engine: BrowserEngine): Promise<string> {
+    const r = await engine.evaluate("String(performance && performance.timeOrigin || 'nodoc')").catch(() => null);
+    return r?.ok ? String(r.result) : "nodoc";
+  }
 
   registerFormRef(ref: string, engine: BrowserEngine, selector: string, scope?: string) {
     // This is a sync stub; actual resolution should happen via resolveElement in the controller
@@ -72,12 +113,21 @@ export class Observer {
     })()`).catch(() => { this.mutationAttached = false; });
   }
 
-  private async generate(engine: BrowserEngine, pageId: string, url: string, revision: number, scope?: string, detail: DetailLevel = "minimal"): Promise<Observation> {
+  private async generate(engine: BrowserEngine, pageId: string, url: string, revision: number, scope?: string, detail: DetailLevel = "minimal", documentId = "unknown"): Promise<Observation> {
     const elements: ObservedElement[] = [];
     const text: ObservedText[] = [];
     const sel = this.buildSelector(scope);
     const maxText = detail === "minimal" ? 10 : detail === "standard" ? 30 : 100;
-    const maxElements = detail === "minimal" ? 120 : detail === "standard" ? 400 : 2000;
+    // `minimal` is the agent-control view, so it stays small enough to be read
+    // in full. The manual report hit a ~55 KB observation that the client
+    // truncated; that was `standard`/`full` on a dense portal. Rather than just
+    // capping harder, `minimal` also compacts each element (see `compact` below)
+    // so the same number of elements costs far fewer bytes.
+    const maxElements = detail === "minimal" ? 80 : detail === "standard" ? 400 : 2000;
+    const nameCap = detail === "minimal" ? 80 : 200;
+    const valueCap = detail === "minimal" ? 60 : 500;
+    // P1-F: report when a cap hid real content instead of truncating silently.
+    let totalElementMatches = 0;
 
     const isComboboxScope = !!(scope && /(combobox|listbox|menu|search)/i.test(scope));
 
@@ -93,6 +143,45 @@ export class Observer {
         const qs = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="textbox"], [role="combobox"], [role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"], [role="option"], [role="switch"], [role="slider"], [role="searchbox"], [tabindex]';
         const out = [];
         const seen = new Set();
+        // A piercing path back to the node, so a ref stays resolvable after the
+        // page re-renders. Puppeteer understands ">>>" for open shadow roots.
+        const deepPath = (el) => {
+          if (el.id) return '#' + CSS.escape(el.id);
+          const segs = [];
+          let cur = el, guard = 0;
+          while (cur && cur.nodeType === 1 && guard++ < 8) {
+            const parent = cur.parentElement;
+            const root = cur.getRootNode();
+            let seg = cur.tagName.toLowerCase();
+            if (parent) {
+              const sibs = Array.from(parent.children).filter((c) => c.tagName === cur.tagName);
+              if (sibs.length > 1) seg += ':nth-of-type(' + (sibs.indexOf(cur) + 1) + ')';
+            } else if (root && root !== document && root.host) {
+              seg += ':nth-of-type(1)';
+            } else {
+              seg += ':nth-of-type(1)';
+            }
+            segs.unshift(seg);
+            // Crossing a shadow boundary: jump to the host and mark the pierce.
+            if (root && root !== document && root.host) {
+              segs.unshift('>>>');
+              cur = root.host;
+              continue;
+            }
+            if (!parent) break;
+            cur = parent;
+          }
+          return segs.join(' ').replace(/\\s+>>>\\s+/g, ' >>> ').trim();
+        };
+        // Nearest overlay-ish container, matching the matcher's definition, so an
+        // observed ref can be verified against its banner/dialog root after a
+        // dismissal click.
+        const containerSignature = (el) => {
+          const c = el.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], [class*="consent" i], [id*="consent" i], [class*="cookie" i], [id*="cookie" i], [class*="banner" i], [id*="banner" i], [class*="notice" i], [class*="popup" i], [class*="modal" i]');
+          if (!c) return null;
+          const r = c.getBoundingClientRect();
+          return (c.id ? '#' + c.id : c.tagName.toLowerCase() + '.' + String(c.className || '').split(/\\s+/)[0]) + '@' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height);
+        };
         const capture = (node) => {
           if (seen.has(node)) return;
           seen.add(node);
@@ -127,7 +216,7 @@ export class Observer {
           let checked = null;
           if (role === "checkbox" || role === "radio") checked = el.checked;
 
-          out.push({ index: out.length, tag, role, name: name.substring(0, 200), value: value.substring(0, 500), enabled: !el.disabled, href: tag === "a" ? (el.href || null) : null, checked, readonly: el.readOnly || false, required: el.required || false, type: el.type || null });
+          out.push({ index: out.length, tag, role, name: name.substring(0, 200), value: value.substring(0, 500), enabled: !el.disabled, href: tag === "a" ? (el.href || null) : null, raw_href: tag === "a" ? el.getAttribute("href") : null, checked, readonly: el.readOnly || false, required: el.required || false, type: el.type || null, path: deepPath(el), placeholder: el.getAttribute("placeholder"), name_attr: el.getAttribute("name"), testid: el.getAttribute("data-testid"), in_viewport: r.bottom > 0 && r.right > 0 && r.top < (window.innerHeight || 0) && r.left < (window.innerWidth || 0), editable: (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) && !el.disabled, container: containerSignature(el), rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } });
         };
         const targets = [];
         if (${isComboboxScope}) {
@@ -139,41 +228,102 @@ export class Observer {
           }
           targets.forEach(t => t.querySelectorAll('[role="option"], [role="menuitem"]').forEach(c => capture(c)));
         }
-        target.querySelectorAll(qs).forEach((node) => capture(node));
+        // Walk the light tree AND descend into open shadow roots. Component-based
+        // portals (Shoelace, Lit, Stencil, Salesforce LWC, Oracle HCM) render their
+        // interactive controls inside shadow roots; a light-DOM-only sweep made
+        // every one of them invisible, so the model could neither see them nor get
+        // a ref to click. Bounded to keep the single evaluate cheap.
+        const MAX_HOSTS = 400, MAX_DEPTH = 8;
+        let hosts = 0;
+        const walk = (node, depth) => {
+          node.querySelectorAll(qs).forEach((n) => capture(n));
+          if (depth >= MAX_DEPTH || hosts >= MAX_HOSTS) return;
+          const all = node.querySelectorAll('*');
+          for (let i = 0; i < all.length && hosts < MAX_HOSTS; i++) {
+            const sr = all[i].shadowRoot;
+            if (sr) { hosts++; walk(sr, depth + 1); }
+          }
+        };
+        walk(target, 0);
         return out;
       })()`).catch(() => ({ ok: false as const }));
 
       if (rawResult.ok && Array.isArray(rawResult.result)) {
+        totalElementMatches = rawResult.result.length;
         for (const r of rawResult.result.slice(0, maxElements)) batched.push(r);
       }
     } catch { /* page not ready */ }
 
-    // Build elements + refMap — store KruzElement objects, not Playwright Locators
-    const cssCounters: Record<string, number> = {};
+    // Mint every observed element through the SHARED ref registry. This is the
+    // single place refs come into existence, which is what lets page.probe hand
+    // the model a ref that page.click can actually resolve.
     const scopeSelector = scope || "body";
     for (const d of batched) {
-      const ref = `e${++this.elCounter}`;
-      elements.push({ ref, role: d.role, name: d.name, value: d.value || undefined, enabled: d.enabled, href: d.href ?? undefined, checked: d.checked ?? undefined, selected: undefined, readonly: d.readonly, required: d.required, type: d.type ?? undefined });
+      // The spec is reconstructed from what we observed, so the registry can
+      // re-resolve this element semantically (Tier 2/3) after a re-render.
+      // A link's identity is its RESOLVED destination — the DOM attribute is
+      // usually relative, so an `a[href="<absolute>"]` selector would match
+      // nothing and a valid ref would be reported stale.
+      const spec: MatchSpec = { scope: scopeSelector, strategy: "observe" };
+      if (d.tag === "a" && d.href) { spec.resolvedHref = d.href; spec.strategy = "resolvedHref"; }
+      else if (d.testid) { spec.testid = d.testid; spec.strategy = "testid"; }
+      else if (d.name_attr) { spec.nameAttr = d.name_attr; spec.strategy = "nameAttr"; }
+      else if (d.placeholder) { spec.placeholder = d.placeholder; spec.strategy = "placeholder"; }
+      else { spec.css = d.tag; spec.strategy = "css"; }
+
+      const entry = this.registry.mint("observe", {
+        i: d.index,
+        path: d.path ?? "",
+        tag: d.tag,
+        role: d.role,
+        name: d.name,
+        name_source: "",
+        href: d.href ?? null,
+        raw_href: d.raw_href ?? null,
+        placeholder: d.placeholder ?? null,
+        type: d.type ?? null,
+        name_attr: d.name_attr ?? null,
+        testid: d.testid ?? null,
+        value: d.value || null,
+        checked: d.checked ?? null,
+        visible: true,
+        enabled: d.enabled,
+        in_viewport: d.in_viewport ?? false,
+        editable: d.editable ?? false,
+        actionable: d.enabled,
+        blocked_reason: d.enabled ? null : "disabled or aria-disabled=true",
+        container: d.container ?? null,
+        rect: d.rect ?? null,
+        context: null,
+      }, { pageId, documentId, frameId: "main", spec, scope: scopeSelector, revision });
+
+      const ref = entry.ref;
+      // Compact: drop fields that are false/null in the common case. An agent
+      // choosing an action cares about role, name and whether it is enabled;
+      // `readonly: false` on every row is pure payload.
+      const el: ObservedElement = { ref, role: d.role, name: d.name.slice(0, nameCap) };
+      if (d.value) el.value = d.value.slice(0, valueCap);
+      if (d.href) el.href = d.href;
+      if (d.type) el.type = d.type;
+      if (detail !== "minimal") {
+        el.enabled = d.enabled;
+        if (d.checked !== null) el.checked = d.checked;
+        if (d.readonly) el.readonly = true;
+        if (d.required) el.required = true;
+      } else {
+        // Keep the one boolean an agent actually acts on.
+        if (!d.enabled) el.enabled = false;
+      }
+      elements.push(el);
+
+      // Legacy alias kept so existing consumers that read the observer's map
+      // directly (e.g. the ref-TTL path) still see the entry.
       const cssSel = d.tag === "input" && d.type ? `input[type='${d.type}']` : d.tag;
-      if (!(cssSel in cssCounters)) cssCounters[cssSel] = 0;
-      const typeIndex = cssCounters[cssSel]++;
-      // K14: Store a KruzElement (resolved lazily) instead of a Playwright Locator.
-      // The controller's resolveElementWithRef checks entry.locator?.handle === 'string'
-      // to treat it as a KruzElement — we store a synthetic handle + semantic metadata.
-      const syntheticEl: KruzElement = {
-        handle: `${scopeSelector} >> ${cssSel} >> nth=${typeIndex}`,
-        strategy: "css-nth",
-        target: { css: cssSel },
-        scope: scopeSelector,
-        resolvedAt: Date.now(),
-      };
-      this.refMap.set(ref, {
-        locator: syntheticEl,
-        semantic: { role: d.role, name: d.name, text: d.name, index: d.index, tag: d.tag, type: d.type, cssSelector: cssSel, cssTypeIndex: typeIndex },
-      });
+      this.refMap.set(ref, { locator: null, css: d.path, semantic: { ...entry } });
     }
 
     // Batch 2: text nodes
+    let totalTextMatches = 0;
     try {
       const selJson2 = sel.replace(/'/g, "\\'");
       const linesResult: any = await engine.evaluate(`(() => {
@@ -181,11 +331,34 @@ export class Observer {
         const root = document.querySelector(s);
         if (!${!!scope} && !root) return [];
         const target = root || document.body;
-        return (target.innerText || "").split("\\n").map(l => l.trim()).filter(l => l.length > 0 && l.length < 500);
+        const lines = [];
+        const push = (t) => { for (const l of (t || "").split("\\n")) { const v = l.trim(); if (v) lines.push(v); } };
+        push(target.innerText);
+        // innerText does not descend into shadow roots (and a ShadowRoot has no
+        // innerText of its own — it is a DocumentFragment), so component-rendered
+        // copy (button labels, option text, validation messages) was missing
+        // entirely. Collect leaf-element text from each open root instead.
+        let hosts = 0;
+        const pushShadow = (sr) => {
+          for (const el of sr.querySelectorAll('*')) {
+            if (el.children.length) continue;
+            const t = (el.textContent || '').trim();
+            if (t && t.length < 500) push(t);
+          }
+        };
+        const visit = (node, depth) => {
+          if (depth >= 8 || hosts >= 400) return;
+          for (const n of node.querySelectorAll('*')) {
+            if (n.shadowRoot && hosts < 400) { hosts++; pushShadow(n.shadowRoot); visit(n.shadowRoot, depth + 1); }
+          }
+        };
+        visit(target, 0);
+        return Array.from(new Set(lines));
       })()`).catch(() => ({ ok: false as const }));
 
       if (linesResult.ok && Array.isArray(linesResult.result)) {
         const lines: string[] = linesResult.result;
+        totalTextMatches = lines.length;
         const take = Math.min(lines.length, maxText);
         for (let i = 0; i < take; i++) {
           const ref = `t${++this.txtCounter}`;
@@ -200,7 +373,17 @@ export class Observer {
       }
     } catch { /* ignore */ }
 
-    return { page_id: pageId, url, title: await engine.title().catch(() => ""), revision, scope: scope || "body", elements, text, changed: [], detail };
+    const observation: Observation = { page_id: pageId, url, title: await engine.title().catch(() => ""), revision, scope: scope || "body", elements, text, changed: [], detail };
+    // P1-F: surface the cap honestly (fields are additive; absent when nothing was cut).
+    if (totalElementMatches > elements.length || totalTextMatches > text.length) {
+      observation.truncated = true;
+      observation.returned_elements = elements.length;
+      observation.total_elements_estimate = totalElementMatches;
+      observation.returned_text = text.length;
+      observation.total_text_estimate = totalTextMatches;
+      observation.truncation_hint = detail === "full" ? "Even 'full' is capped; narrow with a scope." : `Raise detail to 'full' or narrow with a scope to see more than ${elements.length} elements.`;
+    }
+    return observation;
   }
 
   private buildSelector(scope?: string): string {
