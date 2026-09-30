@@ -14,6 +14,7 @@
  */
 
 import type { MatchSpec } from "./inpage-matcher.js";
+import { ACCESSIBLE_NAME_BUNDLE_SRC } from "./accessible-name.js";
 
 /**
  * The matcher. Also the single source of element identity for the whole server:
@@ -81,62 +82,13 @@ function __kruzMatcher(args) {
     return "generic";
   };
 
-  // Label text must EXCLUDE the control's own subtree, or a wrapping
-  // <label>Location<select>...</select></label> reports "LocationBangalore" and
-  // can never match a plain "Location" target.
-  var labelText = function (el) {
-    var id = el.getAttribute("id");
-    if (id) {
-      var l = document.querySelector('label[for="' + CSS.escape(id) + '"]');
-      if (l) {
-        var t = labelOwnText(l, el);
-        if (t) return t;
-      }
-    }
-    var wrapping = el.closest("label");
-    if (wrapping) {
-      var w = labelOwnText(wrapping, el);
-      if (w) return w;
-    }
-    return "";
-  };
-
-  // Text of a label minus the text contributed by the labelled control itself.
-  var labelOwnText = function (label, control) {
-    var clone = label.cloneNode(true);
-    var kill = clone.querySelectorAll("input, select, textarea, button, [contenteditable]");
-    for (var i = 0; i < kill.length; i++) kill[i].remove();
-    var t = (clone.textContent || "").replace(/\\s+/g, " ").trim();
-    if (t) return t;
-    // Nothing left after stripping controls: fall back to the label's own text.
-    return (label.textContent || "").replace(/\\s+/g, " ").trim();
-  };
-
-  // Accessible-name approximation, ordered the way the accessibility tree
-  // orders it. Exposed so page.observe names elements exactly the way the
-  // matcher does; otherwise "the observer saw it, the action path could not"
-  // comes straight back.
-  var accessibleName = function (el) {
-    var lb = el.getAttribute("aria-labelledby");
-    if (lb) {
-      var parts = lb.split(/\s+/).map(function (id) { var n = document.getElementById(id); return n ? (n.textContent || "") : ""; }).filter(Boolean);
-      var joined = parts.join(" ").trim();
-      if (joined) return { name: joined, source: "aria-labelledby" };
-    }
-    var al = el.getAttribute("aria-label");
-    if (al && al.trim()) return { name: al.trim(), source: "aria-label" };
-    var lt = labelText(el);
-    if (lt) return { name: lt, source: "label" };
-    var title = el.getAttribute("title");
-    if (title && title.trim()) return { name: title.trim(), source: "title" };
-    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-      var ph = el.getAttribute("placeholder");
-      if (ph && ph.trim()) return { name: ph.trim(), source: "placeholder" };
-    }
-    var own = (el.textContent || "").replace(/\s+/g, " ").trim();
-    if (own && own.length <= 200) return { name: own, source: "text" };
-    return { name: "", source: "none" };
-  };
+  // Accessible name is shared with the page observer via ONE implementation
+  // (src/browser/accessible-name.ts). It used to be duplicated here, and the
+  // two copies drifted apart on five rules -- see that file for the table.
+  // Embedding the canonical source is what stops a node acquiring two
+  // different logical identities depending on which subsystem looked at it.
+${ACCESSIBLE_NAME_BUNDLE_SRC}
+  var accessibleName = __kruzAccessibleName;
 
   var deepPath = function (el) {
     if (el.id) return "#" + CSS.escape(el.id);
@@ -321,7 +273,7 @@ function __kruzMatcher(args) {
     var wantLabel = norm(spec.label);
     var labelPool = allIn('input,select,textarea,[role="textbox"],[role="combobox"],[role="checkbox"],[role="radio"],[contenteditable]');
     for (var li = 0; li < labelPool.length; li++) {
-      var lt = norm(labelText(labelPool[li]));
+      var lt = norm(__kruzLabelText(labelPool[li]));
       if (lt === wantLabel || (lt.length > wantLabel.length && lt.indexOf(" " + wantLabel + " ") >= 0)) nodes.push(labelPool[li]);
     }
   } else if (spec.placeholder) {

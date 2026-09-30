@@ -4,6 +4,7 @@ import { ObservationCache } from "./cache.js";
 import { detectDelta, observationsEqual } from "./delta.js";
 import { RefRegistry } from "../browser/ref-registry.js";
 import { specFromTarget, type MatchSpec } from "../browser/inpage-matcher.js";
+import { ACCESSIBLE_NAME_BUNDLE_SRC } from "../browser/accessible-name.js";
 import type { DetailLevel } from "../types/schema.js";
 
 interface BatchedData { index: number; tag: string; role: string; name: string; value: string; enabled: boolean; href: string | null; raw_href?: string | null; checked: boolean | null; readonly: boolean; required: boolean; type: string | null; path?: string; placeholder?: string | null; name_attr?: string | null; testid?: string | null; in_viewport?: boolean; editable?: boolean; container?: string | null; rect?: { x: number; y: number; w: number; h: number } | null; }
@@ -136,6 +137,7 @@ export class Observer {
     try {
       const selJson = sel.replace(/'/g, "\\'");
       const rawResult: any = await engine.evaluate(`(() => {
+${ACCESSIBLE_NAME_BUNDLE_SRC}
         const s = '${selJson}';
         const root = document.querySelector(s);
         if (!${!!scope} && !root && !${isComboboxScope}) return [];
@@ -202,12 +204,16 @@ export class Observer {
           }
           if (["heading", "generic", "img", "presentation", "none"].includes(role)) return;
 
-          let name = el.getAttribute("aria-label") || "";
-          if (!name) { const lb = el.getAttribute("aria-labelledby"); if (lb) { const le = document.getElementById(lb); if (le) name = le.textContent?.trim() || ""; } }
-          if (!name && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement)) { const id = el.id; if (id) { const l = document.querySelector('label[for="' + id + '"]'); if (l) name = l.textContent?.trim() || ""; } if (!name) { const pl = el.closest("label"); if (pl) name = pl.textContent?.trim() || ""; } }
-          if (!name) name = el.getAttribute("title") || "";
-          if (!name && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) name = el.placeholder || "";
-          if (!name && tag !== "select") { const t = el.textContent?.trim(); if (t && t.length < 100) name = t; }
+          // Name comes from the ONE canonical implementation shared with the
+          // action-path matcher (src/browser/accessible-name.ts). This used to be
+          // a second, independently drifting copy: it ordered aria-label above
+          // aria-labelledby, read only the FIRST id of an aria-labelledby, did
+          // not collapse whitespace, capped text at 100 chars instead of 200, and
+          // excluded <select> from its own text while the matcher did not. A
+          // node therefore got a different logical identity depending on which
+          // subsystem happened to observe it.
+          const an = __kruzAccessibleName(el);
+          const name = an.name;
 
           let value = "";
           if (tag === "input" || tag === "textarea") value = el.value || "";
