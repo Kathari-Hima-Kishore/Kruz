@@ -182,6 +182,41 @@ Refs are stable handles that survive minor DOM changes. Always prefer refs over 
 {"target": {"text": "Click here"}}
 ```
 
+### Accessible names — what the `name` field actually means
+
+`page.observe` and the action tools compute accessible name with **one shared
+implementation**, so a name you read in an observation is the same name the
+resolver matches on. The order is:
+
+1. `aria-labelledby` — **all** referenced ids joined, and it wins over `aria-label`
+2. `aria-label`
+3. associated `<label>` — for a wrapping label the control's own text is stripped,
+   so `<label>Location<select>…</select></label>` is named `Location`, never
+   `LocationBangalore`
+4. `title`
+5. `placeholder` — inputs and textareas only
+6. own text content, collapsed to single spaces, up to 200 chars
+
+**A `<select>` is never named from its own options.** Its options are the control's
+*value*, not its label, so a theme picker offering Auto/Light/Dark is named `Theme`
+(from its label) and not `Auto Light Dark`. Target it by its label or by the ref:
+
+```json
+{"target": {"role": "combobox", "name": "Theme"}}
+{"target": {"label": "Location"}}
+```
+
+Pages often render a control more than once (a visible desktop copy and a hidden
+mobile copy), so a genuinely duplicated name returns `AMBIGUOUS_TARGET` with
+candidate refs. That is the answer to act on, not a fault.
+
+### Ref numbers are small, and that is expected
+
+Ref ids restart in each new document, so a busy page numbers `e1…e400` rather than
+`e8000`. A session keeps the **6000 most recent** refs; older ones are retired and
+then return `UNKNOWN_REFERENCE`. If a ref stops resolving, re-observe — do not try
+to reconstruct it or hunt for a typo.
+
 ---
 
 ## Verification Semantics

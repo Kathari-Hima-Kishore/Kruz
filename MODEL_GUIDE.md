@@ -70,6 +70,41 @@ Avoid when possible — CSS selectors break on DOM changes.
 
 Matches elements containing the text. Use for links and buttons without accessible names.
 
+### What the `name` field actually is
+
+The observer and the action tools share **one** accessible-name implementation, so
+a name you read in an observation is the name the resolver matches on. Order:
+
+1. `aria-labelledby` (all ids joined — and it beats `aria-label`)
+2. `aria-label`
+3. associated `<label>`, with the control's own text stripped, so
+   `<label>Location<select>…</select></label>` is named `Location` and never
+   `LocationBangalore`
+4. `title`
+5. `placeholder` (inputs and textareas only)
+6. own text, whitespace-collapsed, up to 200 chars
+
+Worked consequences:
+
+- `<label>Location<select><option>Bangalore</option></select></label>` is named
+  `Location` — the option text is stripped, so `{"label": "Location"}` matches
+- a theme `<select>` with Auto/Light/Dark options is named `Theme` (from its
+  label), **never** `Auto Light Dark`; a `<select>` is not named from its options
+- a page that ships both a desktop and a mobile copy of a control gives you two
+  matches → `AMBIGUOUS_TARGET` with candidate refs. Act on one, or add a `scope`.
+
+```json
+{"target": {"role": "combobox", "name": "Theme"}}
+{"target": {"label": "Location"}}
+{"target": {"ref": "e7"}}
+```
+
+### Ref numbering and lifetime
+
+- Ids restart in each new document: a busy page shows `e1…e400`, not `e8000`.
+- A session keeps the 6000 most recent refs. Older ones are retired and then return
+  `UNKNOWN_REFERENCE` — re-observe instead of reconstructing the id.
+
 ---
 
 ## Understanding Verification

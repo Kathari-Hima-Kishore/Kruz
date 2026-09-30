@@ -137,6 +137,50 @@ Notes:
 - **Ambiguity is refused, not guessed.** If several visible elements match, Kruz returns `AMBIGUOUS_TARGET` with candidate refs rather than clicking the first. Pick a candidate ref, or narrow it with `scope` / a unique selector.
 - **Verification is explicit.** `clicked: true` means input was dispatched. `verified: true` means a postcondition was observed (`verification: rendered_destination | target_disappeared | in_place_change | predicate`). `verified: false` with an `unverified_reason` means nothing changed — inspect the page before retrying.
 
+### Accessible name is one shared implementation
+
+Accessible name is **element identity**, so the observer and the action-path
+matcher must not each compute it their own way. Both now embed the single
+implementation in [`src/browser/accessible-name.ts`](./src/browser/accessible-name.ts),
+embedded as a string into each in-page program. The two copies previously drifted
+on five rules — `aria-labelledby` id count and precedence, whitespace collapsing,
+the text-length cap, and whether a `<select>` is named from its own options — which
+let one DOM node acquire two different logical identities depending on which
+subsystem observed it.
+
+Resolution order:
+
+1. `aria-labelledby` (all referenced ids joined) — wins over `aria-label`
+2. `aria-label`
+3. associated `<label>`, with the control's own subtree text stripped, so
+   `<label>Location<select>…</select></label>` is named `Location`, never
+   `LocationBangalore`
+4. `title`
+5. `placeholder` (inputs and textareas only)
+6. own text, whitespace-collapsed, up to 200 chars
+
+A `<select>` is deliberately **not** named from its options: its options are the
+control's value, not its label. A theme picker offering Auto/Light/Dark is named
+`Theme` from its label, which is what both `page.observe` and `page.select` see.
+
+`tests/integration/accessible-name-parity.test.ts` asserts both producers agree on
+every rule above.
+
+### Ref space is bounded
+
+Refs are minted per observation (a `full` observe on a dense page is ~2000) and
+every re-render mints a fresh set, so:
+
+- `entries` is capped at **6000**, evicting oldest-first — the observation you are
+  actually acting from is never what disappears
+- counters **restart per document**, once the map is empty of the old document;
+  that is the only moment id recycling is safe
+- a retired ref returns `UNKNOWN_REFERENCE`, which is honest: it was minted long
+  ago and is no longer offered
+
+Ids are therefore small (`e1…e400`) rather than climbing to five digits across a
+long session.
+
 ### The ref contract
 
 Resolution walks a ladder and **never degrades into "act on whatever matched first"**:
@@ -306,6 +350,7 @@ Environment variables always override `config.json` (project root).
 | `src/extractor/` | Observation (observer/cache/delta) + fidelity extraction |
 | `src/safety/layer.ts` | Destructive-action classification |
 | `src/browser/ref-registry.ts` | The ref contract: one mint/resolve authority per session |
+| `src/browser/accessible-name.ts` | Canonical accessible name, embedded into both producers |
 | `src/browser/inpage-scripts.ts` | Shared in-page matcher (probe + action path share these bytes) |
 | `tests/` | Vitest unit + integration suites (fixtures included) |
 | `SKILL.md` | Agent-facing runtime contract, served as `kruz://skill` |
