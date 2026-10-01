@@ -234,10 +234,16 @@ or pass `force:true`.
 `page.open` decides readiness from **rendered content**, not from the lifecycle
 event, and it no longer blocks on that event. So you do not need a lower
 `wait_for` to get a faster return, and you should not read
-`_timing.lifecycle_timed_out: true` as a broken navigation — it only says the
-browser never resolved `load`/`domcontentloaded` (common with slow images,
-long-polling connections and SPAs). If `_ready` is true and `_waited_ms` is
-small, the page is ready regardless.
+`_timing.lifecycle_state: "pending"` as a broken navigation — it only says the
+event had not fired yet when the page was already usable (common with slow
+images, long-polling connections and SPAs). If `_ready` is true and `_waited_ms`
+is small, the page is ready regardless. `"gave_up"` is the one to act on, and it
+sets `_warning: "LIFECYCLE_NOT_RESOLVED"`.
+
+Check `_wait_condition.downgraded` if your wait mode matters: `requested` echoes
+your argument and `lifecycle` shows what the browser was really asked for.
+`wait_for: "networkidle"` is honoured as a bounded (≤8s) in-page quiescence
+check and reports `network_idle_reached`.
 
 ### Pattern 3: Handle overlays before clicking
 

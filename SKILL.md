@@ -458,17 +458,28 @@ guessing (and never wrap a call in a shell timestamp).
 | Tool | Fields |
 |---|---|
 | `page.probe` | `probe_ms` |
-| `page.open` | `_timing.total_ms` (+ `lifecycle_ms`, `lifecycle_timed_out`, `navigate_ms`, `poll_ms`) |
+| `page.open` | `_timing.total_ms` (+ `lifecycle_state`, `navigate_ms`, `poll_ms`) |
 | `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |
 | `page.observe` | `timing.total_ms`, `generate_ms` |
 | `page.handleOverlays` | `timing.total_ms`, `discovery_ms`, `dismissal_ms` |
 
-`page.open` reports `_timing.lifecycle_ms` and `lifecycle_timed_out`. It decides
-readiness from rendered content and no longer blocks on the lifecycle event, so
-`lifecycle_timed_out: true` with `_ready: true` is a healthy page whose `load`
-event never fired — not a broken navigation, and not a reason to re-navigate.
+`page.open` reports `_timing.lifecycle_state` — `resolved` (your requested wait
+mode was honoured), `pending` (had not fired yet when the page was already
+usable) or `gave_up` (never fired within the navigation budget, and
+`_warning: "LIFECYCLE_NOT_RESOLVED"` is set). Readiness is decided from rendered
+content and does not block on the lifecycle event, so `pending` with `_ready: true`
+is a healthy page, not a broken navigation.
+
+`_wait_condition` reports `requested` (your argument, verbatim),
+`lifecycle` (what the browser was actually asked for) and `downgraded`. They
+differ only when your request could not be passed through — check `downgraded`
+if the wait mode matters to you.
+
+`wait_for: "networkidle"` is honoured as a bounded in-page quiescence check
+(≤8s), reported as `network_idle_reached`. It is not the browser's networkidle
+event, which never fires on a page holding a WebSocket or long-poll.
 
 A high `resolve_ms` means target resolution was hard (often genuine ambiguity); a high
 `action_ms` means the browser was slow. Both are measured server-side.

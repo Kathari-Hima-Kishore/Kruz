@@ -83,6 +83,28 @@ function shapeResult(result: any, tool: string): any {
 }
 
 /**
+ * Hoist the error contract to the TOP level of a failed response.
+ *
+ * The envelope lives under `error`, which is the documented shape and what the
+ * examples show. But two rounds of bug reports read `r.code` / `r.page_id` at the
+ * top level, concluded the field was missing, and filed it as a defect — twice on
+ * fields that were present and correct one level down. A contract that is easy to
+ * misread is a contract that will keep generating false bug reports, so the four
+ * documented failure fields are now also readable directly off the response.
+ *
+ * Additive only: `error` is untouched, and nothing is overwritten if the tool
+ * already put a same-named key at the top level.
+ */
+function hoistEnvelope(result: any): Record<string, unknown> {
+  if (!result || result.ok !== false || !result.error) return {};
+  const out: Record<string, unknown> = {};
+  for (const k of ["code", "message", "retryable", "outcome", "subsystem", "help"]) {
+    if (result.error[k] !== undefined && result[k] === undefined) out[k] = result.error[k];
+  }
+  return out;
+}
+
+/**
  * Should this result set MCP `isError`?
  *
  * Only a FAILURE should. An `isError: true` result is raised as a thrown
@@ -111,10 +133,23 @@ function isFailure(result: any): boolean {
 export class ToolRouter {
   private readonly instanceId = randomUUID();
   private sm: SessionManager;
+  /** Cached canonical tab id, refreshed wherever the active tab can change. */
+  private pageIdCache: string | null = null;
 
   private diagnostics() {
     const s = this.sm.getActive();
-    return { server_instance_id: this.instanceId, process_id: process.pid, session_id: s?.id ?? null, browser_connected: s?.engine?.connected ?? false, session_creating: this.sm.isCreating };
+    // page_id is served from a cache rather than a fresh listTabs() round-trip,
+    // because diagnostics() rides on EVERY tool response and a CDP call per tool
+    // is not worth one convenience field. It is refreshed wherever the active tab
+    // can change under us (session create, navigate, tab ops).
+    return {
+      server_instance_id: this.instanceId,
+      process_id: process.pid,
+      session_id: s?.id ?? null,
+      browser_connected: s?.engine?.connected ?? false,
+      session_creating: this.sm.isCreating,
+      ...(s?.engine ? { page_id: this.pageIdCache } : {}),
+    };
   }
 
   /**
@@ -269,7 +304,7 @@ export class ToolRouter {
           timer = setTimeout(() => reject(new Error("ROUTE_TIMEOUT")), ROUTE_TIMEOUT_MS)
         ),
       ]);
-      return { content: [{ type: "text", text: JSON.stringify({ ...shapeResult(result, name), ...this.diagnostics() }) }], isError: isFailure(result) };
+      return { content: [{ type: "text", text: JSON.stringify({ ...shapeResult(result, name), ...this.diagnostics(), ...hoistEnvelope(result) }) }], isError: isFailure(result) };
     } catch (err) {
       if (String(err) === "Error: ROUTE_TIMEOUT") {
         // A timeout cannot establish success or cancel an in-flight browser action.
@@ -333,10 +368,10 @@ export class ToolRouter {
       case "page.open": return this.openWithRetry(a.url, a.wait_for ?? a.wait_until, a.timeout_ms ?? a.nav_timeout_ms, 1, a.detect_redirect);
 
       // Multi-tab (parallel boards / keep-JD-open while verifying)
-      case "page.newTab": return this.ctrl.newTab(a.url);
-      case "page.switchTab": return this.ctrl.switchTab(a.page_id);
+      case "page.newTab": return this.tabOp(() => this.ctrl.newTab(a.url));
+      case "page.switchTab": return this.tabOp(() => this.ctrl.switchTab(a.page_id));
       case "page.listTabs": return this.ctrl.listTabs();
-      case "page.closeTab": return this.ctrl.closeTab(a.page_id);
+      case "page.closeTab": return this.tabOp(() => this.ctrl.closeTab(a.page_id));
 
       // Observe
       case "page.observe": return this.obs(a);
@@ -435,6 +470,7 @@ export class ToolRouter {
     // Report the engine's real tab id, not a hardcoded literal, so it matches
     // what page.observe / page.listTabs report for the same tab.
     const pageId = await this.activePageId();
+    this.pageIdCache = pageId ?? null;
     // The control layer is injected over CDP and re-applies
     // on every navigation. Installed hidden: the blue overlay + input lock
     // engage only around mutating tool calls (route()), so the window is clean
@@ -598,12 +634,14 @@ export class ToolRouter {
 
   // Issue 1 & 7: Auto-retry with new session on browser crash
   private async openWithRetry(url: string, waitFor?: string, timeoutMs?: number, retries = 1, detectRedirect?: boolean): Promise<any> {
-    // K1: networkidle NEVER resolves on SPAs with WebSockets (Oracle HCM, etc.)
-    // Convert to domcontentloaded which always completes. The internal fallback
-    // in ctrl.open() will handle the rest.
-    const effectiveWait = (waitFor === "networkidle") ? "domcontentloaded" : (waitFor as any);
+    // K1: networkidle NEVER resolves as a browser lifecycle event on SPAs with
+    // WebSockets (Oracle HCM, etc.), so the CONTROLLER handles it with a bounded
+    // in-page quiescence check instead. The caller's argument is passed through
+    // untouched: coercing it here made `_wait_condition.requested` echo a request
+    // that was never made, so `requested === effective` always held and no
+    // caller could detect the downgrade.
     const attempt = async (): Promise<any> => {
-      const result = await this.ctrl.open(url, effectiveWait, timeoutMs);
+      const result = await this.ctrl.open(url, waitFor as any, timeoutMs);
       if (result.ok) {
         // Deep-link redirect detection (Accenture-style: jobdetails → search page)
         if (detectRedirect && url.includes("jobdetails")) {
@@ -628,6 +666,8 @@ export class ToolRouter {
         if (result && result.ok && result.result && result.result.page_id === undefined) {
           result.result.page_id = await this.activePageId();
         }
+        // page_id also rides the top level via diagnostics(), so `r.page_id`
+        // works here exactly as it does on session.create / page.observe.
         return result;
       }
       // A non-crash failure is terminal — do not burn the retry budget.
@@ -669,10 +709,21 @@ export class ToolRouter {
  */
   private async activePageId(): Promise<string | null> {
     const s = this.sm.getActive();
-    if (!s?.engine) return null;
+    if (!s?.engine) { this.pageIdCache = null; return null; }
     const tabs = await s.engine.listTabs().catch(() => null);
     const active = tabs?.find((t) => t.isActive) ?? tabs?.[0];
-    return active?.id ?? null;
+    this.pageIdCache = active?.id ?? null;
+    return this.pageIdCache;
+  }
+
+  /** Refresh the cached tab id after an operation that may have changed it. */
+  private async refreshPageId(): Promise<void> { await this.activePageId().catch(() => {}); }
+
+  /** Run a tab-mutating call, then re-read which tab is active. */
+  private async tabOp<T>(fn: () => Promise<T>): Promise<T> {
+    const r = await fn();
+    await this.refreshPageId();
+    return r;
   }
 
   private pid(): string {

@@ -247,6 +247,13 @@ around tools that return values — and it made delivery depend on the client an
 on which call it was, so code validated against the first call failed on the
 second.
 
+On a failed response the six envelope fields (`code`, `message`, `retryable`,
+`outcome`, `subsystem`, `help`) are readable **both** under `error` and directly
+off the response, so `r.code` and `r.error.code` both work. Likewise `page_id`
+appears at the top level of every tool response, not only inside a nested
+`result`. Reading a documented field at the wrong depth previously produced
+false bug reports against fields that were present and correct.
+
 **Retryable** (the same call may succeed shortly): `NO_SESSION`, `BROWSER_CRASHED`, `ELEMENT_OBSCURED`, `ELEMENT_NOT_VISIBLE`, `ELEMENT_DISABLED`, `STALE_ELEMENT`, `ACTION_TIMEOUT`, `NO_MATCH`, `INTERNAL_ERROR`.
 
 **Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `OVERLAY_NO_DISMISS_INTENT`.
@@ -264,7 +271,7 @@ calls in external timestamps. Diagnostic metadata only — never a decision inpu
 | Tool | Fields |
 |---|---|
 | `page.probe` | `probe_ms` |
-| `page.open` | `_timing.total_ms` (+ `lifecycle_ms`, `lifecycle_timed_out`, `navigate_ms`, `poll_ms`) |
+| `page.open` | `_timing.total_ms` (+ `lifecycle_state`, `navigate_ms`, `poll_ms`) |
 | `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |

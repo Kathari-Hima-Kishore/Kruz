@@ -101,12 +101,21 @@ export class BrowserController {
     if (!engine) return this.noSession();
     // BUG-4: Clear network logs from previous navigation to avoid cumulative dumps
     this.clearNetworkLogs();
-    // K1: networkidle NEVER resolves on SPAs with WebSockets. Convert to domcontentloaded.
+    // The caller's actual argument, preserved verbatim. It used to be overwritten
+    // with the coerced value before being reported back as `requested`, so the
+    // response described a request that was never made.
+    const requestedWait = waitFor;
+    // K1: `networkidle` is not honoured as a browser lifecycle event — it never
+    // resolves on SPAs with WebSockets (Oracle HCM, Snowflake, Workday). It is
+    // implemented instead as a BOUNDED in-page quiescence check below, so the
+    // caller still gets the semantics they asked for, and an honest answer when
+    // quiescence was not reached within the budget.
+    const lifecycleWait = waitFor === "networkidle" ? "domcontentloaded" : waitFor;
     // Career portals (Siemens/Phenom, Oracle HCM, SuccessFactors) need 12-25s for edge
     // CDN + bot-mitigation before domcontentloaded fires — default 45s, honor caller
     // timeout_ms up to 60s. No more 15s hard cap.
     const rawTimeout = Math.min(timeoutMs || 45000, 60000);
-    const effectiveWait = waitFor === "networkidle" ? "domcontentloaded" : waitFor;
+    const effectiveWait = lifecycleWait;
     const effectiveTimeout = effectiveWait === "commit" ? Math.min(rawTimeout, 30000) : rawTimeout;
     // K30: Do NOT gate readiness on the DOMContentLoaded/load lifecycle event.
     // The goto below is capped at 20s so it can never deadlock the routing thread
@@ -139,6 +148,23 @@ export class BrowserController {
       await engine.bringToFront().catch(() => {});
       const tPoll0 = Date.now();
       let pic = await this.pollForContent(engine, url, Math.min(rawTimeout, 15000), 250);
+      // Bounded network-idle wait. Runs AFTER the content poll on purpose: run
+      // earlier it would sample a page that has not loaded yet and declare
+      // "idle" instantly, which is worse than not offering the option.
+      let networkIdleMs: number | null = null;
+      let networkIdleReached: boolean | null = null;
+      if (requestedWait === "networkidle") {
+        const tNi = Date.now();
+        const budgetMs = Math.min(Math.max(rawTimeout, 1000), 8000);
+        const QUIET_MS = 500;
+        while (Date.now() - tNi < budgetMs) {
+          const q = await this.networkQuiescence(engine);
+          if (q && q.pending === 0 && q.quietForMs >= QUIET_MS) { networkIdleReached = true; break; }
+          await engine.waitMs(200).catch(() => {});
+        }
+        if (networkIdleReached === null) networkIdleReached = false;
+        networkIdleMs = Date.now() - tNi;
+      }
       // A not-ready verdict is only trustworthy once the navigation has actually
       // committed. Before that, pollForContent is reading the pre-navigation
       // document (empty body, no mutation tracker), which its thin-page shortcut
@@ -154,6 +180,14 @@ export class BrowserController {
       // leaving a dangling navigation, but never block on it: by now the content
       // poll has already decided readiness one way or the other.
       await Promise.race([navP, engine.waitMs(1500).catch(() => {})]);
+      // Distinguish "never resolved" from "still running when we stopped looking".
+      // Reporting the latter as a timeout produced a false LIFECYCLE_NOT_RESOLVED
+      // on fast navigations whose event simply had not landed inside the grace
+      // window — a warning that cries wolf is worse than none.
+      const navBudgetMs = Math.min(effectiveTimeout, 20000);
+      const navElapsedMs = Date.now() - tNav0;
+      const lifecycleState: "resolved" | "pending" | "gave_up" =
+        navSettledMs !== null ? "resolved" : navElapsedMs >= navBudgetMs ? "gave_up" : "pending";
       // K31+: A real Chrome crash (renderer OOM / hard process death) must surface as
       // BROWSER_CRASHED so the router's openWithRetry can auto-recreate the session.
       // Without this check the swallowed navigate error reads as PAGE_NOT_READY and the
@@ -186,20 +220,37 @@ export class BrowserController {
           // null when the browser never resolved the wait condition at all, which
           // is the signal that distinguishes "slow page" from "stalled event".
           lifecycle_ms: navSettledMs,
-          lifecycle_timed_out: navSettledMs === null,
+          lifecycle_timed_out: lifecycleState === "gave_up",
+          lifecycle_state: lifecycleState,
           navigate_ms: tPoll0 - tNav0,
           poll_ms: tFg - tPoll0,
           overlay_ms: tEnd - tFg,
           total_ms: tEnd - t0,
         },
-        _wait_condition: { requested: waitFor, effective: effectiveWait },
+        _wait_condition: {
+          // `requested` is the caller's argument verbatim; `lifecycle` is what
+          // the browser was actually asked for. They differ exactly when a
+          // downgrade happened, which is what makes the downgrade detectable.
+          requested: requestedWait,
+          lifecycle: effectiveWait,
+          downgraded: requestedWait !== effectiveWait,
+          ...(networkIdleMs !== null
+            ? { network_idle_ms: networkIdleMs, network_idle_reached: networkIdleReached }
+            : {}),
+        },
       };
+      if (lifecycleState === "gave_up") {
+        result._warning = "LIFECYCLE_NOT_RESOLVED";
+        result._warning_detail = `The '${effectiveWait}' lifecycle event never resolved within ${navBudgetMs}ms. Readiness was decided from rendered content instead (${
+          pic.loaded ? "content present" : "no content detected"
+        }).`;
+      }
       if (!pic.loaded) {
         // The lifecycle wait failing is the likeliest explanation, and it is
         // actionable (retry with wait_for:"commit"), so it must not stay swallowed.
         if (navErr) result._navigate_error = String(navErr).slice(0, 300);
         if (navSettledMs === null) {
-          result._navigate_error ??= `The '${effectiveWait}' lifecycle event never resolved within ${Math.min(effectiveTimeout, 20000)}ms.`;
+          result._navigate_error ??= `The '${effectiveWait}' lifecycle event never resolved within ${navBudgetMs}ms.`;
         }
         result._warning = "PAGE_NOT_READY";
         result.message = `Navigation committed but no real content detected after ${pic.elapsedMs}ms poll (body_length=${pic.bodyLength}). The page may show a bot-challenge, consent wall, or is still hydrating. Call page.observe or extract.text to see what is actually on screen.`;
@@ -254,6 +305,34 @@ export class BrowserController {
       if (now - started > thinWindow) return { ...snap, elapsedMs: Date.now() - started };
     }
     return { ...snap, elapsedMs: Date.now() - started };
+  }
+
+  /**
+ * In-flight request count and how long the network has been quiet, from the
+ * Resource Timing buffer. `responseEnd === 0 && duration === 0` is a request
+ * the browser started but has not finished.
+ *
+ * This is what makes `networkidle` implementable at all: the browser's own
+ * networkidle lifecycle event never fires on a page holding a WebSocket or a
+ * long-poll, which is why the option used to be silently coerced away. Resource
+ * Timing is per-request rather than per-connection, so a permanently open socket
+ * does not prevent quiescence from being detected.
+ */
+  private async networkQuiescence(engine: BrowserEngine): Promise<{ pending: number; quietForMs: number; total: number } | null> {
+    const r = await engine.evaluate(`(() => {
+      try {
+        var rs = performance.getEntriesByType("resource");
+        var pending = 0, lastStart = 0;
+        for (var i = 0; i < rs.length; i++) {
+          var e = rs[i];
+          if (e.responseEnd === 0 && e.duration === 0) pending++;
+          if (e.startTime > lastStart) lastStart = e.startTime;
+        }
+        return { pending: pending, quietForMs: Math.round(performance.now() - lastStart), total: rs.length };
+      } catch (x) { return null; }
+    })()`).catch(() => null);
+    const v = r?.ok ? (r.result as any) : null;
+    return v && typeof v.pending === "number" ? v : null;
   }
 
   /** Current DOM mutation count, or null when no tracker is installed. */
