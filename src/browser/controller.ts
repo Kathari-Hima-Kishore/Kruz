@@ -19,7 +19,7 @@ import type { Observation } from "../types/observation.js";
 import { extractExperienceSignals } from "./ats-tools.js";
 
 import { bulkHarvest, type TargetCompany } from "./ats-json.js";
-import { kruzError, kruzErrorFromThrown, ErrCode, withRetry, type Subsystem } from "../errors.js";
+import { kruzError, kruzErrorFromThrown, ErrCode, isErrCode, withRetry, type Subsystem } from "../errors.js";
 
 /**
  * Diagnostic timing for an action. Metadata only: never consulted when deciding
@@ -33,6 +33,10 @@ export interface ActionTiming {
   action_ms?: number;
   verify_ms?: number;
   observe_ms?: number;
+  /** Conditional navigation grace after an implicit-submission Enter. */
+  grace_ms?: number;
+  /** Coordinate hit-test performed before a clickAt dispatch. */
+  hit_test_ms?: number;
 }
 
 export interface ActionResult {
@@ -592,13 +596,72 @@ export class BrowserController {
    */
   async probeTarget(e: BrowserEngine, target: Target, fallback?: Fallback, scope?: string): Promise<{
     count: number; actionable_count: number; strategy: string; candidates: Array<Record<string, unknown>>;
+    /** Present when strategy is "ref": which resolution tier proved identity. */
+    tier?: number;
+    ref?: string;
+    ref_state?: string;
+    evidence?: Record<string, unknown>;
+    code?: string;
+    retryable?: boolean;
+    help?: string;
     _timing?: { probe_ms: number }; error?: string;
   }> {
+    const started = Date.now();
+    // A ref target must go through the registry, not the descriptor matcher.
+    // specFromTarget has no `ref` branch, so probing a ref used to fall straight
+    // through to `strategy: "none", count: 0` with ok:true and no error — a false
+    // "nothing matches" for a ref the observe that minted it had just returned.
+    // That is the worst possible answer from the tool you reach for precisely
+    // when a ref has stopped working.
+    if (target.ref) {
+      // Identity must be refreshed first, exactly as unified() does before any
+      // action. Without it this path compared the ref against a stale/absent
+      // docIdCache and reported DOCUMENT_CHANGED for a perfectly live ref.
+      await this.refreshIdentity(e);
+      const r = await resolveForAction(
+        { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+        target, fallback, scope, "clickable", { allowHidden: true, waitMs: 0 },
+      );
+      if (r.ok) {
+        const d = r.descriptor;
+        return {
+          count: 1,
+          actionable_count: 1,
+          strategy: "ref",
+          tier: r.tier,
+          candidates: [{
+            ref: target.ref, role: d.role, name: d.name, tag: d.tag,
+            href: d.href ?? null, visible: true, enabled: true, in_viewport: true,
+            actionable: true, blocked_reason: null,
+          }],
+          _timing: { probe_ms: Date.now() - started },
+        };
+      }
+      // Report the real reason. `strategy: "ref"` plus the registry's evidence is
+      // the honest answer to "does this ref still exist?", and it distinguishes a
+      // stale ref from a ref that was never issued.
+      return {
+        count: 0,
+        actionable_count: 0,
+        strategy: "ref",
+        candidates: [],
+        ref: target.ref,
+        ref_state: r.code,
+        ...(r.evidence ? { evidence: r.evidence } : {}),
+        error: r.message,
+        ...(r.code ? { code: r.code, retryable: r.retryable, help: r.help } : {}),
+        _timing: { probe_ms: Date.now() - started },
+      };
+    }
     const spec = specFromTarget(target, fallback, scope);
     if (spec.strategy === "none") {
-      return { count: 0, actionable_count: 0, strategy: "none", candidates: [] };
+      return {
+        count: 0, actionable_count: 0, strategy: "none", candidates: [],
+        // Never answer "nothing matched" for a target Kruz could not even interpret.
+        error: "No usable target field. Pass ref, css, role+name, label, placeholder, text, testid, nameAttr or id.",
+        _timing: { probe_ms: Date.now() - started },
+      };
     }
-    const started = Date.now();
     const m = await runMatch(e, spec, 40);
     const candidates = await this.targetCandidates(e, target, fallback, scope, 8, "probe");
     return {
@@ -776,6 +839,7 @@ export class BrowserController {
 
   async press(key: string, target?: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
+    const t0 = Date.now();
     try {
       // P1-A correction: an Enter that submits a form (or activates a link) commits
       // its navigation asynchronously. Capturing feedback the instant the key lands
@@ -785,17 +849,28 @@ export class BrowserController {
       // form, plain typing) pay zero cost, then wait only until the URL actually moves.
       let grace = false;
       let graceFrom = "";
-      let resolved: { el: KruzElement } | undefined;
+      let resolved: { el: KruzElement; ref?: string } | undefined;
       if (target) resolved = await this.resolve(target, fallback, scope, timeoutMs);
       if (/enter/i.test(key)) {
         grace = resolved ? await this.enterCanNavigate(e, resolved.el) : await this.enterCanNavigate(e);
         if (grace) graceFrom = await e.evaluate("location.href").then(r => (r.ok ? String(r.result) : "")).catch(() => "");
       }
+      const tResolve = Date.now();
       if (resolved) await e.press(resolved.el, key, { timeoutMs });
       else await e.keyboardPress(key);
+      const tKey = Date.now();
       this.bump();
       if (grace && graceFrom) await this.awaitUrlChange(e, graceFrom, 1000);
-      return { ok: true };
+      const tEnd = Date.now();
+      // press was the one action tool reporting no timing at all, so a slow or
+      // stalled keypress was indistinguishable from an instant one. The grace
+      // window is broken out because it is conditional: an Enter that cannot
+      // navigate must not look like it paid for navigation.
+      return {
+        ok: true,
+        result: { key, pressed: true, ...(resolved ? { ref: resolved.ref } : {}), ...(grace ? { navigation_grace: true, grace_from: graceFrom } : {}) },
+        timing: { total_ms: tEnd - t0, resolve_ms: tResolve - t0, action_ms: tKey - tResolve, grace_ms: tEnd - tKey },
+      };
     } catch (err) { return this.actionErr(`Press "${key}"`, err); }
   }
 
@@ -859,7 +934,7 @@ export class BrowserController {
       : options.label !== undefined ? { label: options.label }
       : options.index !== undefined ? { index: options.index }
       : null;
-    if (!criterion) return this.err("page.select", "No selection criteria (value, label, or index)", false);
+    if (!criterion) return this.err(ErrCode.INVALID_INPUT, "page.select: no selection criterion. Pass one of value, label or index.", false);
 
     const applyNative = async (el: KruzElement): Promise<boolean> => {
       // Check whether the resolved element is a native <select>. If it is not,
@@ -1224,18 +1299,18 @@ export class BrowserController {
           break;
         }
         case "element": {
-          if (!target) return this.err("page.wait", "Target required for element wait", false);
+          if (!target) return this.err(ErrCode.INVALID_INPUT, "page.wait: a target is required for an element/hidden wait.", false);
           const el = await tryResolveElement(e, target, fallback, scope, timeoutMs);
           if (!el) throw new Error("Element not visible");
           break;
         }
         case "hidden": {
-          if (!target) return this.err("page.wait", "Target required for hidden wait", false);
+          if (!target) return this.err(ErrCode.INVALID_INPUT, "page.wait: a target is required for a hidden wait.", false);
           await e.waitForSelector(target, { state: "hidden", timeoutMs }); break;
         }
         case "navigation": await e.waitForNavigation(timeoutMs); break;
         case "timeout": await new Promise(r => setTimeout(r, timeoutMs)); break;
-        default: return this.err("page.wait", `Unknown condition: ${condition}`, false);
+        default: return this.err(ErrCode.INVALID_INPUT, `page.wait: unknown condition "${condition}". Use load, domcontentloaded, networkidle, element, hidden, content or navigation.`, false);
       }
       return { ok: true };
     } catch (err) { return this.err("page.wait", `Wait failed (${condition}): ${err}`, true); }
@@ -1249,9 +1324,9 @@ export class BrowserController {
       const rm = this.getRefMap();
       const srcEl = (await resolveElementWithRef(e, s, rm, sf, scope)).el;
       const dstEl = (await resolveElementWithRef(e, d, rm, df, scope)).el;
-      if (!srcEl || !dstEl) return this.err("page.drag", "Source or dest not visible", false);
+      if (!srcEl || !dstEl) return this.err(ErrCode.INVALID_INPUT, "page.drag: source or destination was not visible; pass visible x/y for both.", false);
       const [src, dst] = await Promise.all([e.boundingBox(srcEl), e.boundingBox(dstEl)]);
-      if (!src || !dst) return this.err("page.drag", "Source or dest not visible", false);
+      if (!src || !dst) return this.err(ErrCode.INVALID_INPUT, "page.drag: source or destination was not visible; pass visible x/y for both.", false);
       const sx = src.x + src.width / 2, sy = src.y + src.height / 2;
       const dx = dst.x + dst.width / 2, dy = dst.y + dst.height / 2;
       await e.mouseMove(sx, sy);
@@ -1272,7 +1347,7 @@ export class BrowserController {
       const rm = this.getRefMap();
       const srcEl = (await resolveElementWithRef(e, s, rm, sf, scope)).el;
       const dstEl = (await resolveElementWithRef(e, d, rm, df, scope)).el;
-      if (!srcEl || !dstEl) return this.err("page.html5Drag", "Source or dest not visible", false);
+      if (!srcEl || !dstEl) return this.err(ErrCode.INVALID_INPUT, "page.html5Drag: source or destination was not visible; pass visible x/y for both.", false);
       await e.html5Drag(srcEl, dstEl);
       this.bump();
       return { ok: true };
@@ -1300,8 +1375,20 @@ export class BrowserController {
     try {
       const r = await e.evaluate(expression);
       this.bump();
-      return r.ok ? { ok: true, result: r.result } : this.err("page.evaluate", r.error || "Evaluation failed", false);
-    } catch (err) { return this.err("page.evaluate", `JS eval failed: ${err}`, true); }
+      if (r.ok) return { ok: true, result: r.result };
+      // A SyntaxError is the caller's expression being wrong — malformed input,
+      // diagnosed and actionable, so it belongs with INVALID_INPUT and RESOLVES.
+      // A runtime ReferenceError/TypeError means the code ran and failed, which is
+      // a genuine failure of the tool and still raises. Collapsing both into one
+      // behaviour would either crash the caller on a typo or hide a real error.
+      const rawEvalErr = r.error || "Evaluation failed";
+      if (/SyntaxError/i.test(rawEvalErr)) {
+        return this.err(ErrCode.INVALID_INPUT, `page.evaluate: ${String(rawEvalErr).replace(/^Error:\s*/, "")}`, false);
+      }
+      return this.err(ErrCode.OPERATION_FAILED, rawEvalErr, false, { operation: "page.evaluate" });
+    } catch (err) {
+      return this.err(ErrCode.OPERATION_FAILED, `JS eval failed: ${err}`, true, { operation: "page.evaluate" });
+    }
   }
 
   async readVariable(name: string): Promise<ActionResult> {
@@ -1469,10 +1556,31 @@ export class BrowserController {
 
   async clickAt(x: number, y: number, button: "left" | "right" | "middle" = "left"): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
+    const t0 = Date.now();
     try {
+      // Report what was actually under the point BEFORE dispatching. A coordinate
+      // click is the least verifiable action in the catalog — there is no ref and
+      // no fingerprint to re-check — so the caller has no way to confirm what it
+      // hit unless the tool says so.
+      const at = await e.evaluate(`(() => {
+        try {
+          var el = document.elementFromPoint(${Math.round(x)}, ${Math.round(y)});
+          if (!el) return { hit: false, tag: null, id: null, role: null, name: null };
+          var nm = el.getAttribute("aria-label") || (el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 60) || el.getAttribute("title") || null;
+          return { hit: true, tag: el.tagName.toLowerCase(), id: el.id || null,
+                   role: el.getAttribute("role") || null, name: nm };
+        } catch (err) { return { hit: false, tag: null, id: null, role: null, name: null, error: String(err) }; }
+      })()`).catch(() => null);
+      const target = at?.ok ? (at.result as Record<string, unknown>) : null;
+      const tHit = Date.now();
       await (e as any).rememberCursor?.({ x, y });
       await e.mouseClick(x, y, { button });
-      return { ok: true };
+      const tEnd = Date.now();
+      return {
+        ok: true,
+        result: { x, y, button, clicked: true, ...(target ?? {}) },
+        timing: { total_ms: tEnd - t0, hit_test_ms: tHit - t0, action_ms: tEnd - tHit },
+      };
     }
     catch (err) { return this.err("page.clickAt", `Click at (${x},${y}) failed: ${err}`, true); }
   }
@@ -1521,7 +1629,7 @@ export class BrowserController {
   async computerUseScrollTo(i: number): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
     if (typeof i !== "number" || !Number.isFinite(i) || i < 0) {
-      return this.err("page.computerUseScrollTo", `i must be a non-negative integer (got ${i})`, false);
+      return this.err(ErrCode.INVALID_INPUT, `page.computerUseScrollTo: i must be a non-negative integer (got ${i}).`, false);
     }
     const { scrollToTargetJS } = await import("./computer-use.js");
     const r = await e.evaluate(`(${scrollToTargetJS.toString()})(${i})`);
@@ -2199,7 +2307,7 @@ export class BrowserController {
       }
 
       if (!searchInput) {
-        return this.err("page.oracleHCMSearch", "No search input found on Oracle HCM page", false);
+        return this.err(ErrCode.TARGET_NOT_FOUND, "page.oracleHCMSearch: no search input is present on this Oracle HCM page, so the search cannot be submitted.", false);
       }
 
       // Clear and fill the search input
@@ -2580,7 +2688,7 @@ export class BrowserController {
   /** Close a tab, switching active to the next remaining one. */
   async closeTab(pageId: string): Promise<ActionResult> {
     const ok = await this.sessionManager.closeTab(pageId);
-    if (!ok) return { ok: false, error: { code: "NO_TAB", message: `No open tab '${pageId}'.`, retryable: false } };
+    if (!ok) return { ok: false, error: kruzError(ErrCode.NO_TAB, { subsystem: "session", message: `No open tab '${pageId}'.`, trace: ["controller:page.closeTab"] }).toJSON() };
     this.invalidateAllRefs();
     const tabs = await this.sessionManager.listTabs();
     return { ok: true, result: { closed: pageId, active: tabs.filter(t => t.isActive).map(t => t.id) } };
@@ -2600,7 +2708,7 @@ export class BrowserController {
     try {
       await e.switchTab(pageId);
     } catch {
-      return { ok: false, error: { code: "NO_TAB", message: `No open tab '${pageId}'. Use page.listTabs to see open tabs.`, retryable: false } };
+      return { ok: false, error: kruzError(ErrCode.NO_TAB, { subsystem: "session", message: `No open tab '${pageId}'.`, trace: ["controller:page.switchTab"] }).toJSON() };
     }
     this.invalidateAllRefs();
     try { await e.bringToFront().catch(() => {}); } catch { /* ignore */ }
@@ -2628,17 +2736,31 @@ export class BrowserController {
   private noSession(): ActionResult {
     return { ok: false, error: kruzError(ErrCode.NO_SESSION, { subsystem: "session", message: "No active browser session. Start one with session.create.", trace: ["controller"] }).toJSON() };
   }
-  /** Build a standard error ActionResult — one shape for every controller failure. */
-  private err(code: string, message: string, retryable: boolean, extra?: { help?: string; subsystem?: Subsystem }): ActionResult {
+  /**
+   * Build a standard error ActionResult — one shape for every controller failure.
+   *
+   * `code` is normalised to a DOCUMENTED ErrCode. Roughly 57 call sites pass an
+   * operation name here ("page.evaluate", "page.scroll", "ats.paginate", …), so
+   * `code` used to be a tool name: not in the taxonomy, not in any doc, and
+   * impossible to branch on — which is the one job `code` exists for. Those
+   * collapse to OPERATION_FAILED and the operation is preserved on the envelope
+   * as `operation`, so nothing diagnostic is lost and `code` becomes branchable.
+   */
+  private err(code: string, message: string, retryable: boolean, extra?: { help?: string; subsystem?: Subsystem; operation?: string }): ActionResult {
+    const documented = isErrCode(code);
+    const finalCode = documented ? code : ErrCode.OPERATION_FAILED;
+    const envelope = kruzError(finalCode, {
+      message,
+      subsystem: extra?.subsystem,
+      retryable,
+      help: extra?.help,
+      trace: ["controller"],
+    }).toJSON();
+    if (!documented) envelope.operation = code;
+    if (extra?.operation) envelope.operation = extra.operation;
     return {
       ok: false,
-      error: kruzError(code, {
-        message,
-        subsystem: extra?.subsystem,
-        retryable,
-        help: extra?.help,
-        trace: ["controller"],
-      }).toJSON(),
+      error: envelope,
     };
   }
 

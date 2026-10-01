@@ -282,12 +282,20 @@ A tool that cannot do what you asked returns a **value**, not a thrown exception
 So `const r = await page_click(...); if (!r.ok)` is the correct and sufficient
 pattern — **do not wrap tool calls in try/catch for expected refusals.**
 
-- **`outcome: "refusal"`** — Kruz did its job and the answer is "not safely".
+- **`outcome: "refusal"`** - Kruz did its job and the answer is "not safely".
   It guessed nothing and clicked nothing; the payload holds what it found
   (`candidates` on `AMBIGUOUS_TARGET`, `region_candidates` on
   `OVERLAY_NO_DISMISS_INTENT`). Re-plan deliberately rather than retrying.
-- **`outcome: "failure"`** — the tool could not do its job: no session, crashed
-  browser, timeout, unhandled exception. These *are* raised as errors.
+  Argument-validation refusals are here too — `INVALID_TARGET`, `INVALID_INPUT`,
+  `NO_TAB`: Kruz read the call, understood it, rejected it, and `help` says what
+  a correct call looks like. Fix the argument; never retry it unchanged.
+- **`outcome: "failure"`** - the tool could not do its job: no session, crashed
+  browser, timeout, a runtime exception in your own JS, an unhandled error.
+  These *are* raised as errors.
+
+Every `code` is one of the documented codes below. Operations that fail without a
+more specific classification report `OPERATION_FAILED` and carry the originating
+operation on `error.operation`.
 
 ### Retryable (safe to retry)
 `ELEMENT_NOT_VISIBLE`, `ELEMENT_OBSCURED`, `STALE_ELEMENT`, `ELEMENT_DISABLED`, `NO_SESSION`, `BROWSER_CRASHED`, `ACTION_TIMEOUT`, `INTERNAL_ERROR`
@@ -296,7 +304,7 @@ pattern — **do not wrap tool calls in try/catch for expected refusals.**
 `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`,
 `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`,
 `UNKNOWN_REFERENCE`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`,
-`OVERLAY_NO_DISMISS_INTENT`
+`OVERLAY_NO_DISMISS_INTENT`, `INVALID_TARGET`, `INVALID_INPUT`, `NO_TAB`
 
 `OVERLAY_NO_DISMISS_INTENT` is the one to read carefully: an overlay **was**
 found, but none of its controls carried a safe dismissal intent, so nothing was
@@ -461,6 +469,8 @@ guessing (and never wrap a call in a shell timestamp).
 | `page.open` | `_timing.total_ms` (+ `lifecycle_state`, `navigate_ms`, `poll_ms`) |
 | `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
+| `page.press` | `timing.total_ms`, `resolve_ms`, `action_ms`, `grace_ms` |
+| `page.clickAt` | `timing.total_ms`, `hit_test_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |
 | `page.observe` | `timing.total_ms`, `generate_ms` |
 | `page.handleOverlays` | `timing.total_ms`, `discovery_ms`, `dismissal_ms` |

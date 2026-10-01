@@ -105,6 +105,17 @@ function hoistEnvelope(result: any): Record<string, unknown> {
 }
 
 /**
+ * Copy named keys out of a nested `result` onto the response, without
+ * overwriting a key the tool already set at the top level.
+ */
+function hoistResult(result: any, keys: string[]): Record<string, unknown> {
+  if (!result || typeof result !== "object") return {};
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (result[k] !== undefined) out[k] = result[k];
+  return out;
+}
+
+/**
  * Should this result set MCP `isError`?
  *
  * Only a FAILURE should. An `isError: true` result is raised as a thrown
@@ -378,7 +389,11 @@ export class ToolRouter {
 
       // Click - semantic target click (preferred) + coordinate fallback
       case "page.click": return this.click(a);
-      case "page.clickAt": return this.ctrl.clickAt(a.x, a.y, a.button);
+      // through withFeedback so it returns the same compact post-action `state` as
+      // every other action tool. It previously returned a bare `{ok:true}` — no
+      // state, no timing, and nothing confirming what the coordinate actually
+      // hit — making it the only action whose effect the caller could not check.
+      case "page.clickAt": return this.withFeedback(this.sm.getActiveEngine(), () => this.ctrl.clickAt(a.x, a.y, a.button));
 
       // Computer-use (text-only CUA bridge — see src/browser/computer-use.ts)
       case "page.computerUseList": return this.ctrl.computerUseList();
@@ -609,14 +624,36 @@ export class ToolRouter {
       response = { ok: false, error: shapeError(toErrorEnvelope(err), "page.click") };
     }
 
-    return finish({...response, ...(overlays ? {overlay_handling:overlays} : {}), ...(visualFallback ? {visual_fallback:visualFallback} : {})});
+    const settled = await finish({...response, ...(overlays ? {overlay_handling:overlays} : {}), ...(visualFallback ? {visual_fallback:visualFallback} : {})});
+    // BUG-009: page.click was the only action tool that returned `result` instead of
+    // the compact post-action `state` that press/fill/select/scroll all provide. The
+    // skill documents `state` as the closed loop ("use it to decide the next step
+    // without a separate page.observe"), and click is the highest-traffic tool in the
+    // catalog - so the documented path was missing exactly where it is used most, and
+    // dom_changed / focus / signature / document_changed / page_mutated were
+    // unreachable after a click.
+    //
+    // The verification fields are ALSO hoisted, because the skill's verification table
+    // presents clicked/verified/verification as top-level and reading `res.clicked`
+    // returned undefined - the same class of path trap that produced two false bug
+    // reports this session. `result` keeps everything for backward compatibility.
+    if (settled.ok !== true || !engine) return settled;
+    let clickState: unknown = null;
+    try {
+      clickState = await this.ctrl.pageFeedback(engine, this.stateOf(before), { includeLists: false });
+    } catch { /* state is advisory; never fail a click over it */ }
+    if (!clickState) return settled;
+    return { ...settled, state: clickState, ...hoistResult(settled.result, ["clicked", "verified", "verification", "effect_observed", "navigation", "url", "title", "resolution_tier", "effect_token", "ref"]) };
   }
 
   private async extText(a: Record<string, any>) {
     const s = this.sm.getActive();
     if (!s?.engine) return this.noSess();
     await this.waitForContent(s.engine);
-    return s.extractor.extractText(s.engine, a.target, a.fallback, a.scope, this.pid(), "tab1");
+    // Same canonical id for both: `tabId` defaulted to a separate hardcoded "tab1"
+    // namespace, so one response carried page_id "tab-1" and tab_id "tab1".
+    const pid = this.pid();
+    return s.extractor.extractText(s.engine, a.target, a.fallback, a.scope, pid, pid);
   }
 
   private async waitForContent(e: BrowserEngine, maxMs = 5000): Promise<void> {
@@ -726,9 +763,19 @@ export class ToolRouter {
     return r;
   }
 
+  /**
+   * Canonical tab id, synchronous form. Reads the cache rather than calling
+   * listTabs(), because this rides inside an action that already made CDP calls.
+   *
+   * This used to be `s?.engine ? "p1" : "p1"` — both branches identical, i.e. a
+   * hardcoded "p1". So extract_text reported `source.page_id: "p1"` and
+   * `source.tab_id: "tab1"` while every other tool reported "tab-1": the last
+   * surviving trace of the two-namespace split, hidden inside one field that no
+   * round had happened to read.
+   */
   private pid(): string {
-    const s = this.sm.getActive();
-    return s?.engine ? "p1" : "p1";
+    if (!this.sm.getActive()?.engine) return "p1";
+    return this.pageIdCache ?? "tab-1";
   }
   private noSess() { return { ok: false, error: kruzError(ErrCode.NO_SESSION, { subsystem: "session", message: "No active session in this MCP server instance. Compare server_instance_id with previous responses; call session.create here to start a session.", trace: ["router"] }).toJSON() }; }
   getSessionManager() { return this.sm; }

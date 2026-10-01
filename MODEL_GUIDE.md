@@ -161,15 +161,23 @@ Errors return a typed envelope:
 - **`"failure"`** — the tool could not do its job (no session, crash, timeout,
   unhandled exception). Raised as an error.
 
+Argument-validation refusals are in the first group, not the second:
+`INVALID_TARGET`, `INVALID_INPUT` and `NO_TAB` resolve with `ok: false` and a
+`help` string naming the correct call shape. A `SyntaxError` in your own
+`page.evaluate` expression is `INVALID_INPUT` and resolves; a runtime
+`ReferenceError` is `OPERATION_FAILED` and throws. Every `code` is documented -
+operations with no more specific classification report `OPERATION_FAILED` and put
+the originating operation on `error.operation`.
+
 ### Retryable errors (the same call may succeed shortly)
 `ELEMENT_NOT_VISIBLE`, `ELEMENT_OBSCURED`, `ELEMENT_DISABLED`, `STALE_ELEMENT`,
 `NO_SESSION`, `BROWSER_CRASHED`, `ACTION_TIMEOUT`, `INTERNAL_ERROR`
 
 ### Non-retryable errors (replaying cannot work — reconsider)
 `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`,
-`CONDITION_NOT_MET`, `UNKNOWN_REFERENCE`, `INVALID_TARGET`, `INVALID_INPUT`,
-`UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`,
-`OVERLAY_NO_DISMISS_INTENT`
+`CONDITION_NOT_MET`, `UNKNOWN_REFERENCE`, `UNKNOWN_TOOL`,
+`ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `INVALID_TARGET`, `INVALID_INPUT`,
+`NO_TAB`, `OVERLAY_NO_DISMISS_INTENT`
 
 `OVERLAY_NO_DISMISS_INTENT` means an overlay **was** detected but none of its
 controls had a safe dismissal intent, so nothing was clicked. That is correct

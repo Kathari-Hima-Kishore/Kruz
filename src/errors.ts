@@ -69,6 +69,14 @@ export const ErrCode = {
   CLICK_FAILED: "CLICK_FAILED",
   INVALID_TARGET: "INVALID_TARGET",
   INVALID_INPUT: "INVALID_INPUT",
+  /** The named tab is not open. A caller mistake, not a browser failure. */
+  NO_TAB: "NO_TAB",
+  /**
+   * An operation failed for a reason not otherwise classified. This is what a
+   * tool name used as an error code collapses into — see controller.err().
+   * The originating operation is preserved on the envelope as `operation`.
+   */
+  OPERATION_FAILED: "OPERATION_FAILED",
   // overlays
   /**
    * An overlay region was detected but Kruz declined to guess which control
@@ -142,10 +150,23 @@ const REFUSAL_CODES: ReadonlySet<string> = new Set<string>([
   ErrCode.TARGET_NOT_ACTIONABLE,
   ErrCode.CONDITION_NOT_MET,
   ErrCode.OVERLAY_NO_DISMISS_INTENT,
+  // Caller-input validation. These are diagnosed, terminal, and carry `help`
+  // naming the correct shape, so they belong in the same class as TARGET_NOT_FOUND:
+  // Kruz read the request, understood it, and rejected it. Throwing them meant an
+  // agent following the documented `if (!r.ok)` pattern crashed on a typo'd
+  // argument instead of reading the message that told it how to fix it.
+  ErrCode.INVALID_INPUT,
+  ErrCode.INVALID_TARGET,
+  ErrCode.NO_TAB,
 ]);
 
 export function isRefusalCode(code: string): boolean {
   return REFUSAL_CODES.has(code);
+}
+
+/** Is this string one of the documented, branchable error codes? */
+export function isErrCode(code: string): boolean {
+  return Object.prototype.hasOwnProperty.call(ErrCode, code);
 }
 
 export interface KruzErrorField {
@@ -167,6 +188,8 @@ export interface KruzErrorEnvelope {
   help?: string;
   trace?: string[];
   cause?: string;
+  /** The originating operation when `code` had to be normalised (see controller.err). */
+  operation?: string;
 }
 
 export class KruzError extends Error {
@@ -264,6 +287,8 @@ const HELP: Partial<Record<ErrCode, string>> = {
   [ErrCode.CU_CLEAR]: "Could not clear marks. Retry after the page settles.",
   [ErrCode.CU_SCROLL]: "Could not scroll to the target. Re-list targets and retry.",
   [ErrCode.INVALID_INPUT]: "The argument is malformed. Check the expected shape for this tool.",
+  [ErrCode.NO_TAB]: "That tab is not open. Call page.listTabs for the current ids; the active tab can change after newTab, switchTab and closeTab.",
+  [ErrCode.OPERATION_FAILED]: "The operation failed on the page. Inspect current state with page.observe before retrying; if it repeats on a settled page, treat it as site behaviour rather than a transient fault.",
   [ErrCode.ROUTE_TIMEOUT]: "The tool exceeded its routing budget. Inspect page state before retrying.",
 };
 
@@ -325,6 +350,7 @@ export function isRetryableCode(code: string): boolean {
     case ErrCode.ELEMENT_NOT_EDITABLE:
     case ErrCode.INVALID_TARGET:
     case ErrCode.INVALID_INPUT:
+    case ErrCode.NO_TAB:
       return false;
     default:
       return false;

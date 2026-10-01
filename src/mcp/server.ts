@@ -123,7 +123,7 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
   // Probe — cheap, non-mutating "what matches the current DOM right now?" (P1-B).
   // Use when a target or plan is uncertain; NOT required before every action, because
   // actions resolve targets locally and return ambiguity candidates themselves.
-  t("page.probe", "Cheap, non-mutating existence check against the CURRENT DOM (never waits). Returns {count, actionable_count, candidates[]} where every candidate carries a ref that page.click / page.fill / page.select / page.check / page.scroll can act on directly, plus per-candidate visible/enabled/in_viewport/actionable so a matched-but-hidden element is never mistaken for a clickable one. Use it to test a hypothesis or disambiguate before acting — it answers 'what exists now?', not 'wait and see if my guess appears'.", {
+  t("page.probe", "Cheap, non-mutating existence check against the CURRENT DOM (never waits). Returns {count, actionable_count, candidates[]} where every candidate carries a ref that page.click / page.fill / page.select / page.check / page.scroll can act on directly, plus per-candidate visible/enabled/in_viewport/actionable so a matched-but-hidden element is never mistaken for a clickable one. Accepts a ref as well as a descriptor: a live ref reports strategy 'ref' with its resolution tier, and a dead one reports ref_state (UNKNOWN_REFERENCE vs DOCUMENT_CHANGED) instead of a misleading count of 0. Use it to test a hypothesis or disambiguate before acting — it answers 'what exists now?', not 'wait and see if my guess appears'.", {
     target: T, fallback: F, scope: z.string().optional(),
   });
 

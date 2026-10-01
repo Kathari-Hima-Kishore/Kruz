@@ -237,8 +237,13 @@ the result resolves or is raised as an error:
 
 | `outcome` | Meaning | Delivery |
 |---|---|---|
-| `refusal` | Kruz did its job; the answer is "not safely". Nothing was guessed or clicked, and the payload carries what it was found (`candidates`, `region_candidates`). | resolves as a value — `if (!r.ok)` is sufficient, no `try/catch` |
-| `failure` | The tool could not do its job: no session, crashed browser, timeout, unhandled exception. | raised as an error |
+| `refusal` | Kruz did its job; the answer is "not safely". Nothing was guessed or clicked, and the payload carries what it was found (`candidates`, `region_candidates`). Includes argument-validation refusals — `INVALID_TARGET`, `INVALID_INPUT`, `NO_TAB` — where `help` names the correct call shape. | resolves as a value — `if (!r.ok)` is sufficient, no `try/catch` |
+| `failure` | The tool could not do its job: no session, crashed browser, timeout, unhandled exception, a runtime error in your own JS. | raised as an error |
+
+Every `code` is one of the documented codes. An operation that fails with no more
+specific classification reports `OPERATION_FAILED` and carries the originating
+operation on `error.operation`, so `code` is always something you can branch on —
+never a tool name.
 
 This split exists because `isError: true` is surfaced by most MCP clients as a
 thrown exception with the JSON flattened into `Error.message`. That made the
@@ -256,7 +261,7 @@ false bug reports against fields that were present and correct.
 
 **Retryable** (the same call may succeed shortly): `NO_SESSION`, `BROWSER_CRASHED`, `ELEMENT_OBSCURED`, `ELEMENT_NOT_VISIBLE`, `ELEMENT_DISABLED`, `STALE_ELEMENT`, `ACTION_TIMEOUT`, `NO_MATCH`, `INTERNAL_ERROR`.
 
-**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `OVERLAY_NO_DISMISS_INTENT`.
+**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `NO_TAB`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `OVERLAY_NO_DISMISS_INTENT`.
 
 > The same taxonomy, with recovery recipes, is in [`SKILL.md`](./SKILL.md) — that is what
 > agents read at runtime.
@@ -274,6 +279,8 @@ calls in external timestamps. Diagnostic metadata only — never a decision inpu
 | `page.open` | `_timing.total_ms` (+ `lifecycle_state`, `navigate_ms`, `poll_ms`) |
 | `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
+| `page.press` | `timing.total_ms`, `resolve_ms`, `action_ms`, `grace_ms` |
+| `page.clickAt` | `timing.total_ms`, `hit_test_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |
 | `page.observe` | `timing.total_ms`, `generate_ms` |
 | `page.handleOverlays` | `timing.total_ms`, `discovery_ms`, `dismissal_ms` |
