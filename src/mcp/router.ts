@@ -330,7 +330,7 @@ export class ToolRouter {
       case "session.close": { const prev = this.sm.getActive(); const c = await this.sm.close(undefined, a.graceful !== false); if (c && prev?.engine) await (prev.engine as any).removeControlIndicator?.()?.catch?.(() => {}); return { ok: c, status: c ? "closed" : "error" }; }
 
       // Navigation
-      case "page.open": return this.openWithRetry(a.url, a.wait_for, a.timeout_ms, 1, a.detect_redirect);
+      case "page.open": return this.openWithRetry(a.url, a.wait_for ?? a.wait_until, a.timeout_ms ?? a.nav_timeout_ms, 1, a.detect_redirect);
 
       // Multi-tab (parallel boards / keep-JD-open while verifying)
       case "page.newTab": return this.ctrl.newTab(a.url);

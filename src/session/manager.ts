@@ -235,12 +235,20 @@ export class SessionManager {
 
   /**
    * Close a tab in the active session.
+   *
+   * The existence check is not defensive padding: `page.close()` on an unknown
+   * target does not throw, so this used to report success — and
+   * `{"closed":"<whatever the caller passed>"}` — for a tab that never existed,
+   * while the real tab stayed open. A close that did not happen must not be
+   * reported as having happened.
    */
   async closeTab(pageId: string, sessionId?: string): Promise<boolean> {
     const session = sessionId ? this.sessions.get(sessionId) : this.getActive();
     if (!session || !session.engine) return false;
 
     try {
+      const tabs = await session.engine.listTabs().catch(() => null);
+      if (tabs && !tabs.some((t) => t.id === pageId)) return false;
       await session.engine.closeTab(pageId);
       return true;
     } catch {

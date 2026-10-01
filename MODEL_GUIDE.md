@@ -231,11 +231,29 @@ or pass `force:true`.
 }
 ```
 
+`page.open` decides readiness from **rendered content**, not from the lifecycle
+event, and it no longer blocks on that event. So you do not need a lower
+`wait_for` to get a faster return, and you should not read
+`_timing.lifecycle_timed_out: true` as a broken navigation — it only says the
+browser never resolved `load`/`domcontentloaded` (common with slow images,
+long-polling connections and SPAs). If `_ready` is true and `_waited_ms` is
+small, the page is ready regardless.
+
 ### Pattern 3: Handle overlays before clicking
 
 ```json
 {"close_cookie_banner": true, "close_newsletter_popup": true}
 ```
+
+If it answers `ok: false` with `OVERLAY_NO_DISMISS_INTENT`, that is **not** a
+failure to clean up — it means an overlay IS present and Kruz refused to guess
+which control closes it. Do not retry, and do not read it as "the page is clear".
+Read `result.region_candidates` and click an explicit Close control by ref, or
+pass `force:true` to the click.
+
+`detected_overlay: false` is the only "nothing in the way" answer, and it is now
+trustworthy for a control-less modal too — a full-screen `role=dialog` is detected
+whether or not it happens to have a Close button.
 
 ### Pattern 4: Form filling
 

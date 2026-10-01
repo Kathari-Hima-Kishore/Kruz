@@ -264,7 +264,7 @@ calls in external timestamps. Diagnostic metadata only — never a decision inpu
 | Tool | Fields |
 |---|---|
 | `page.probe` | `probe_ms` |
-| `page.open` | `_timing.total_ms` (+ `navigate_ms`, `poll_ms`) |
+| `page.open` | `_timing.total_ms` (+ `lifecycle_ms`, `lifecycle_timed_out`, `navigate_ms`, `poll_ms`) |
 | `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |

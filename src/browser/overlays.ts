@@ -90,8 +90,11 @@ const CONFIG_SELECTORS: Record<string, string[]> = {
   ],
   newsletter: [
     '[class*="newsletter" i][class*="popup" i]', '[class*="subscribe" i][class*="modal" i]',
-    ".newsletter-modal", ".subscription-popup", ".email-capture", '[class*="newsletter" i]',
-    '[id*="newsletter" i]',
+    ".newsletter-modal", ".subscription-popup", ".email-capture",
+    // NOT a bare [class*="newsletter" i] / [id*="newsletter" i]: those match the
+    // ordinary inline footer signup block on every Shopify storefront, so Kruz
+    // reported a blocking overlay on pages that had none. Every entry here now
+    // names a popup/modal/capture construct.
   ],
   chat: [
     ".intercom-messenger", ".drift-chat", ".crisp-client", ".tawk-widget",

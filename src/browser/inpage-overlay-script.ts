@@ -157,13 +157,43 @@ function __kruzOverlayScan(cfg, KNOWN) {
   var TOP_LAYER = 'dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"], [popover], [role="region"][aria-label*="cookie" i], [role="region"][aria-label*="consent" i], [aria-label*="cookie" i][role], [aria-label*="consent" i][role]';
   var topLayer = [];
   deepQuery(document, TOP_LAYER, topLayer);
+  // DECLARES that it is modal: aria-modal, role=dialog/alertdialog, or an open
+  // <dialog>. Such an element blocks the page by definition — it must never be
+  // dismissed by a size heuristic.
+  var declaresModal = function (el) {
+    var role = el.getAttribute("role");
+    return el.getAttribute("aria-modal") === "true" || role === "dialog" || role === "alertdialog" ||
+      (el.tagName.toLowerCase() === "dialog" && el.hasAttribute("open"));
+  };
+  // Covers ~the whole viewport AND is actually on top of the page content. This
+  // is the authoritative check, because the browser already computed the stacking
+  // for us — it cannot be fooled by a missing/typo'd z-index.
+  var blocksViewport = function (el) {
+    var r = el.getBoundingClientRect();
+    if (!(r.width >= window.innerWidth * 0.98 && r.height >= window.innerHeight * 0.98)) return false;
+    if (getComputedStyle(el).pointerEvents === "none") return false;
+    var cx = Math.max(0, Math.min(Math.floor(innerWidth / 2), Math.floor(r.right) - 1));
+    var cy = Math.max(0, Math.min(Math.floor(innerHeight / 2), Math.floor(r.bottom) - 1));
+    var atPoint = document.elementFromPoint(cx, cy);
+    return !!atPoint && (atPoint === el || el.contains(atPoint));
+  };
   var addedTop = 0;
   for (var ti = 0; ti < topLayer.length; ti++) {
     var tel = topLayer[ti];
     if (regions.has(tel) || !rendered(tel)) continue;
     var r = tel.getBoundingClientRect();
-    // A full-viewport "main content" dialog is not a banner.
-    if (r.width >= window.innerWidth * 0.98 && r.height >= window.innerHeight * 0.98) continue;
+    var fullViewport = r.width >= window.innerWidth * 0.98 && r.height >= window.innerHeight * 0.98;
+    // A near-full-viewport dialog is usually a page-blocking modal (the thing
+    // dismissal exists for), but it can also be an in-app "main content" dialog
+    // that simply IS the page. Size alone cannot tell those apart, so decide on
+    // declaration + an actual hit test rather than on dimensions.
+    //
+    // This replaces a blanket "full-viewport dialog is not a banner" skip, which
+    // was wrong in the dangerous direction: it reported "no overlay present" for a
+    // full-screen modal that was provably topmost and blocking the page, purely
+    // because the modal had no Close button. Detection and dismissability have
+    // to be independent, or a control-less overlay becomes invisible.
+    if (fullViewport && !declaresModal(tel) && !blocksViewport(tel)) continue;
     regions.set(tel, "dialog");
     addedTop++;
   }
@@ -186,7 +216,11 @@ function __kruzOverlayScan(cfg, KNOWN) {
     var st = getComputedStyle(eel);
     if (st.position !== "fixed" && st.position !== "sticky") continue;
     var er = eel.getBoundingClientRect();
-    if (er.width * er.height > window.innerWidth * window.innerHeight * 0.6) continue;
+    // Same trap as rung 2: a full-screen modal is "too large" by area, so a bare
+    // area cap hides exactly the page-blocking overlays. Exempt elements that
+    // declare themselves modal or that provably sit on top of the page.
+    var coversMost = er.width * er.height > window.innerWidth * window.innerHeight * 0.6;
+    if (coversMost && !declaresModal(eel) && !blocksViewport(eel)) continue;
     var touchesEdge = er.top <= 4 || er.bottom >= window.innerHeight - 4 || er.left <= 4 || er.right >= window.innerWidth - 4;
     if (!touchesEdge) continue;
     var ctrls = eel.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');

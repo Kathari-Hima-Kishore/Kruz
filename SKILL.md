@@ -300,9 +300,11 @@ pattern — **do not wrap tool calls in try/catch for expected refusals.**
 
 `OVERLAY_NO_DISMISS_INTENT` is the one to read carefully: an overlay **was**
 found, but none of its controls carried a safe dismissal intent, so nothing was
-clicked. That is the correct outcome — do not retry it. Read
-`result.region_candidates` for the controls that were there and click an explicit
-Close control by ref, or pass `force:true` to click through.
+clicked. That is the correct outcome — do not retry it, and do not read it as
+"the page is clear". Read `result.region_candidates` for the controls that were
+there and click an explicit Close control by ref, or pass `force:true` to click
+through. `detected_overlay: false` is the only "nothing in the way" answer, and
+it holds even for a full-screen modal that has no Close button.
 
 > **Try again automatically** vs **reconsider the plan**: retryable = the same call may
 > work shortly (a transient overlay/re-render). Non-retryable = the current plan is
@@ -456,12 +458,17 @@ guessing (and never wrap a call in a shell timestamp).
 | Tool | Fields |
 |---|---|
 | `page.probe` | `probe_ms` |
-| `page.open` | `_timing.total_ms` (+ `navigate_ms`, `poll_ms`) |
+| `page.open` | `_timing.total_ms` (+ `lifecycle_ms`, `lifecycle_timed_out`, `navigate_ms`, `poll_ms`) |
 | `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |
 | `page.observe` | `timing.total_ms`, `generate_ms` |
 | `page.handleOverlays` | `timing.total_ms`, `discovery_ms`, `dismissal_ms` |
+
+`page.open` reports `_timing.lifecycle_ms` and `lifecycle_timed_out`. It decides
+readiness from rendered content and no longer blocks on the lifecycle event, so
+`lifecycle_timed_out: true` with `_ready: true` is a healthy page whose `load`
+event never fired — not a broken navigation, and not a reason to re-navigate.
 
 A high `resolve_ms` means target resolution was hard (often genuine ambiguity); a high
 `action_ms` means the browser was slow. Both are measured server-side.

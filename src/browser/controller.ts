@@ -121,9 +121,39 @@ export class BrowserController {
       // instead of serially — saves 1-2 round-trips per page.open.
       await this.listen(engine).catch(() => {});
       const tNav0 = Date.now();
-      const navP = engine.navigate(url, effectiveWait, Math.min(effectiveTimeout, 20000)).catch(() => {});
+      // BUG-005: the lifecycle event and the readiness poll were SERIALISED, so
+      // a page that is fully rendered and usable while `domcontentloaded` never
+      // fires cost the whole 20s navigate cap before the poll even started. That
+      // is what produced a flat ~20.2s navigate_ms followed by an ~11ms poll on
+      // ordinary storefronts: the time was spent waiting for an event nobody
+      // needed, not for the page.
+      //
+      // Readiness is decided by pollForContent — a real check of what is
+      // rendered — so the two are raced instead. snapshotPage verifies the target
+      // host, so polling cannot be satisfied by the page we are leaving.
+      let navSettledMs: number | null = null;
+      let navErr: unknown = null;
+      const navP = engine.navigate(url, effectiveWait, Math.min(effectiveTimeout, 20000))
+        .catch((e) => { navErr = e; })
+        .then(() => { navSettledMs = Date.now() - tNav0; });
       await engine.bringToFront().catch(() => {});
-      await navP;
+      const tPoll0 = Date.now();
+      let pic = await this.pollForContent(engine, url, Math.min(rawTimeout, 15000), 250);
+      // A not-ready verdict is only trustworthy once the navigation has actually
+      // committed. Before that, pollForContent is reading the pre-navigation
+      // document (empty body, no mutation tracker), which its thin-page shortcut
+      // treats as settled — so without this guard a slow page is reported
+      // PAGE_NOT_READY after ~2s instead of being waited for. Waiting the
+      // navigation out here costs nothing on the fast path: when content really
+      // was ready, the branch is never entered.
+      if (!pic.loaded && navSettledMs === null) {
+        await navP.catch(() => {});
+        pic = await this.pollForContent(engine, url, Math.min(rawTimeout, 15000), 250);
+      }
+      // Let an in-flight lifecycle wait finish in the background rather than
+      // leaving a dangling navigation, but never block on it: by now the content
+      // poll has already decided readiness one way or the other.
+      await Promise.race([navP, engine.waitMs(1500).catch(() => {})]);
       // K31+: A real Chrome crash (renderer OOM / hard process death) must surface as
       // BROWSER_CRASHED so the router's openWithRetry can auto-recreate the session.
       // Without this check the swallowed navigate error reads as PAGE_NOT_READY and the
@@ -131,8 +161,6 @@ export class BrowserController {
       if (!engine.connected) {
         return this.err("BROWSER_CRASHED", "Browser disconnected during navigation (renderer crash or process death).", true) as any;
       }
-      const tPoll0 = Date.now();
-      const pic = await this.pollForContent(engine, url, Math.min(rawTimeout, 15000), 250);
       if (!engine.connected) {
         return this.err("BROWSER_CRASHED", "Browser disconnected during content poll (renderer crash or process death).", true) as any;
       }
@@ -152,9 +180,27 @@ export class BrowserController {
         _waited_ms: pic.elapsedMs,
         body_length: pic.bodyLength,
         ...(pic.thin ? { _thin_page: true } : {}),
-        _timing: { listen_ms: tNav0 - t0, navigate_ms: tPoll0 - tNav0, poll_ms: tFg - tPoll0, overlay_ms: tEnd - tFg, total_ms: tEnd - t0 },
+        _timing: {
+          listen_ms: tNav0 - t0,
+          // Sub-phases inside the former opaque navigate_ms. `lifecycle_ms` is
+          // null when the browser never resolved the wait condition at all, which
+          // is the signal that distinguishes "slow page" from "stalled event".
+          lifecycle_ms: navSettledMs,
+          lifecycle_timed_out: navSettledMs === null,
+          navigate_ms: tPoll0 - tNav0,
+          poll_ms: tFg - tPoll0,
+          overlay_ms: tEnd - tFg,
+          total_ms: tEnd - t0,
+        },
+        _wait_condition: { requested: waitFor, effective: effectiveWait },
       };
       if (!pic.loaded) {
+        // The lifecycle wait failing is the likeliest explanation, and it is
+        // actionable (retry with wait_for:"commit"), so it must not stay swallowed.
+        if (navErr) result._navigate_error = String(navErr).slice(0, 300);
+        if (navSettledMs === null) {
+          result._navigate_error ??= `The '${effectiveWait}' lifecycle event never resolved within ${Math.min(effectiveTimeout, 20000)}ms.`;
+        }
         result._warning = "PAGE_NOT_READY";
         result.message = `Navigation committed but no real content detected after ${pic.elapsedMs}ms poll (body_length=${pic.bodyLength}). The page may show a bot-challenge, consent wall, or is still hydrating. Call page.observe or extract.text to see what is actually on screen.`;
         result.hint = "Do NOT loop on page.open. Use page.wait with condition:'content' and a predicate (e.g. predicate: 'document.querySelector(\".jobs-list\")') to wait for the specific element you need.";
