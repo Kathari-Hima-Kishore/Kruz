@@ -99,6 +99,27 @@ function __kruzOverlayScan(cfg, KNOWN) {
   var attempts = [];
   var regions = new Map();
 
+  // An INLINE element with no dismiss intent is not an overlay — it is just
+  // part of the page. A bare class*=newsletter selector matches the
+  // ordinary footer signup block on every Shopify storefront, and treating that
+  // as an overlay made Kruz report "an overlay was detected but nothing was
+  // clickable" on pages with no overlay at all. Rung 1 therefore admits a
+  // vendor-container match only when it is positioned as a layer (fixed /
+  // sticky / absolute), or is a dialog-ish role, or actually holds a control
+  // with a dismissal intent. Rungs 2 and 3 already apply the structural test.
+  var positionedAsLayer = function (el) {
+    var p = getComputedStyle(el).position;
+    return p === "fixed" || p === "sticky" || p === "absolute";
+  };
+  var holdsDismissIntent = function (el) {
+    var found = [];
+    deepQuery(el, "button, [role='button'], input[type='button'], input[type='submit'], summary, [role='menuitem']", found);
+    for (var i = 0; i < found.length && i < 24; i++) {
+      if (rendered(found[i]) && classify(found[i], "probe")) return true;
+    }
+    return false;
+  };
+
   // ── rung 1: well-known vendor containers (fast path) ────────────────────
   var knownRegionCount = 0;
   for (var ki = 0; ki < cfg.kinds.length; ki++) {
@@ -112,6 +133,14 @@ function __kruzOverlayScan(cfg, KNOWN) {
         var el = found[fi];
         if (regions.has(el)) continue;
         if (!rendered(el)) continue;
+        // Never a wrapper around the page's own content.
+        if (el.querySelector("main")) continue;
+        var layerish = positionedAsLayer(el) ||
+          /^(dialog|alertdialog)$/.test(el.getAttribute("role") || "") ||
+          el.getAttribute("aria-modal") === "true" ||
+          el.hasAttribute("popover") ||
+          el.tagName.toLowerCase() === "dialog";
+        if (!layerish && !holdsDismissIntent(el)) continue;
         regions.set(el, kind);
         n++;
         if (regions.size >= cfg.maxRegions) break;
@@ -176,6 +205,12 @@ function __kruzOverlayScan(cfg, KNOWN) {
   var candidateNodes = [];
   var regionRows = [];
   var unsorted = [];
+  // Every interactive control inside a detected region, whether or not it has a
+  // dismissal intent. The refusal path returns these as region_candidates so a
+  // caller that cannot let Kruz guess can still see — and click by ref — the
+  // explicit Close controls the scan already located. Discarding them was what
+  // forced a re-observe to rediscover evidence the scan was holding.
+  var allRegionControls = [];
   regions.forEach(function (kind, region) {
     var controls = [];
     deepQuery(region, 'button, a, [role="button"], input[type="button"], input[type="submit"], summary, [role="menuitem"]', controls);
@@ -184,6 +219,20 @@ function __kruzOverlayScan(cfg, KNOWN) {
       var c = controls[ci];
       if (seen.has(c) || !rendered(c)) continue;
       seen.add(c);
+      if (isControl(c)) {
+        var cName = nameOf(c);
+        if (cName) {
+          allRegionControls.push({
+            label: cName.slice(0, 80),
+            role: roleOf(c),
+            name: cName.slice(0, 80),
+            actionable: !(c.disabled === true || c.getAttribute("aria-disabled") === "true"),
+            container: containerLabel(c),
+            region_kind: kind,
+            path: ""
+          });
+        }
+      }
       var cls = classify(c, kind);
       if (!cls) continue;
       regionControls++;
@@ -221,6 +270,7 @@ function __kruzOverlayScan(cfg, KNOWN) {
     regions_found: regions.size,
     regions: regionRows,
     candidates: candidates.slice(0, 12),
+    region_controls: allRegionControls.slice(0, 24),
     attempts: attempts
   };
 }

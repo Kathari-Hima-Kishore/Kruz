@@ -143,11 +143,23 @@ Errors return a typed envelope:
 {
   "code": "TARGET_NOT_FOUND",
   "message": "Element not found (css=#nope)",
-  "retryable": true,
+  "retryable": false,
+  "outcome": "refusal",
   "subsystem": "engine",
   "help": "Call page.observe to see what is actually on the page"
 }
 ```
+
+### Check `r.ok` — expected refusals are values, not exceptions
+
+`outcome` tells you which you are holding:
+
+- **`"refusal"`** — Kruz did its job; the answer is "not safely". It guessed
+  nothing and clicked nothing, and the payload carries what it found so you can
+  decide. Delivered as a normal resolved value, so `if (!r.ok)` is sufficient.
+  **Do not wrap tool calls in try/catch for these.**
+- **`"failure"`** — the tool could not do its job (no session, crash, timeout,
+  unhandled exception). Raised as an error.
 
 ### Retryable errors (the same call may succeed shortly)
 `ELEMENT_NOT_VISIBLE`, `ELEMENT_OBSCURED`, `ELEMENT_DISABLED`, `STALE_ELEMENT`,
@@ -156,7 +168,14 @@ Errors return a typed envelope:
 ### Non-retryable errors (replaying cannot work — reconsider)
 `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`,
 `CONDITION_NOT_MET`, `UNKNOWN_REFERENCE`, `INVALID_TARGET`, `INVALID_INPUT`,
-`UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`
+`UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`,
+`OVERLAY_NO_DISMISS_INTENT`
+
+`OVERLAY_NO_DISMISS_INTENT` means an overlay **was** detected but none of its
+controls had a safe dismissal intent, so nothing was clicked. That is correct
+behaviour, not a malfunction — do not retry. Use `result.region_candidates` to
+see the controls that were present and click an explicit Close control by ref,
+or pass `force:true`.
 
 > `TARGET_NOT_FOUND` and `AMBIGUOUS_TARGET` used to be listed as retryable. They are not:
 > replaying an identical target against a settled page cannot succeed, and marking them

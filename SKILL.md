@@ -269,11 +269,25 @@ Errors return a typed envelope:
 {
   "code": "TARGET_NOT_FOUND",
   "message": "Element not found (css=#nope)",
-  "retryable": true,
+  "retryable": false,
+  "outcome": "refusal",
   "subsystem": "engine",
   "help": "Call page.observe to see what is actually on the page"
 }
 ```
+
+### `outcome`: refusal vs failure — always inspect `r.ok`
+
+A tool that cannot do what you asked returns a **value**, not a thrown exception.
+So `const r = await page_click(...); if (!r.ok)` is the correct and sufficient
+pattern — **do not wrap tool calls in try/catch for expected refusals.**
+
+- **`outcome: "refusal"`** — Kruz did its job and the answer is "not safely".
+  It guessed nothing and clicked nothing; the payload holds what it found
+  (`candidates` on `AMBIGUOUS_TARGET`, `region_candidates` on
+  `OVERLAY_NO_DISMISS_INTENT`). Re-plan deliberately rather than retrying.
+- **`outcome: "failure"`** — the tool could not do its job: no session, crashed
+  browser, timeout, unhandled exception. These *are* raised as errors.
 
 ### Retryable (safe to retry)
 `ELEMENT_NOT_VISIBLE`, `ELEMENT_OBSCURED`, `STALE_ELEMENT`, `ELEMENT_DISABLED`, `NO_SESSION`, `BROWSER_CRASHED`, `ACTION_TIMEOUT`, `INTERNAL_ERROR`
@@ -281,7 +295,14 @@ Errors return a typed envelope:
 ### Non-retryable (fix the input — do NOT replay the same call)
 `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`,
 `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`,
-`UNKNOWN_REFERENCE`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`
+`UNKNOWN_REFERENCE`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`,
+`OVERLAY_NO_DISMISS_INTENT`
+
+`OVERLAY_NO_DISMISS_INTENT` is the one to read carefully: an overlay **was**
+found, but none of its controls carried a safe dismissal intent, so nothing was
+clicked. That is the correct outcome — do not retry it. Read
+`result.region_candidates` for the controls that were there and click an explicit
+Close control by ref, or pass `force:true` to click through.
 
 > **Try again automatically** vs **reconsider the plan**: retryable = the same call may
 > work shortly (a transient overlay/re-render). Non-retryable = the current plan is

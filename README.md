@@ -224,16 +224,32 @@ Every failure returns a typed envelope:
 {
   "code": "TARGET_NOT_FOUND",
   "message": "Element not found (css=#nope)",
-  "retryable": true,
+  "retryable": false,
+  "outcome": "refusal",
   "subsystem": "engine",
   "help": "Call page.observe to see what is actually on the page and pick a ref.",
   "trace": ["tool:page.click", "router", "controller"]
 }
 ```
 
+`outcome` distinguishes a **refusal** from a **failure**, and it decides whether
+the result resolves or is raised as an error:
+
+| `outcome` | Meaning | Delivery |
+|---|---|---|
+| `refusal` | Kruz did its job; the answer is "not safely". Nothing was guessed or clicked, and the payload carries what it was found (`candidates`, `region_candidates`). | resolves as a value — `if (!r.ok)` is sufficient, no `try/catch` |
+| `failure` | The tool could not do its job: no session, crashed browser, timeout, unhandled exception. | raised as an error |
+
+This split exists because `isError: true` is surfaced by most MCP clients as a
+thrown exception with the JSON flattened into `Error.message`. That made the
+documented `if (!r.ok)` branch unreachable and forced callers into `try/catch`
+around tools that return values — and it made delivery depend on the client and
+on which call it was, so code validated against the first call failed on the
+second.
+
 **Retryable** (the same call may succeed shortly): `NO_SESSION`, `BROWSER_CRASHED`, `ELEMENT_OBSCURED`, `ELEMENT_NOT_VISIBLE`, `ELEMENT_DISABLED`, `STALE_ELEMENT`, `ACTION_TIMEOUT`, `NO_MATCH`, `INTERNAL_ERROR`.
 
-**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`.
+**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `OVERLAY_NO_DISMISS_INTENT`.
 
 > The same taxonomy, with recovery recipes, is in [`SKILL.md`](./SKILL.md) — that is what
 > agents read at runtime.

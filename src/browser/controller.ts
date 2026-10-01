@@ -1497,6 +1497,7 @@ export class BrowserController {
       const failed: string[] = [];
       const attempts: Array<{ strategy: string; control: string; intent: string; outcome: string; note?: string }> = [];
       let candidates: Array<Record<string, unknown>> = [];
+      let regionCandidates: Array<Record<string, unknown>> = [];
       let terminalReason: string | null = null;
       let region: string | null = null;
 
@@ -1524,6 +1525,11 @@ export class BrowserController {
         const discovery = await discoverOverlays(e, kinds);
         region = discovery.region;
         candidates = discovery.candidates as unknown as Array<Record<string, unknown>>;
+        // Controls seen inside the region but WITHOUT a dismissal intent. Kept so
+        // the refusal path can offer them: a region whose controls are all
+        // unrecognised is exactly the case where the caller needs to see them and
+        // decide, rather than be told only that nothing was clickable.
+        regionCandidates = (discovery.region_controls as unknown as Array<Record<string, unknown>>) ?? [];
         const clearedRegions = new Set<string>();
 
         // Bounded escalation. Each candidate is a DIFFERENT control, so a failure
@@ -1575,6 +1581,12 @@ export class BrowserController {
       const summary = `Dismissed ${dismissed.length} overlay(s), ${failed.length} unresolved`;
       return {
         ok: dismissed.length > 0 || (failed.length === 0 && candidates.length === 0),
+        // REFUSAL, not failure: the overlay was DETECTED — that part succeeded —
+        // but nothing was dismissed safely. Returning a typed envelope here is
+        // what lets the agent branch on code/retryable instead of guessing, and
+        // it makes the refusal RESOLVE (see isFailure in router.ts) rather than
+        // throwing, so `if (!r.ok)` remains reachable.
+        error: dismissed.length > 0 || (failed.length === 0 && candidates.length === 0) ? undefined : kruzError(ErrCode.OVERLAY_NO_DISMISS_INTENT, { subsystem: "overlay", retryable: false, message: terminalReason || summary, trace: ["controller:page.handleOverlays"] }).toJSON(),
         result: {
           dismissed,
           dismissed_controls: dismissedControls,
@@ -1583,6 +1595,7 @@ export class BrowserController {
           detected_overlay: region !== null || candidates.length > 0,
           attempts,
           candidates,
+          region_candidates: regionCandidates,
           terminal_reason: terminalReason,
           region,
           discovery_attempts: attempts.length,

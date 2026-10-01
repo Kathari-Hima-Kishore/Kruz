@@ -20,6 +20,7 @@ export const SUBSYSTEMS = [
   "selector",
   "session",
   "observer",
+  "overlay",
   "ats",
   "launcher",
   "computer-use",
@@ -68,6 +69,14 @@ export const ErrCode = {
   CLICK_FAILED: "CLICK_FAILED",
   INVALID_TARGET: "INVALID_TARGET",
   INVALID_INPUT: "INVALID_INPUT",
+  // overlays
+  /**
+   * An overlay region was detected but Kruz declined to guess which control
+   * dismisses it. This is a REFUSAL, not a failure: Kruz did its job, and the
+   * region it found is returned in `result.region` with the controls it saw in
+   * `result.candidates`, so the caller can pick one explicitly.
+   */
+  OVERLAY_NO_DISMISS_INTENT: "OVERLAY_NO_DISMISS_INTENT",
   // routing / lifecycle
   UNKNOWN_TOOL: "UNKNOWN_TOOL",
   ACTION_TIMEOUT: "ACTION_TIMEOUT",
@@ -86,6 +95,59 @@ export const ErrCode = {
 } as const;
 export type ErrCode = (typeof ErrCode)[keyof typeof ErrCode];
 
+/**
+ * FAILURE vs REFUSAL — the distinction the MCP `isError` flag depends on.
+ *
+ * A **failure** means the tool could not do its job: no session, a crashed
+ * browser, an unhandled exception, a timeout. Nothing useful came back.
+ *
+ * A **refusal** means the tool did its job and the answer is "no, not safely".
+ * Nothing was guessed, nothing was clicked, and the payload carries everything
+ * the caller needs to choose deliberately — the `candidates` list on
+ * AMBIGUOUS_TARGET, the `region` and controls on
+ * OVERLAY_NO_DISMISS_INTENT, the diagnostics on TARGET_NOT_FOUND.
+ *
+ * This is load-bearing because MCP's `isError: true` is surfaced by most clients
+ * as a THROWN exception, with the JSON envelope flattened into `Error.message`.
+ * A caller doing the documented `const r = await tool(...); if (!r.ok)` therefore
+ * never reaches its own branch, and any actionable payload has to be re-parsed
+ * out of an exception string. Worse, the throw-vs-resolve behaviour then varies
+ * by client and by call, so code validated against one call breaks on the next.
+ *
+ * Refusals therefore resolve as ordinary values carrying `ok: false` plus the
+ * typed envelope. Failures still set `isError`.
+ */
+export type ErrorOutcome = "failure" | "refusal";
+
+/**
+ * Codes that are refusals rather than failures. Kept as an explicit allowlist
+ * rather than inferred from `retryable`, because "retryable" answers a
+ * different question (is a replay likely to work) and both refusal and failure
+ * are routinely non-retryable.
+ */
+const REFUSAL_CODES: ReadonlySet<string> = new Set<string>([
+  ErrCode.TARGET_NOT_FOUND,
+  ErrCode.AMBIGUOUS_TARGET,
+  ErrCode.ELEMENT_NOT_FOUND,
+  ErrCode.ELEMENT_DISABLED,
+  ErrCode.ELEMENT_NOT_VISIBLE,
+  ErrCode.ELEMENT_NOT_EDITABLE,
+  ErrCode.ELEMENT_OBSCURED,
+  ErrCode.ELEMENT_OBSCURED,
+  ErrCode.STALE_ELEMENT,
+  ErrCode.STALE_REFERENCE,
+  ErrCode.UNKNOWN_REFERENCE,
+  ErrCode.DOCUMENT_CHANGED,
+  ErrCode.FRAME_CHANGED,
+  ErrCode.TARGET_NOT_ACTIONABLE,
+  ErrCode.CONDITION_NOT_MET,
+  ErrCode.OVERLAY_NO_DISMISS_INTENT,
+]);
+
+export function isRefusalCode(code: string): boolean {
+  return REFUSAL_CODES.has(code);
+}
+
 export interface KruzErrorField {
   code: string;
   subsystem?: Subsystem;
@@ -99,6 +161,8 @@ export interface KruzErrorEnvelope {
   code: string;
   message: string;
   retryable: boolean;
+  /** "refusal" resolves as a value; "failure" sets MCP isError. */
+  outcome: ErrorOutcome;
   subsystem?: Subsystem;
   help?: string;
   trace?: string[];
@@ -114,6 +178,8 @@ export class KruzError extends Error {
   readonly trace: string[];
   /** Underlying cause, when one exists (puppeteer/CDP/DOM error). */
   readonly cause?: unknown;
+  /** Derived from `code` so no call site can opt out by omission. */
+  readonly outcome: ErrorOutcome;
 
   constructor(fields: KruzErrorField & { trace?: string[]; cause?: unknown }) {
     super(fields.message || fields.code);
@@ -124,6 +190,7 @@ export class KruzError extends Error {
     this.help = fields.help;
     this.trace = fields.trace ?? [];
     this.cause = fields.cause;
+    this.outcome = isRefusalCode(fields.code) ? "refusal" : "failure";
   }
 
   /** Serialize to the wire envelope used across the MCP boundary. */
@@ -132,6 +199,7 @@ export class KruzError extends Error {
       code: this.code,
       message: this.message,
       retryable: this.retryable,
+      outcome: this.outcome,
       subsystem: this.subsystem,
     };
     if (this.help) obj.help = this.help;
@@ -175,6 +243,7 @@ const HELP: Partial<Record<ErrCode, string>> = {
   [ErrCode.UNKNOWN_REFERENCE]: "This ref was never issued, or it was invalidated by a navigation or action since. Re-observe or re-probe for a fresh ref.",
   [ErrCode.DOCUMENT_CHANGED]: "The page navigated, so refs from before the navigation no longer apply. Observe or probe the new page for fresh refs.",
   [ErrCode.FRAME_CHANGED]: "The frame that held this ref is gone or has been replaced. Re-observe the page to see the current frames.",
+  [ErrCode.OVERLAY_NO_DISMISS_INTENT]: "An overlay was found but none of its controls has a safe dismissal intent, so nothing was clicked. Inspect `result.candidates` for the controls inside the region and click an explicit Close / dismiss control by ref, or pass `force:true` to click through.",
   [ErrCode.TARGET_NOT_ACTIONABLE]: "The target matched but is not in a state that can be acted on. page.probe reports per-candidate visible/enabled/actionable — pick an actionable candidate, or change the page state first.",
   [ErrCode.ELEMENT_DISABLED]: "The control is disabled. Wait for it to become enabled, or choose a different control.",
   [ErrCode.ELEMENT_NOT_VISIBLE]: "The element exists but is not rendered. Scroll it into view, expand its section, or pass ignore_visibility:true.",
@@ -291,6 +360,8 @@ export function classify(code: string): Subsystem {
     case ErrCode.DOCUMENT_CHANGED:
     case ErrCode.FRAME_CHANGED:
       return "selector";
+    case ErrCode.OVERLAY_NO_DISMISS_INTENT:
+      return "overlay";
     case ErrCode.ACTION_TIMEOUT:
     case ErrCode.ROUTE_TIMEOUT:
     case ErrCode.RETRY_EXHAUSTED:

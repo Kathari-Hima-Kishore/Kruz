@@ -144,6 +144,17 @@ export interface OverlayDiscovery {
   regions_found: number;
   regions: Array<{ kind: string; label: string; controls: number }>;
   candidates: OverlayCandidate[];
+  /** Every named interactive control inside a detected region, dismissal intent
+   *  or not. Surfaced on refusal so the caller can act on one explicitly. */
+  region_controls?: Array<{
+    label: string;
+    role: string;
+    name: string;
+    actionable: boolean;
+    container: string | null;
+    region_kind: string;
+    path: string;
+  }>;
   attempts: Array<{ strategy: string; regions: number; controls: number; note?: string }>;
   timing: { discovery_ms: number };
 }
@@ -222,6 +233,9 @@ export async function discoverOverlays(
     regions_found: out.regions_found ?? 0,
     regions: out.regions ?? [],
     candidates: (out.candidates || []) as OverlayCandidate[],
+    // Forwarded so the refusal path can offer the controls it saw but would not
+    // click. Dropping them here is what made the refusal evidence-free.
+    region_controls: out.region_controls || [],
     attempts: out.attempts || [],
     timing: { discovery_ms: Date.now() - started },
   };

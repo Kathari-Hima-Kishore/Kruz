@@ -8,7 +8,7 @@ import { SafetyLayer } from "../safety/layer.js";
 import { loadConfig } from "../config.js";
 import { sanitizeToolName, KNOWN_TOOLS } from "./tool-names.js";
 import type { BrowserEngine } from "../browser/engine.js";
-import { toErrorEnvelope, kruzError, kruzErrorFromThrown, ErrCode, classify, isRetryableCode, KruzError, withRetry, type KruzErrorEnvelope } from "../errors.js";
+import { toErrorEnvelope, kruzError, kruzErrorFromThrown, ErrCode, classify, isRetryableCode, isRefusalCode, KruzError, withRetry, type KruzErrorEnvelope } from "../errors.js";
 
 /**
  * Error codes the click recovery ladder retries (D4: ELEMENT_NOT_VISIBLE is
@@ -60,6 +60,9 @@ function shapeError(error: unknown, tool: string): KruzErrorEnvelope {
       code,
       message: String(e.message ?? code),
       retryable: e.retryable ?? isRetryableCode(code),
+      // Preserved when present, else derived from the code, so a plain error
+      // literal cannot silently disagree with the refusal/failure decision.
+      outcome: e.outcome ?? (isRefusalCode(code) ? "refusal" : "failure"),
       subsystem: e.subsystem ?? classify(code),
       ...(e.help ? { help: e.help } : {}),
       trace: [`tool:${tool}`, "router", ...(Array.isArray(e.trace) ? e.trace : [])],
@@ -77,6 +80,32 @@ function shapeResult(result: any, tool: string): any {
     result.error = shapeError(result.error, tool);
   }
   return result;
+}
+
+/**
+ * Should this result set MCP `isError`?
+ *
+ * Only a FAILURE should. An `isError: true` result is raised as a thrown
+ * exception by most MCP clients, which flattens the envelope into
+ * `Error.message` — so the documented `if (!r.ok)` branch is unreachable, and
+ * any actionable payload (AMBIGUOUS_TARGET `candidates`, overlay `region`) has
+ * to be re-parsed out of a string. It also made delivery depend on the client
+ * and on which call it was: the same refusal resolved once and threw on every
+ * repeat, so code validated against the first call failed in production.
+ *
+ * A REFUSAL resolved correctly the whole time; it is Kruz answering "not
+ * safely" with a complete, typed payload. So refusals resolve as values with
+ * `ok: false`, and only true failures — no session, crash, timeout, unhandled
+ * exception — set `isError`.
+ *
+ * An `ok:false` with NO envelope is treated as a failure: it carries no
+ * actionable payload, so there is nothing for a caller to inspect.
+ */
+function isFailure(result: any): boolean {
+  if (!result || result.ok !== false) return false;
+  if (result.error?.outcome === "refusal") return false;
+  if (typeof result.error?.code === "string" && isRefusalCode(result.error.code)) return false;
+  return true;
 }
 
 export class ToolRouter {
@@ -240,7 +269,7 @@ export class ToolRouter {
           timer = setTimeout(() => reject(new Error("ROUTE_TIMEOUT")), ROUTE_TIMEOUT_MS)
         ),
       ]);
-      return { content: [{ type: "text", text: JSON.stringify({ ...shapeResult(result, name), ...this.diagnostics() }) }], isError: result.ok === false };
+      return { content: [{ type: "text", text: JSON.stringify({ ...shapeResult(result, name), ...this.diagnostics() }) }], isError: isFailure(result) };
     } catch (err) {
       if (String(err) === "Error: ROUTE_TIMEOUT") {
         // A timeout cannot establish success or cancel an in-flight browser action.
@@ -403,6 +432,9 @@ export class ToolRouter {
       s.config = { ...s.config, viewportWidth: actualW, viewportHeight: actualH };
     }
     const url = await s.engine?.url().catch(() => "about:blank") ?? "about:blank";
+    // Report the engine's real tab id, not a hardcoded literal, so it matches
+    // what page.observe / page.listTabs report for the same tab.
+    const pageId = await this.activePageId();
     // The control layer is injected over CDP and re-applies
     // on every navigation. Installed hidden: the blue overlay + input lock
     // engage only around mutating tool calls (route()), so the window is clean
@@ -413,7 +445,7 @@ export class ToolRouter {
       // The layer lives for the whole session, but the overlay is shown only
       // while the model operates (see beginControl/endControl heartbeat).
     }
-    return { ok: true, reused, ...(reused ? { message: "Reused the existing session; launch options and startup_url were not applied. Use page.open to navigate, or session.close before changing launch settings." } : {}), session_id: s.id, status: s.status, control_indicator: indicator, browser: { headless: s.config.headless, viewport: { width: s.config.viewportWidth, height: s.config.viewportHeight } }, page_id: "p1", url };
+    return { ok: true, reused, ...(reused ? { message: "Reused the existing session; launch options and startup_url were not applied. Use page.open to navigate, or session.close before changing launch settings." } : {}), session_id: s.id, status: s.status, control_indicator: indicator, browser: { headless: s.config.headless, viewport: { width: s.config.viewportWidth, height: s.config.viewportHeight } }, page_id: pageId, url };
   }
 
   private async status() {
@@ -590,6 +622,12 @@ export class ToolRouter {
             };
           }
         }
+        // Navigation reports the canonical tab id so an agent can correlate the
+        // tab across navigate/observe/click. It was absent here, which is what
+        // made the id look like it lived in two namespaces ("p1" vs "tab-1").
+        if (result && result.ok && result.result && result.result.page_id === undefined) {
+          result.result.page_id = await this.activePageId();
+        }
         return result;
       }
       // A non-crash failure is terminal — do not burn the retry budget.
@@ -615,6 +653,26 @@ export class ToolRouter {
       }
       return { ok: false, error: shapeError(env, url.includes("jobdetails") ? "page.open" : "page.goto") };
     }
+  }
+
+  /**
+ * The canonical tab id for the active page — ONE id, read from the engine.
+ *
+ * This used to be a hardcoded `"p1"`, while `page.observe` reported the engine's
+ * real tab id (`"tab-1"`). So the same physical tab had two names depending on
+ * which tool you asked, and `page_id` was missing from `page.open` altogether —
+ * an agent could not correlate a tab across calls without guessing, which makes
+ * multi-tab work fragile and invites acting on the wrong tab.
+ *
+ * `controller.activePageId` resolves the same way (`refreshIdentity` reads
+ * `engine.listTabs()`), so both sides now agree on one namespace.
+ */
+  private async activePageId(): Promise<string | null> {
+    const s = this.sm.getActive();
+    if (!s?.engine) return null;
+    const tabs = await s.engine.listTabs().catch(() => null);
+    const active = tabs?.find((t) => t.isActive) ?? tabs?.[0];
+    return active?.id ?? null;
   }
 
   private pid(): string {

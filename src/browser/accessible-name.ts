@@ -34,6 +34,34 @@
  * Without this, a wrapping `<label>Location<select>…</select></label>` reports
  * "LocationBangalore" and can never match a plain "Location" target.
  */
+/**
+ * Text content with NON-RENDERED subtrees removed.
+ *
+ * `textContent` in HTML concatenates the text of `<style>`, `<script>`,
+ * `<template>` and `<noscript>` children, none of which is rendered — and all
+ * of which the accname spec excludes from a name. On a Shopify storefront the
+ * hero slideshow anchors embed a per-block `<style>` scoped to their own id,
+ * so those links reported a name that was a wall of CSS:
+ *
+ *   e476  link  "#block-image-2 { color: #ffffff; } #block-image-2 .button { ... }"
+ *
+ * which is un-targetable by name AND burns context on every observation.
+ *
+ * `innerText` would be the correct rendered text, but it forces layout, and
+ * this runs for every candidate element on every observation — so a walk that
+ * skips the known non-rendered tags is the cheap, sufficient fix. `aria-hidden`
+ * subtrees are skipped for the same reason: they are hidden from assistive tech.
+ */
+export const RENDERED_TEXT_SRC = String.raw`
+function __kruzRenderedText(el) {
+  if (!el) return "";
+  var clone = el.cloneNode(true);
+  var kill = clone.querySelectorAll("style, script, template, noscript, [aria-hidden='true']");
+  for (var i = 0; i < kill.length; i++) kill[i].remove();
+  return (clone.textContent || "").replace(/\s+/g, " ").trim();
+}
+`;
+
 export const LABEL_TEXT_HELPER_SRC = String.raw`
 function __kruzLabelOwnText(label) {
   var clone = label.cloneNode(true);
@@ -41,7 +69,7 @@ function __kruzLabelOwnText(label) {
   for (var i = 0; i < kill.length; i++) kill[i].remove();
   var t = (clone.textContent || "").replace(/\s+/g, " ").trim();
   if (t) return t;
-  return (label.textContent || "").replace(/\s+/g, " ").trim();
+  return __kruzRenderedText(label);
 }
 
 function __kruzLabelText(el) {
@@ -71,7 +99,7 @@ function __kruzAccessibleName(el) {
   if (lb) {
     var parts = lb.split(/\s+/).map(function (id) {
       var n = document.getElementById(id);
-      return n ? (n.textContent || "") : "";
+      return n ? __kruzRenderedText(n) : "";
     }).filter(Boolean);
     var joined = parts.join(" ").replace(/\s+/g, " ").trim();
     if (joined) return { name: joined, source: "aria-labelledby" };
@@ -88,12 +116,25 @@ function __kruzAccessibleName(el) {
   }
   var tag = el.tagName.toLowerCase();
   if (tag !== "select") {
-    var own = (el.textContent || "").replace(/\s+/g, " ").trim();
+    var own = __kruzRenderedText(el);
     if (own && own.length <= 200) return { name: own, source: "text" };
+  }
+  // An image-only link (hero slide, thumbnail gallery) has no text content at
+  // all, so fall back to the alt text of its image. This is what makes such a
+  // link addressable by name instead of only by ref.
+  var imgs = el.querySelectorAll ? el.querySelectorAll("img[alt], [role='img'][aria-label]") : [];
+  var alts = [];
+  for (var ai = 0; ai < imgs.length; ai++) {
+    var av = imgs[ai].getAttribute("alt") || imgs[ai].getAttribute("aria-label") || "";
+    if (av.trim()) alts.push(av.trim());
+  }
+  if (alts.length) {
+    var altName = alts.join(" ").replace(/\s+/g, " ").trim();
+    if (altName && altName.length <= 200) return { name: altName, source: "img-alt" };
   }
   return { name: "", source: "none" };
 }
 `;
 
-/** Both helpers, for embedding in one in-page program. */
-export const ACCESSIBLE_NAME_BUNDLE_SRC = LABEL_TEXT_HELPER_SRC + ACCESSIBLE_NAME_SRC;
+/** All helpers, for embedding in one in-page program. */
+export const ACCESSIBLE_NAME_BUNDLE_SRC = RENDERED_TEXT_SRC + LABEL_TEXT_HELPER_SRC + ACCESSIBLE_NAME_SRC;
