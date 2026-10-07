@@ -25,3 +25,10 @@ Thumbs.db
 npm-debug.log*
 qa/
 *.tsbuildinfo
+
+# Scratch dump — screenshots for image analysis, verification captures, scratch
+# harnesses. Created on demand and deleted by hand; nothing here is source.
+# The contents are ignored but the README is kept, so the convention survives a
+# fresh clone.
+dump/*
+!dump/README.md

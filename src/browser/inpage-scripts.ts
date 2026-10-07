@@ -107,7 +107,14 @@ ${ACCESSIBLE_NAME_BUNDLE_SRC}
       if (!parent) break;
       cur = parent;
     }
-    return segs.join(" ").replace(/\s+>>>\s+/g, " >>> ").trim();
+    // CHILD combinator, not descendant. ":nth-of-type" is only emitted when an
+    // element has same-tag siblings, so a run of lone-child divs contributes bare
+    // "div" segments. Joined with a space those fan out and the path matches every
+    // matching branch — measured on makerbazar.in:
+    //   "section div div div div div div a:nth-of-type(1)"  -> 4 anchors
+    // which silently defeated Tier-1 identity, pushed every ref onto semantic
+    // matching, and made repeated links permanently ambiguous (BUG-004).
+    return segs.join(" > ").replace(/\s*>>>\s*/g, " >>> ").trim();
   };
 
   var CONTAINER_SEL = '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], [class*="consent" i], [id*="consent" i], [class*="cookie" i], [id*="cookie" i], [class*="banner" i], [id*="banner" i], [class*="notice" i], [class*="popup" i], [class*="modal" i]';

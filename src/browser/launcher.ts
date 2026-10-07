@@ -41,7 +41,6 @@ export async function launchBrowser(overrides?: {
   startupUrl?: string;
 }): Promise<LaunchedBrowser> {
   const config = buildConfig(overrides);
-  const headless = config.headless;
   const profileDir = resolve(config.profileDir);
   const downloadDir = resolve(config.downloadDir);
 
@@ -53,18 +52,17 @@ export async function launchBrowser(overrides?: {
     mkdirSync(downloadDir, { recursive: true });
   }
 
-  const chromeArgs: string[] = [
-    "--disable-blink-features=AutomationControlled",
-    "--allow-file-access-from-files",
-  ];
-
-  // Only maximize if running headed AND no custom viewport was requested
-  if (!headless && !overrides?.viewportWidth && !overrides?.viewportHeight) {
-    chromeArgs.unshift("--start-maximized");
-  }
-
-  // Configure the base P1Config so the engine knows the launch settings; the
-  // boot() signature takes (config, profileDir) so we pass config + profileDir.
+  // Launch flags are built by PuppeteerEngine.boot(), NOT here. This function
+  // used to compute a `chromeArgs` array — including
+  // --disable-blink-features=AutomationControlled, which boot() deliberately
+  // dropped because Chrome answers it with an "unsupported command-line flag"
+  // infobar — and then pass it to boot(config, profileDir), which ignored it
+  // entirely. Two launch paths, disagreeing, with the computed one dead.
+  //
+  // boot() is the single source of truth for flags. It always adds
+  // --start-maximized when headed, which is now purely cosmetic: the CSS viewport
+  // is pinned by Emulation device-metrics (see setViewportSize), so the window
+  // size no longer decides which responsive layout a page serves.
   const engine = new PuppeteerEngine(true);
   try {
     await engine.boot(config, profileDir);

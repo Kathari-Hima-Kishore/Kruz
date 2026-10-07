@@ -109,7 +109,25 @@ export class Observer {
     engine.onPageLoad(() => { this.mutationCount++; this.mutationAttached = false; });
     engine.evaluate(`(() => {
       let c = 0;
-      new MutationObserver(() => c++).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      // Kruz's own overlay must NOT count. pageFeedback's signature includes this
+      // counter, and that signature is what decides \`dom_changed\` — i.e. whether an
+      // action changed anything. The banner is rebuilt in the LIGHT DOM and its
+      // inline styles change on every state transition, so Kruz was marking its own
+      // housekeeping as page mutation: an action that provably did nothing still
+      // reported dom_changed:true. Both overlay nodes carry [data-kruz] precisely so
+      // they can be excluded here. (The closed shadow root was never observed anyway;
+      // it is the light-DOM banner that leaked.)
+      const isOwn = (n) => {
+        try {
+          if (!n || n.nodeType !== 1) return false;
+          if (typeof n.closest === 'function' && n.closest('[data-kruz]')) return true;
+          const host = n.getRootNode && n.getRootNode().host;
+          return !!(host && host.hasAttribute && host.hasAttribute('data-kruz'));
+        } catch (e) { return false; }
+      };
+      new MutationObserver((recs) => {
+        for (const r of recs) if (!isOwn(r.target)) c++;
+      }).observe(document.documentElement, { childList: true, subtree: true, attributes: true });
       (window).__p1MutationCount = () => c;
     })()`).catch(() => { this.mutationAttached = false; });
   }
@@ -173,7 +191,10 @@ ${ACCESSIBLE_NAME_BUNDLE_SRC}
             if (!parent) break;
             cur = parent;
           }
-          return segs.join(' ').replace(/\\s+>>>\\s+/g, ' >>> ').trim();
+          // CHILD combinator, not descendant — see the identical fix in inpage-scripts.ts
+          // (BUG-004). Bare "div" segments with a space fan out to every matching
+          // branch, so an observed ref could not be re-found by its own path.
+          return segs.join(' > ').replace(/\\s*>>>\\s*/g, ' >>> ').trim();
         };
         // Nearest overlay-ish container, matching the matcher's definition, so an
         // observed ref can be verified against its banner/dialog root after a

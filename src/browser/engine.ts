@@ -91,10 +91,17 @@ export interface BrowserEngine {
   /** Page-level. */
   url(): Promise<string>;
   title(): Promise<string>;
-  viewportSize(): Promise<{ width: number; height: number }>;
+  viewportSize(): Promise<{ width: number; height: number; dpr?: number }>;
   setViewportSize(w: number, h: number): Promise<void>;
   bringToFront(): Promise<void>;
+  /** Close the active TAB only. The browser process keeps running. */
   close(): Promise<void>;
+  /**
+   * Terminate the browser PROCESS, releasing the profile-directory lock. Used by a
+   * forced `session.close({graceful:false})` — a tab-only close leaves Chrome
+   * running and the next `session.create` then fails on the profile lock (E-015).
+   */
+  terminate(): Promise<void>;
   content(): Promise<string>;
 
   /** Navigation. */
@@ -120,8 +127,8 @@ export interface BrowserEngine {
   evaluate<T = unknown>(expression: string): Promise<EvalResult>;
   readVariable<T = unknown>(name: string): Promise<T | undefined>;
 
-  /** Screenshots. */
-  screenshot(opts: { fullPage?: boolean; path?: string }): Promise<Buffer>;
+  /** Screenshots. `type` defaults to png; `quality` applies to jpeg/webp only. */
+  screenshot(opts: { fullPage?: boolean; path?: string; type?: "png" | "jpeg" | "webp"; quality?: number }): Promise<Buffer>;
 
   /** Frames. */
   frames(): Promise<KruzFrame[]>;
@@ -142,7 +149,7 @@ export interface BrowserEngine {
   takeMarkedNode(fallbackCss: string, target: Target): Promise<KruzElement | null>;
 
   /** Element operations (resolve-on-call). */
-  click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow" }): Promise<void>;
+  click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow"; modifiers?: string[] }): Promise<void>;
   dblclick(el: KruzElement, opts?: { timeoutMs?: number }): Promise<void>;
   hover(el: KruzElement, opts?: { timeoutMs?: number; dwellMs?: number }): Promise<void>;
   /** Install the virtual cursor + control glow (idempotent, survives navigation). */
@@ -201,7 +208,10 @@ export interface BrowserEngine {
   countElements(target: Target, scope?: string): Promise<number>;
 
   /** Element-level screenshot. */
-  screenshotElement(el: KruzElement, opts?: { path?: string }): Promise<Buffer>;
+  screenshotElement(el: KruzElement, opts?: { path?: string; type?: "png" | "jpeg" | "webp"; quality?: number }): Promise<Buffer>;
+
+  /** Intrinsic dimensions of a PNG/JPEG/WebP buffer. Advisory — never throws. */
+  imageDimensions(buf: Buffer): { width: number | null; height: number | null };
 
   /** Frame-scoped element queries. */
   queryOneInFrame(frameId: string, target: Target, fallback?: Fallback): Promise<KruzElement | null>;
@@ -218,7 +228,36 @@ export interface BrowserEngine {
 
   /** Drag & drop. */
   dragPointer(srcBox: { x: number; y: number }, dstBox: { x: number; y: number }): Promise<void>;
-  html5Drag(src: KruzElement, dst: KruzElement): Promise<void>;
+  html5Drag(src: KruzElement, dst: KruzElement, payload?: Record<string, string>): Promise<void>;
+
+  /**
+   * Trusted drag with real timing, modifier support and an optional settle.
+   *
+   * Separate from dragPointer (the raw 3-call form) because custom drag engines
+   * (Tinkercad, Canva, block builders) ignore a press/move/release that arrives in
+   * a single task: puppeteer's `move(x,y,{steps:n})` fires every step with no delay
+   * between them, and a drag that never appears to *move over time* is dropped
+   * silently. This walks a human-like trajectory with per-step delays, which is what
+   * those engines actually key on.
+   */
+  dragPath(
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    opts?: { steps?: number; button?: "left" | "right" | "middle"; speed?: "instant" | "fast" | "normal" | "slow"; modifiers?: string[]; pressHoldMs?: number; releaseSettleMs?: number },
+  ): Promise<{ steps: number; duration_ms: number; modifiers: string[] }>;
+
+  /**
+   * Viewport coordinates of an element's centre, scrolling it into view first.
+   *
+   * Deliberately NOT puppeteer's boundingBox(): that is page-relative (it carries
+   * the scroll offset) while trusted mouse input is dispatched in viewport space.
+   * Mixing the two lands the drag somewhere else on a scrolled page — the same
+   * reason computeClickPoint uses getBoundingClientRect.
+   */
+  viewportPoint(el: KruzElement): Promise<{ x: number; y: number } | null>;
+
+  /** Attach files to an `<input type=file>` via CDP DOM.setFileInputFiles. */
+  uploadFileTo(el: KruzElement, paths: string[]): Promise<{ files: string[] }>;
 
   /** Shadow DOM piercing (engine-level capability). */
   queryOnePiercing(target: Target, fallback?: Fallback, scope?: string): Promise<KruzElement | null>;

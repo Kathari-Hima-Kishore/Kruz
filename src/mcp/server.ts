@@ -14,7 +14,7 @@ import { loadConfig } from "../config.js";
 
 
 
-const T = z.object({
+const T_FIELDS = {
 
   ref: z.string().optional(), css: z.string().optional(),
 
@@ -30,7 +30,29 @@ const T = z.object({
 
   scope: z.string().optional(),
 
-});
+};
+
+// Every field optional: a target may name any one of these, and `{}` is accepted so
+// the controller can answer with its own "no target specified" guidance listing every
+// valid field, which is a better error than a schema message.
+const T = z.object(T_FIELDS);
+
+/**
+ * The SAME shape, but it must actually name something.
+ *
+ * This exists purely for use inside `z.union`. A `z.object` strips unknown keys and
+ * accepts an all-optional shape, so the bare target matched EVERY object — including
+ * `{x: "not-a-number"}` — and validated it to `{}`. Inside a union that means the
+ * target branch silently swallows every failure its sibling branch exists to catch:
+ * putting coordinates first does make valid coordinates survive, but malformed ones
+ * still "validate" into an empty target and surface much later as a confusing
+ * TARGET_NOT_FOUND instead of a validation error. Requiring one present field closes
+ * that — anything the coordinates branch rejects now fails here too.
+ */
+const T_TARGET = z.object(T_FIELDS).refine(
+  (v) => Object.values(v).some((x) => x !== undefined),
+  { message: "a target must set at least one of: ref, css, role+name, text, label, placeholder, testid, nameAttr, id" },
+);
 
 
 
@@ -68,7 +90,9 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
 
     proxy: z.string().optional(), download_dir: z.string().optional(), startup_url: z.string().optional(),
 
-    control_indicator: z.boolean().optional().describe("Show the blue 'being controlled' viewport glow plus the virtual cursor (default true). Pass false for a clean browser window."),
+    control_indicator: z.boolean().optional().describe("Show the status banner plus the virtual cursor (default true). The banner is top-left and states one of three things: blue 'Controlled by Kruz' while a call is in flight, amber 'Model is thinking' between calls, clear 'Input needed on Browser/TUI' when a human is expected. Pass false for a clean browser window."),
+
+    cdp_url: z.string().optional().describe("ATTACH to an already-running Chrome over CDP instead of launching one — e.g. 'http://127.0.0.1:9222'. Start that browser yourself with --remote-debugging-port=9222. This is the ONLY path that keeps your real Chrome profile reputation, and therefore the only one where Google-account sign-in works: a Puppeteer-launched profile is rejected as automation ('This browser or app may not be secure') even when a human types the credentials, because that check is transport-level and in-page stealth cannot influence it. On attach, session.close DISCONNECTS and leaves your browser running, and viewport pinning is not applied."),
 
   });
 
@@ -76,9 +100,9 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
 
   t("session.close", "Close browser and cleanup.", { graceful: z.boolean().optional() });
 
-  t("session.pause", "Pause model control for manual work (login, CAPTCHA). The blue overlay and the input lock turn off, so the page is fully interactive; the browser stays open. Call session.resume to hand control back.", { message: z.string().optional() });
+  t("session.pause", "Pause model control for manual work (login, CAPTCHA). The input lock lifts and the banner goes clear ('Input needed on Browser/TUI'), so the page is fully interactive; the browser stays open. Call session.resume to hand control back.", { message: z.string().optional() });
 
-  t("session.resume", "Resume model control after session.pause or human.takeover. The blue overlay returns on the next action.", {});
+  t("session.resume", "Resume model control after session.pause or human.takeover. The banner returns to amber ('Model is thinking') and goes blue again on the next action.", {});
 
 
 
@@ -147,7 +171,53 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
     force: z.boolean().optional(), ignore_visibility: z.boolean().optional(),
     visual: z.boolean().optional().describe("Glide a visible virtual cursor to the target and click with real trusted input. Verifiable by eye and harder for bot detection to fingerprint. Costs ~0.3s extra."),
     speed: z.enum(["instant", "fast", "normal", "slow"]).optional().describe("Cursor glide speed when visual:true. Default normal."),
+    modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).optional().describe("Keys held down for the whole click, then released. This is how shift-click / ctrl-click multi-select and additive range selection are expressed — a key COMBO (page.press 'Control+g') cannot be, because a combo is atomic while multi-select needs the modifier held across the click. Example: [\"Shift\"] to add to a selection."),
 
+  });
+
+
+
+  // Drag — the primitive click/press cannot express.
+
+  // Coords FIRST: T is all-optional, so it would match (and strip) {x,y} if tried first.
+  // Coordinates FIRST, and the target branch requires a named field (T_TARGET).
+  // Order alone is not enough — see T_TARGET for why.
+  const DragPoint = z.union(
+    [z.object({ x: z.number(), y: z.number() }), T_TARGET],
+    { errorMap: () => ({ message: "Provide either {x, y} CSS-pixel coordinates, or a target such as {ref} / {css} / {role, name}. Coordinates must both be numbers." }) },
+  );
+  t("page.drag", "Press, move and release the mouse between two points — the primitive for palette-to-canvas placement (Tinkercad, Canva, block builders), slider handles, and reorderable lists. Each endpoint is either {x,y} in CSS pixels or any target page.click accepts (ref/css/role+name), which is scrolled into view and grabbed at its centre. Dispatches TRUSTED input via CDP with real per-step timing, because custom drag engines ignore a press/move/release that arrives in one task. Reports dragged/verified with verification 'navigation' | 'dom_change' | 'no_change'; a drop that changed nothing returns verified:false with unverified_reason rather than pretending success (use page.screenshot to check a canvas, which does not change the DOM).", {
+    from: DragPoint.describe("Grab point: {x,y} in CSS pixels, or a target to press on."),
+    to: DragPoint.describe("Release point: {x,y} in CSS pixels, or a target to drop on."),
+    mode: z.enum(["pointer", "html5"]).optional().describe("'pointer' (default) is a real mouse press/move/release with timing. 'html5' dispatches dragstart/dragenter/dragover/drop/dragend with a DataTransfer for sites built on the HTML5 drag API, and requires two targets rather than {x,y}. Try pointer first — it is what canvas and custom engines use."),
+    data: z.record(z.string()).optional().describe("mode:'html5' only. MIME->value pairs to seed the DataTransfer with, e.g. {\"text/plain\":\"https://example.com\"} or {\"text/uri-list\":\"https://example.com\"}. REQUIRED for a payload: Chrome discards setData() calls made by the page's own dragstart handler on a synthetic DataTransfer (verified), so a drop handler that reads getData() sees an empty string unless the payload is seeded here."),
+    steps: z.number().int().min(2).max(200).optional().describe("Intermediate moves (default derived from speed, ~24). Raise it for long drags; some engines only start a drag after enough motion."),
+    speed: z.enum(["instant", "fast", "normal", "slow"]).optional().describe("Gesture pacing. Default normal. 'slow' adds per-step delay and longer press/release settles — the lever when a first drag is silently ignored."),
+    button: z.enum(["left", "right", "middle"]).optional(),
+    modifiers: z.array(z.enum(["Alt", "Control", "Meta", "Shift"])).optional().describe("Keys held for the whole drag, then released."),
+    settle_ms: z.number().min(0).max(5000).optional().describe("Wait after release before measuring. Raise it for editors that commit on a drop handler rather than synchronously (default 250)."),
+    timeout_ms: z.number().optional(),
+  });
+
+
+
+  // Viewport — determinism for responsive layouts.
+
+  t("page.setViewport", "Pin the CSS viewport for the rest of the session, and report the measured result. Use this when a site has flipped to its mobile layout (the desktop control is then not in the DOM at all) or when a layout assumption must be made deterministic. Applies CDP Emulation device metrics, so the OS window is NOT resized and nothing on the user's desktop changes. The device scale factor is preserved, so element screenshots stay in DEVICE pixels (image dimensions remain css x dpr). session.create already pins the viewport for you; this re-pins it mid-session, which is the recovery that used to require closing the session and losing every tab.", {
+    width: z.number().describe("CSS viewport width."),
+    height: z.number().describe("CSS viewport height."),
+  });
+
+
+
+  // File input — the only upload route a page cannot fake.
+
+  t("page.uploadFile", "Attach one or more local files to a file input, via CDP DOM.setFileInputFiles, and fires the change event the page listens for. The input does not need to be visible — file inputs are normally display:none behind a styled button. Paths are resolved on the machine running Kruz. An in-page DataTransfer cannot populate a real file input, which is why this exists rather than a page.evaluate recipe.", {
+    target: T.optional().describe("The file input: ref, css (e.g. 'input[type=\"file\"]'), role+name, id, testid. Defaults to the first input[type=file] on the page."),
+    path: z.string().optional().describe("Single local file path."),
+    paths: z.array(z.string()).optional().describe("Multiple local file paths (use this for <input multiple>)."),
+    file: z.string().optional().describe("Alias for path."),
+    fallback: F, scope: z.string().optional(), timeout_ms: z.number().optional(),
   });
 
 
@@ -350,11 +420,31 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
 
   // Extract — extract.text only. extract.target deleted (text+scope does the job).
 
-  // Screenshot deleted: text-model runs never look at pixels (badges/grounding
-
-  // pairs with clickAt coordinates, not images).
-
   t("extract.text", "Extract exact text from element or scope with provenance.", { target: T.optional(), fallback: F, scope: z.string().optional(), timeout_ms: z.number().optional() });
+
+
+
+  // Vision — page.screenshot.
+
+  // Previously deleted on the reasoning that "text-model runs never look at pixels,
+  // grounding pairs with clickAt coordinates, not images". That was a statement
+  // about the CONSUMER, not a limit of the code: the engine already had
+  // screenshot() and screenshotElement(), and the router could already deliver
+  // them — they were simply never registered as a tool. The premise no longer
+  // holds. Vision-capable models are now the norm, and grounding still pairs with
+  // refs/coordinates; this is the perception channel those act ON, not a
+  // replacement for them.
+
+  t("page.screenshot", "Capture the page as an image and return it for visual ANALYSIS (not OCR - you receive the actual pixels and interpret them yourself). Modes: default = current viewport; full_page = the entire scrollable page; pass `target` = just that one element, which is the cheapest way to inspect a specific card, icon or tile. Returns an MCP image content block plus a metadata block (mime_type, width, height, bytes, mode, and the `ref` when one was used). Use it when the DOM cannot answer the question: icon-only controls with no accessible name, canvas/WebGL or image-based UI, checking whether something is visually obscured or overlapping, verifying layout/rendering, or any task described by appearance rather than by text. Pair with page.observe for refs and page.click to act. PREFER type:'jpeg' with quality ~70-80 for full_page captures to keep the payload small; png is sharper and lossless for element crops.", {
+    target: T.optional().describe("Crop to a single element. Accepts the same targets as page.click (ref, css, role+name, label, placeholder, text, testid, nameAttr, id)."),
+    fallback: F,
+    scope: z.string().optional().describe("Restrict target resolution to this CSS selector / semantic scope"),
+    full_page: z.boolean().optional().describe("Capture the whole scrollable page instead of just the viewport. Much larger - prefer type:'jpeg'."),
+    path: z.string().optional().describe("Also write the image to this file path. The image is returned either way; this just keeps a copy. Use the repo's gitignored 'dump/' folder for scratch captures (e.g. 'dump/card.png')."),
+    type: z.enum(["png", "jpeg", "webp"]).optional().describe("Image format. Default png (lossless, larger). Use jpeg for full-page or when only layout matters."),
+    quality: z.number().optional().describe("Compression quality 1-100, jpeg/webp only. Ignored for png. Default 80."),
+    timeout_ms: z.number().optional().describe("Element-resolution timeout ms (default 15000)"),
+  });
 
 
 

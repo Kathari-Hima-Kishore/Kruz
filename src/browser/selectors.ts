@@ -34,14 +34,56 @@ export async function resolveElement(engine: BrowserEngine, target: Target, fall
  * stranger. Same-href twins (image + title link to one product) share the
  * destination, so either is a correct landing.
  */
-async function markElementByHref(engine: BrowserEngine, href: string): Promise<KruzElement | null> {
+async function markElementByHref(engine: BrowserEngine, href: string, preferPath?: string, preferName?: string): Promise<KruzElement | null> {
   const token = `k${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
   try {
     // Only one live mark at a time (actions are sequential): clear any stale
     // mark first, then mark the destination. The mark MUST persist after this
     // call — every later resolveHandle re-queries by it for the whole action.
+    //
+    // `preferPath` is the piercing path recorded for the element the agent
+    // actually OBSERVED. When it still resolves to a same-href anchor, that node
+    // is the one to mark. Falling back to document-order first-match is what made
+    // this correct for clicks (a twin lands on the same URL) but wrong for
+    // anything that captures the node's own geometry — see BUG-002.
     const found: any = await engine.evaluate(
-      `(t => { try { document.querySelectorAll('a[data-kruz-refmark]').forEach(x => x.removeAttribute('data-kruz-refmark')); const a = Array.from(document.querySelectorAll('a')).find(x => x.href === ${JSON.stringify(href)}); if (!a) return false; a.setAttribute('data-kruz-refmark', t); return true; } catch (e) { return false; } })(${JSON.stringify(token)})`,
+      `(t => { try {
+         document.querySelectorAll('a[data-kruz-refmark]').forEach(x => x.removeAttribute('data-kruz-refmark'));
+         const href = ${JSON.stringify(href)};
+         const wantName = ${JSON.stringify(preferName ?? null)};
+         const twins = Array.from(document.querySelectorAll('a')).filter(x => x.href === href);
+         if (!twins.length) return 'no-twins';
+         // A twin is only usable if it actually renders. getClientRects() is empty
+         // for display:none subtrees (Shopify keeps a closed drawer + a display:none
+         // desktop nav in the DOM), and a 0x0 box cannot be captured or clicked.
+         const rendered = (el) => {
+           const r = el.getBoundingClientRect();
+           const cs = getComputedStyle(el);
+           return el.getClientRects().length > 0 && r.width > 0 && r.height > 0
+             && cs.display !== 'none' && cs.visibility !== 'hidden';
+         };
+         // The accessible name is the only signal that reliably separates same-href
+         // twins: "RC Planes and Drones" (card) vs "RC Planes & Drones" (nav) vs
+         // "Aeromodelling" (footer). The recorded piercing path is NOT trusted —
+         // deepPath() was measured resolving to a different twin (BUG-002), and the
+         // href check cannot catch it because every twin shares the href.
+         const nameOf = (el) => ((el.getAttribute('aria-label') || el.textContent || '') + ' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+         let byPath = null;
+         const p = ${JSON.stringify(preferPath ?? null)};
+         if (p) { try { const cand = document.querySelector(p); if (cand && twins.indexOf(cand) !== -1) byPath = cand; } catch (e) { /* invalid path */ } }
+         const wn = wantName ? String(wantName).replace(/\\s+/g, ' ').trim().toLowerCase() : '';
+         const score = (el) => {
+           let s = 0;
+           if (wn && nameOf(el) === wn) s += 4;
+           if (el === byPath && wn && nameOf(el) === wn) s += 2;  // path only corroborates a name match
+           if (rendered(el)) s += 1;
+           return s;
+         };
+         let a = twins[0], best = score(twins[0]);
+         for (let i = 1; i < twins.length; i++) { const sc = score(twins[i]); if (sc > best) { best = sc; a = twins[i]; } }
+         a.setAttribute('data-kruz-refmark', t);
+         return true;
+       } catch (e) { return false; } })(${JSON.stringify(token)})`,
     ).catch(() => null);
     if (!found?.ok || found.result !== true) return null;
     return await engine.queryOne({ css: `a[data-kruz-refmark="${token}"]` }).catch(() => null);
@@ -60,6 +102,12 @@ export async function resolveElementWithRef(engine: BrowserEngine, target: Targe
 
   if (target.ref) {
     const entry = refMap.get(target.ref);
+    // The piercing path recorded for the node the agent actually OBSERVED. Hoisted
+    // here because the D7 href fast path needs it too: it marks the observed node
+    // when the path still resolves, instead of the first same-href anchor in the
+    // document (BUG-002 — equivalent for clicks, wrong for anything that reads the
+    // node's own geometry).
+    const recordedPath: string | undefined = entry?.css || (entry?.semantic as any)?.path;
     if (entry?.semantic) {
       // D7 fast path: destination identity for links in the default scope.
       // Runs before semantic re-match because role-only fallback would return
@@ -68,7 +116,12 @@ export async function resolveElementWithRef(engine: BrowserEngine, target: Targe
       const semTag = (entry.semantic as any)?.tag;
       const entryScope = (entry as any)?.locator?.scope as string | undefined;
       if (semTag === "a" && typeof semHref === "string" && semHref && (!entryScope || entryScope === "body")) {
-        const marked = await markElementByHref(engine, semHref).catch(() => null);
+        const marked = await markElementByHref(
+          engine,
+          semHref,
+          recordedPath,
+          (entry.semantic as any)?.name as string | undefined,
+        ).catch(() => null);
         if (marked) return { el: marked, byRef: true };
       }
       // Primary: semantic re-match against the live DOM (name/role/text).
@@ -83,7 +136,7 @@ export async function resolveElementWithRef(engine: BrowserEngine, target: Targe
       // rebind when the DOM shifts (inserted siblings), which previously clicked
       // a stranger. A path hit whose href differs from the observed one is
       // discarded so Tier 2 can recover by identity instead of position.
-      const path = entry.css || entry.semantic.path;
+      const path = recordedPath;
       if (path) {
         const byPath = await engine.queryOne({ css: path }).catch(() => null);
         if (byPath) {

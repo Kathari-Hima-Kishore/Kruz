@@ -23,8 +23,10 @@ export const KNOWN_TOOLS = new Set<string>([
   "page.observe",
   "page.probe",
   "page.click", "page.clickAt",
+  "page.drag", "page.setViewport", "page.uploadFile",
 
   "page.computerUseList", "page.computerUseSnapshot",
+  "page.screenshot",
   "page.fill", "page.press",
   "page.select", "page.check", "page.uncheck",
   "page.scroll", "page.paginate",

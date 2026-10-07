@@ -355,12 +355,21 @@ export class RefRegistry {
     // act on "its fresh ref", so returning a list without refs would advertise a
     // recovery the caller cannot actually take — the same class of broken
     // promise as an unusable observe ref.
+    //
+    // The candidate is pinned to the EXACT node via its piercing path, not to the
+    // spec that produced the ambiguity. Inheriting `spec` made every candidate
+    // re-derive the same match set, so acting on one re-raised the identical
+    // AMBIGUOUS_TARGET with freshly minted refs — the advertised recovery looped
+    // forever on any page with repeated hrefs (BUG-003).
     const candidates = hits.slice(0, 6).map((h) => {
+      const pinnedSpec: MatchSpec = h.path
+        ? { css: h.path }
+        : spec;
       const minted = this.mint("ambiguity", h, {
         pageId: entry.pageId,
         documentId: entry.documentId,
         frameId: entry.frameId,
-        spec,
+        spec: pinnedSpec,
         scope,
         revision: entry.revision,
       });

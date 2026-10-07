@@ -11,13 +11,9 @@ import type { BrowserEngine } from "../browser/engine.js";
 import { toErrorEnvelope, kruzError, kruzErrorFromThrown, ErrCode, classify, isRetryableCode, isRefusalCode, KruzError, withRetry, type KruzErrorEnvelope } from "../errors.js";
 
 /**
- * Error codes the click recovery ladder retries (D4: ELEMENT_NOT_VISIBLE is
- * included — a hidden first match can resolve to the visible twin after the
- * re-observe escalation, matching the type/fill ladders in controller.ts).
- */
-/**
  * Error codes the click recovery ladder retries. ELEMENT_NOT_VISIBLE is included so a
- * hidden first match can resolve to its visible twin after re-observe.
+ * hidden first match can resolve to its visible twin after re-observe (D4, matching
+ * the type/fill ladders in controller.ts).
  * P1-D / §28: TARGET_NOT_FOUND is deliberately NOT retried — a genuinely missing target
  * must return quickly so the model can reconsider the plan instead of waiting through a
  * recovery ladder that cannot possibly succeed.
@@ -179,15 +175,32 @@ export class ToolRouter {
   private idleReleaseTimer?: ReturnType<typeof setTimeout>;
   private pingTimer?: ReturnType<typeof setTimeout>;
 
-  /** Stop the heartbeat and (after `graceMs`) force the overlay down. */
-  private endControl(graceMs = 600): void {
+  /**
+   * Stop the heartbeat. That is ALL this does now.
+   *
+   * It used to also schedule a delayed `setControlLock(false)` "to force the overlay
+   * down", duplicating the page-side watchdog (which already hides the overlay
+   * `IDLE_MS` after the last ping). The duplicate was not harmless:
+   *
+   *  - It raced. If that timer had already fired and its `setLock(false)` evaluate was
+   *    still in flight when the NEXT call began, `beginControl()` could not cancel it
+   *    (`clearTimeout` cannot cancel a running callback). `setLock(false)` sets
+   *    `lastPing = 0`, so the overlay went dark *during* an in-flight call and stayed
+   *    dark until the next heartbeat tick — a call executing with no indicator. That
+   *    is the "the overlay doesn't always show up" symptom.
+   *  - It cost a CDP round-trip after every single tool call, to re-assert something
+   *    the page already knew.
+   *
+   * The watchdog is the single source of truth for state; the heartbeat is the
+   * single source of truth for intent. Ending a call deliberately does NOT push
+   * an explicit state — letting the ping lapse is what moves the banner to
+   * "thinking", which is the honest description of a model between actions.
+   * The explicit paths are `session.pause` / `human.takeover` (awaiting) and
+   * `session.resume` (thinking), which go through `setControlMode`.
+   */
+  private endControl(_graceMs = 600): void {
     if (this.pingTimer) { clearTimeout(this.pingTimer); this.pingTimer = undefined; }
-    if (this.idleReleaseTimer) clearTimeout(this.idleReleaseTimer);
-    this.idleReleaseTimer = setTimeout(() => {
-      this.idleReleaseTimer = undefined;
-      void this.setControlLock(false).catch(() => {});
-    }, graceMs);
-    (this.idleReleaseTimer as any)?.unref?.();
+    if (this.idleReleaseTimer) { clearTimeout(this.idleReleaseTimer); this.idleReleaseTimer = undefined; }
   }
 
   /** Heartbeat ON for the duration of a call; overlay visible while it beats. */
@@ -231,6 +244,24 @@ export class ToolRouter {
       await engine.evaluate(`(() => { try { const v = window.__kruzVisual; if (v && v.setLock) return v.setLock(${on ? "true" : "false"}); return "no-layer"; } catch (e) { return "error"; } })()`).catch(() => null);
     } catch { /* best-effort; never fail an action on the indicator */ }
   }
+
+  /**
+   * Drive the banner to an explicit state. Used where the state is KNOWN rather
+   * than inferred from the heartbeat: a pause/takeover is a declaration that a
+   * human is needed, and a resume is a declaration that the model has the page
+   * again but is not mid-action.
+   *
+   * awaiting is deliberately sticky (it only clears on the next ping), while
+   * thinking is a floor the watchdog will keep raising/lowering on activity.
+   */
+  private async setControlMode(next: "controlling" | "thinking" | "awaiting"): Promise<void> {
+    try {
+      const engine = this.sm.getActiveEngine();
+      if (!engine) return;
+      await engine.evaluate(`(() => { try { const v = window.__kruzVisual; if (v && v.setMode) return v.setMode(${JSON.stringify(next)}); return "no-layer"; } catch (e) { return "error"; } })()`).catch(() => null);
+    } catch { /* best-effort; never fail an action on the indicator */ }
+  }
+
   private ctrl: BrowserController;
   private safety: SafetyLayer;
 
@@ -302,7 +333,10 @@ export class ToolRouter {
     // 45s goto isn't killed by the default 25s race; everything else stays under the
     // MCP SDK -32001 default (30s) to avoid false timeouts.
     const NAV_TOOLS = new Set(["session.create", "page.open", "page.goto", "page.reload", "page.iCIMSSearch", "ats.verifyPosting"]);
-    const ROUTE_TIMEOUT_MS = NAV_TOOLS.has(name) ? 55000 : 25000; // BUG-1: stay under MCP SDK -32001 default (30s) to avoid false timeouts
+    // Full-page capture of a long storefront can outlast the default budget, so
+    // page.screenshot gets its own ceiling rather than inheriting the 25s default.
+    const CAPTURE_TOOLS = new Set(["page.screenshot"]);
+    const ROUTE_TIMEOUT_MS = NAV_TOOLS.has(name) ? 55000 : CAPTURE_TOOLS.has(name) ? 55000 : 25000; // BUG-1: stay under MCP SDK -32001 default (30s) to avoid false timeouts
     let timer: ReturnType<typeof setTimeout> | undefined;
     // Model control is tied to ACTIVITY: overlay + input lock go on for the
     // duration of the call and are released shortly after the model goes idle.
@@ -315,16 +349,27 @@ export class ToolRouter {
           timer = setTimeout(() => reject(new Error("ROUTE_TIMEOUT")), ROUTE_TIMEOUT_MS)
         ),
       ]);
-      return { content: [{ type: "text", text: JSON.stringify({ ...shapeResult(result, name), ...this.diagnostics(), ...hoistEnvelope(result) }) }], isError: isFailure(result) };
+      return this.buildToolResult(result, name);
     } catch (err) {
       if (String(err) === "Error: ROUTE_TIMEOUT") {
         // A timeout cannot establish success or cancel an in-flight browser action.
         // Report unknown completion and require inspection before another mutation.
+        // Re-read the tab id first: the hung call may well have switched tabs
+        // before wedging, and stamping the response with the pre-call cache is how
+        // a response ends up naming a tab the action never touched.
+        await this.refreshPageId();
         return {
           content: [{ type: "text", text: JSON.stringify({
             ok: false,
             error: kruzError(ErrCode.ACTION_TIMEOUT, {
               subsystem: "router",
+              // Explicitly NOT retryable. `retryable` is the taxonomy's "may the same
+              // input succeed without replanning?" field, and this response answers no:
+              // completion is unknown and work may still be running, so replaying risks
+              // a double-submit. It previously inherited isRetryableCode()===true from
+              // ACTION_TIMEOUT while the same payload set retry_safe:false — the one
+              // field a caller branches on contradicted the payload beside it.
+              retryable: false,
               message: `Action '${name}' exceeded ${ROUTE_TIMEOUT_MS}ms. Completion is unknown and work may still be running.`,
               trace: [`tool:${name}`, "router"],
             }).toJSON(),
@@ -337,6 +382,7 @@ export class ToolRouter {
         };
       }
       const env = shapeError(err, name);
+      await this.refreshPageId();
       return { content: [{ type: "text", text: JSON.stringify({ ok: false, ...this.diagnostics(), error: env }) }], isError: true };
     } finally {
       if (timer) clearTimeout(timer);
@@ -344,6 +390,49 @@ export class ToolRouter {
       // overlay turns itself off (unless the user holds control).
       if (!isLifecycle && this.sm.getActive()?.id) this.endControl();
     }
+  }
+
+  /**
+   * Shape a tool result into an MCP CallToolResult.
+   *
+   * Every tool historically returned a single text block of JSON, so this was
+   * `JSON.stringify(result)` inline. `page.screenshot` breaks that: its payload is
+   * a base64 PNG, and JSON-encoding that would deliver the image as an
+   * unparseable string inside prose. MCP has a first-class image content block for
+   * exactly this, and clients render it as an actual image the model can look at.
+   *
+   * So: the base64 is hoisted OUT of the JSON and into a sibling image block. The
+   * text block keeps every metadata field (mime_type, width, height, bytes, mode,
+   * ref, path) so a text-only client still gets a complete, useful answer and the
+   * model can correlate what it is looking at with the element it came from.
+   *
+   * This is what turns Kruz from a text-only tool into one that supports image
+   * ANALYSIS: the model receives pixels and interprets them. It is deliberately
+   * not OCR — no text is extracted here, because the caller already has
+   * `extract.text` for that and gets strictly more from seeing the rendered page.
+   */
+  private buildToolResult(result: any, name: string): CallToolResult {
+    const shaped = shapeResult(result, name);
+    const meta = { ...shaped, ...this.diagnostics(), ...hoistEnvelope(shaped) };
+
+    const payload = shaped?.result;
+    const b64 = payload && typeof payload.base64 === "string" ? payload.base64 : null;
+    if (b64) {
+      // Strip it from the JSON view. Leaving a megabyte of base64 inline would
+      // duplicate it in the transcript for no benefit.
+      const { base64: _dropped, ...rest } = payload;
+      meta.result = { ...rest, image_attached: true };
+    }
+
+    const content: CallToolResult["content"] = [{ type: "text", text: JSON.stringify(meta) }];
+    if (b64) {
+      content.push({
+        type: "image",
+        data: b64,
+        mimeType: (payload.mime_type as any) ?? "image/png",
+      });
+    }
+    return { content, isError: isFailure(shaped) };
   }
 
   private async handle(name: string, a: Record<string, any>): Promise<any> {
@@ -363,14 +452,17 @@ export class ToolRouter {
       // Session
       case "session.create": return this.mkSession(a);
       case "session.status": return this.status();
-      case "session.pause": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); await this.setControlLock(false); return { ok: true, status: "paused", message: a.message || "Automation paused; the page is yours until session.resume.", session_id: s.id }; }
+      case "session.pause": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); await this.setControlMode("awaiting"); return { ok: true, status: "paused", message: a.message || "Automation paused; the page is yours until session.resume.", session_id: s.id, overlay: { mode: "awaiting", banner: "Input needed on Browser/TUI" } }; }
       case "session.resume": {
         const r = await this.sm.resume();
         const s = this.sm.getActive();
         if (!s) return { ok: false, error: kruzError(ErrCode.RESUME_FAILED, { subsystem: "session", message: "No active session to resume", trace: ["router"] }).toJSON() };
         // Idempotent: resuming an already-active session is a no-op success.
-        await this.setControlLock(false);   // overlay returns with the next action
-        return { ok: true, status: "active", was_paused: r };
+        // NOT setControlLock(false): that now means "a human is needed", which is
+        // exactly the opposite of a resume. The model has the page back but is not
+        // mid-action, so this is the "thinking" state until the next ping.
+        await this.setControlMode("thinking");
+        return { ok: true, status: "active", was_paused: r, overlay: { mode: "thinking", banner: "Model is thinking" } };
       }
 
       case "session.close": { const prev = this.sm.getActive(); const c = await this.sm.close(undefined, a.graceful !== false); if (c && prev?.engine) await (prev.engine as any).removeControlIndicator?.()?.catch?.(() => {}); return { ok: c, status: c ? "closed" : "error" }; }
@@ -399,9 +491,40 @@ export class ToolRouter {
       case "page.computerUseList": return this.ctrl.computerUseList();
       case "page.computerUseSnapshot": return this.ctrl.computerUseSnapshot();
 
+      // Vision — deliver actual pixels as an MCP image content block so a
+      // vision-capable model can analyse the page, not just read its markup.
+      case "page.screenshot": return this.ctrl.screenshot(a.target, a.fallback, a.scope, a.path, a.full_page === true, (a.type ?? "png") as "png" | "jpeg" | "webp", a.quality, a.timeout_ms);
+
       // Keyboard — mutating actions carry a compact post-action state delta (P1-A).
       case "page.fill": return this.withFeedback(engine, () => this.ctrl.fill(a.target, a.value, a.fallback, a.scope, a.timeout_ms, { force: a.force, ignoreVisibility: a.ignore_visibility }), { includeLists: false });
       case "page.press": return this.withFeedback(engine, () => this.ctrl.press(a.key, a.target, a.fallback, a.scope, a.timeout_ms), { includeLists: true });
+
+      // Drag — trusted press/move/release. Reports `verified:false` with a reason
+      // when nothing changed, because the alternative failure mode (a silent no-op
+      // drag on a custom drag engine) looks identical to success.
+      case "page.drag": return this.ctrl.drag(a.from, a.to, {
+        steps: a.steps, button: a.button, speed: a.speed, mode: a.mode, data: a.data,
+        modifiers: a.modifiers, timeoutMs: a.timeout_ms, settleMs: a.settle_ms,
+      });
+
+      // File input — CDP DOM.setFileInputFiles (the only route a page cannot fake).
+      case "page.uploadFile": return this.ctrl.uploadFile(a.target ?? a.selector ?? { css: 'input[type="file"]' }, a.path ?? a.paths ?? a.file, {
+        scope: a.scope, fallback: a.fallback, timeoutMs: a.timeout_ms,
+      });
+
+      // Viewport — pin the CSS viewport so a responsive layout cannot flip under the
+      // agent mid-task. Emulation only; the OS window is untouched.
+      case "page.setViewport": {
+        const r = await this.ctrl.setViewport(a.width, a.height);
+        const s = this.sm.getActive();
+        // Keep the session's pinned size in step, or session.status would report the
+        // new viewport as drift the moment it was applied.
+        if (s && r.ok) {
+          const actual = (r as any).result?.browser_viewport;
+          s.config = { ...s.config, viewportWidth: actual?.width ?? a.width, viewportHeight: actual?.height ?? a.height };
+        }
+        return r;
+      }
 
       // Probe — cheap, non-mutating "what matches now?" (P1-B)
       case "page.probe": return this.probeTarget(a);
@@ -456,7 +579,7 @@ export class ToolRouter {
       case "extract.text": return this.extText(a);
 
       // Safety
-      case "human.takeover": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); await this.setControlLock(false); return { ok: true, status: "needs_human", message: a.message || "Human intervention required. The blue overlay is off and the page is yours.", session_id: s.id, hint: "Interact freely, then call session.resume to hand the browser back to the model." }; }
+      case "human.takeover": { const s = this.sm.getActive(); if (!s) return this.noSess(); await this.sm.pause(); if (s.engine) await s.engine.bringToFront().catch(() => {}); await this.setControlMode("awaiting"); return { ok: true, status: "needs_human", message: a.message || "Human intervention required. The overlay is clear and the page is yours.", session_id: s.id, overlay: { mode: "awaiting", banner: "Input needed on Browser/TUI" }, hint: "Interact freely, then call session.resume to hand the browser back to the model." }; }
 
       default: return { ok: false, error: kruzError(ErrCode.UNKNOWN_TOOL, { subsystem: "router", message: `Unknown tool: ${name}`, trace: ["router"] }).toJSON() };
     }
@@ -466,18 +589,61 @@ export class ToolRouter {
 
   private async mkSession(a: Record<string, any>) {
     if (a.headless === true) return { ok: false, error: kruzError(ErrCode.HEADED_REQUIRED, { subsystem: "session", message: "Kruz sessions require a visible browser. Use headless:false.", trace: ["router"] }).toJSON() };
+
+    // Attach to an ALREADY-RUNNING browser over CDP instead of launching one.
+    // This is the only path that keeps the user's real Chrome reputation: Google
+    // classifies a Puppeteer-LAUNCHED profile as automation and rejects sign-in with
+    // "This browser or app may not be secure" even when a human types the credentials
+    // by hand, because the rejection is transport-level and in-page stealth cannot
+    // reach it. An attached daily-driver carries real profile history instead.
+    // Start Chrome yourself with --remote-debugging-port=9222 and pass the endpoint.
+    if (a.cdp_url || a.attach || a.cdp_endpoint) {
+      const endpoint = String(a.cdp_url ?? a.cdp_endpoint ?? a.attach);
+      const attached = await this.ctrl.attachBrowser(endpoint);
+      if (!attached.ok) return attached;
+      if (a.startup_url) await this.ctrl.open(a.startup_url).catch(() => {});
+      return { ...attached, result: { ...(attached as any).result, mode: "attached", viewport_pinned: false, note: "Driving an existing browser. session.close disconnects from it — it does not close the user's browser." } };
+    }
     const reused = this.sm.isCreating || !!this.sm.getActive()?.engine?.connected;
     if (!reused) this.ctrl.clearCapture();
     const s = await this.sm.create({ headless: a.headless, profileDir: a.profile_dir, viewportWidth: a.viewport_width, viewportHeight: a.viewport_height, userAgent: a.user_agent, locale: a.locale, proxy: a.proxy, downloadDir: a.download_dir, startupUrl: a.startup_url });
-    if (!reused && s.engine && (a.viewport_width || a.viewport_height)) {
-      const w = a.viewport_width || s.config.viewportWidth;
-      const h = a.viewport_height || s.config.viewportHeight;
+    // Viewport reconciliation (DEF-5).
+    //
+    // This block used to be gated on `(a.viewport_width || a.viewport_height)`, so
+    // the WHOLE read-back — the measurement, the warning, and the assignment of the
+    // measured value into s.config — was skipped whenever the caller omitted the
+    // optional arguments, i.e. on the documented default path. s.config then kept
+    // the *requested* default forever, so session.create and server.info reported a
+    // viewport that had never been compared against the browser. Measured: reported
+    // 1280x720 while the page was 1920x912.
+    //
+    // The read-back is unconditional: truth is read on every fresh session, and the
+    // response reports both the request and what the browser actually gave.
+    let viewportRequested: { width: number; height: number } | undefined;
+    if (!reused && s.engine) {
+      // Pin the CSS viewport on every fresh session — but pin it at the size the
+      // window ALREADY has, not at the config default.
+      //
+      // Pinning is the fix for drift: a session created at 1536x730 was serving a
+      // 936px MOBILE layout minutes later because the user un-maximized the window,
+      // the responsive "Create design" menu was then not rendered at all, and there
+      // was no tool to recover except closing the session and losing the tabs.
+      // Emulation.setDeviceMetricsOverride does not touch the OS window, so pinning
+      // is not a resize of the user's desktop.
+      //
+      // Measuring first matters: defaulting the pin to the 1280x720 config value
+      // would have silently narrowed every session below its real width, which is a
+      // layout change the caller never asked for and can itself cross a breakpoint.
+      const live0 = await s.engine.viewportSize().catch(() => null);
+      const w = a.viewport_width || live0?.width || s.config.viewportWidth;
+      const h = a.viewport_height || live0?.height || s.config.viewportHeight;
+      viewportRequested = { width: w, height: h };
       await s.engine.setViewportSize(w, h).catch(() => {});
       const actual = await s.engine.viewportSize().catch(() => null);
       const actualW = actual?.width ?? w;
       const actualH = actual?.height ?? h;
       if (actualW !== w || actualH !== h) {
-        process.stderr.write(`[kruz] K8: Viewport requested ${w}x${h} but Chrome returned ${actualW}x${actualH}. This is normal on headed Windows (title bar offset).\n`);
+        process.stderr.write(`[kruz] Viewport requested ${w}x${h} but Chrome reports ${actualW}x${actualH}. This is normal on headed Windows (title bar offset, display scaling).\n`);
       }
       s.config = { ...s.config, viewportWidth: actualW, viewportHeight: actualH };
     }
@@ -487,16 +653,32 @@ export class ToolRouter {
     const pageId = await this.activePageId();
     this.pageIdCache = pageId ?? null;
     // The control layer is injected over CDP and re-applies
-    // on every navigation. Installed hidden: the blue overlay + input lock
-    // engage only around mutating tool calls (route()), so the window is clean
-    // whenever the model is not acting.
+    // on every navigation. Its banner is persistent — it always states which of
+    // the three states the browser is in — while the blue glow and the input
+    // lock engage only around mutating tool calls (route()).
     const indicator = a.control_indicator !== false;
     if (indicator) {
       await (s.engine as any)?.installControlIndicator?.()?.catch?.(() => {});
-      // The layer lives for the whole session, but the overlay is shown only
-      // while the model operates (see beginControl/endControl heartbeat).
+      // The layer comes up immediately in the thinking state: this session was
+      // just created, so the model is engaged but has no call in flight. The
+      // blue glow and input lock still engage only around tool calls
+      // (see beginControl/endControl heartbeat).
+      await this.setControlMode("thinking");
     }
-    return { ok: true, reused, ...(reused ? { message: "Reused the existing session; launch options and startup_url were not applied. Use page.open to navigate, or session.close before changing launch settings." } : {}), session_id: s.id, status: s.status, control_indicator: indicator, browser: { headless: s.config.headless, viewport: { width: s.config.viewportWidth, height: s.config.viewportHeight } }, page_id: pageId, url };
+    // `browser.viewport` is the MEASURED viewport, reconciled on every fresh session.
+// `browser.viewport_requested` is what was asked for, so a caller can see the gap
+// instead of having to trust one number or guess which one it is (DEF-5).
+    return {
+      ok: true, reused,
+      ...(reused ? { message: "Reused the existing session; launch options and startup_url were not applied. Use page.open to navigate, or session.close before changing launch settings." } : {}),
+      session_id: s.id, status: s.status, control_indicator: indicator,
+      browser: {
+        headless: s.config.headless,
+        viewport: { width: s.config.viewportWidth, height: s.config.viewportHeight },
+        ...(viewportRequested ? { viewport_requested: viewportRequested } : {}),
+      },
+      page_id: pageId, url,
+    };
   }
 
   private async status() {
@@ -505,7 +687,27 @@ export class ToolRouter {
     const bc = this.ctrl.isBrowserConnected();
     const tabs = s.engine ? await s.engine.listTabs().catch(() => [] as any[]) : [];
     const activePageUrl = s.engine ? await s.engine.url().catch(() => "about:blank") : "about:blank";
-    return { ok: true, session_id: s.id, status: bc ? s.status : "crashed", created_at: s.createdAt, browser_connected: bc, active_page: activePageUrl, pages: tabs.length, navigation_trace: this.sm.getTrace(s.id).slice(-10) };
+    // Re-measure the viewport instead of echoing the creation snapshot. The log's
+    // top bug was that this number went stale: created at 1536x730, serving a
+    // 936px MOBILE layout minutes later, with no tool to recover from. Comparing
+    // the live value against the pinned one turns "the control vanished" into
+    // "the viewport moved", which is actionable.
+    const live = s.engine ? await s.engine.viewportSize().catch(() => null) : null;
+    const pinnedW = s.config?.viewportWidth;
+    const pinnedH = s.config?.viewportHeight;
+    const drifted = !!live && typeof pinnedW === "number" && typeof pinnedH === "number"
+      && (live.width !== pinnedW || live.height !== pinnedH);
+    if (drifted && live) {
+      process.stderr.write(`[kruz] Viewport drifted: pinned ${pinnedW}x${pinnedH}, live ${live.width}x${live.height}. Something cleared the Emulation override — call page.setViewport to re-pin.\n`);
+    }
+    return {
+      ok: true, session_id: s.id, status: bc ? s.status : "crashed", created_at: s.createdAt,
+      browser_connected: bc, active_page: activePageUrl, pages: tabs.length,
+      browser_viewport: live,
+      viewport_requested: typeof pinnedW === "number" ? { width: pinnedW, height: pinnedH } : undefined,
+      viewport_drifted: drifted,
+      navigation_trace: this.sm.getTrace(s.id).slice(-10),
+    };
   }
 
   private async obs(a: Record<string, any>) {
@@ -530,11 +732,22 @@ export class ToolRouter {
     }
     const engine = this.sm.getActiveEngine();
     if (!engine) return this.noSess();
+    const tClick0 = Date.now();
+    const tC0 = Date.now();
+    // captureClickState returns {tabs, state} — the baseline that pageFeedback must
+    // be diffed against is `before.state`. Passing `before` itself type-checks (it is
+    // an object) and yields an EMPTY baseline, because every field it looks for lives
+    // one level down. Every diff then compared the page against itself: url_changed
+    // and document_changed were always false on a click that had navigated, and only
+    // dom_changed survived, because signature did not exist on the wrapper.
     const before = await captureClickState(engine);
+    const timing = { capture_ms: Date.now() - tC0, dispatch_ms: 0, complete_ms: 0, feedback_ms: 0, total_ms: 0 };
     const finish = async (response: any) => {
       if (!response.ok || response.result?.dialog_pending) return response;
       try {
+        const tF0 = Date.now();
         const completion = await completeClick(engine, before, { ...a, effect_token: response.result?.effect_token });
+        timing.complete_ms = Date.now() - tF0;
         return { ...response, result: { ...response.result, ...completion } };
       } catch (error) {
         return { ...response, result: { ...response.result, clicked:true, verified:false, completion_error:String(error), retry_safe:false } };
@@ -559,13 +772,21 @@ export class ToolRouter {
     //      (refs are invalidated by the DOM churn an overlay removal causes), retry
     //   3. a transient re-render race -> re-observe to refresh refs, retry
     //   4. final dispatch attempt
-    const dispatch = (overrides: Record<string, any> = {}) =>
-      this.ctrl.click(a.target, a.fallback, a.scope, a.timeout_ms, a.strict, a.button, a.click_count, {
+    const dispatch = (overrides: Record<string, any> = {}) => {
+      const tD0 = Date.now();
+      const p = this.ctrl.click(a.target, a.fallback, a.scope, a.timeout_ms, a.strict, a.button, a.click_count, {
         force: a.force || overrides.force,
         ignoreVisibility: a.ignore_visibility,
         visual: overrides.visual ?? a.visual,
         speed: overrides.speed ?? a.speed,
+        // Held across the whole click: shift-click / ctrl-click multi-select in
+        // canvas and list editors cannot be expressed by a key combo.
+        modifiers: a.modifiers,
       });
+      // Accumulates across recovery-ladder attempts, so the number shows how much
+      // of a slow click was genuine dispatch versus escalation.
+      return p.finally(() => { timing.dispatch_ms += Date.now() - tD0; });
+    };
 
     const reobserve = async (): Promise<boolean> => {
       const s = this.sm.getActive();
@@ -625,6 +846,17 @@ export class ToolRouter {
     }
 
     const settled = await finish({...response, ...(overlays ? {overlay_handling:overlays} : {}), ...(visualFallback ? {visual_fallback:visualFallback} : {})});
+    // Where the time went. Observe already reports `timing`; a slow click is the
+    // single most-reported latency in browser control, and without this split a
+    // 2s click is indistinguishable from a 2s click.
+    //
+    // The controller's own fields (resolve_ms / action_ms / verify_ms) are
+    // SPREAD rather than replaced: `timing.resolve_ms` is a documented contract
+    // and nesting it would break every existing reader. `total_ms` is the one
+    // field that must be overridden — the router's total also covers the
+    // pre-dispatch capture and the post-click verification poll.
+    const ctrlTiming = (settled as any)?.timing;
+    settled.timing = { ...(ctrlTiming && typeof ctrlTiming === "object" ? ctrlTiming : {}), ...timing, total_ms: Date.now() - tClick0 };
     // BUG-009: page.click was the only action tool that returned `result` instead of
     // the compact post-action `state` that press/fill/select/scroll all provide. The
     // skill documents `state` as the closed loop ("use it to decide the next step
@@ -639,9 +871,12 @@ export class ToolRouter {
     // reports this session. `result` keeps everything for backward compatibility.
     if (settled.ok !== true || !engine) return settled;
     let clickState: unknown = null;
+    const tB0 = Date.now();
     try {
-      clickState = await this.ctrl.pageFeedback(engine, this.stateOf(before), { includeLists: false });
+      clickState = await this.ctrl.pageFeedback(engine, this.stateOf((before as any)?.state), { includeLists: false });
     } catch { /* state is advisory; never fail a click over it */ }
+    timing.feedback_ms = Date.now() - tB0;
+    settled.timing = { ...(ctrlTiming && typeof ctrlTiming === "object" ? ctrlTiming : {}), ...timing, total_ms: Date.now() - tClick0 };
     if (!clickState) return settled;
     return { ...settled, state: clickState, ...hoistResult(settled.result, ["clicked", "verified", "verification", "effect_observed", "navigation", "url", "title", "resolution_tier", "effect_token", "ref"]) };
   }
@@ -701,14 +936,35 @@ export class ToolRouter {
         // tab across navigate/observe/click. It was absent here, which is what
         // made the id look like it lived in two namespaces ("p1" vs "tab-1").
         if (result && result.ok && result.result && result.result.page_id === undefined) {
-          result.result.page_id = await this.activePageId();
+          // Bounded via the shared helper — see boundedActivePageId. This call was
+          // unbounded and alone accounted for >51s of a 55s route budget.
+          // Only set the id when we actually got one: a timed-out probe must not
+          // replace a missing id with a misleading null.
+          const resolvedId = await this.boundedActivePageId();
+          if (resolvedId !== null) result.result.page_id = resolvedId;
         }
         // page_id also rides the top level via diagnostics(), so `r.page_id`
         // works here exactly as it does on session.create / page.observe.
         return result;
       }
       // A non-crash failure is terminal — do not burn the retry budget.
-      if (result.error?.code !== ErrCode.BROWSER_CRASHED) throw kruzErrorFromThrown(result.error, { subsystem: "session" });
+      //
+      // `result.error` is already a KruzError ENVELOPE ({code, message, ...}), not a
+      // thrown Error. Feeding it to kruzErrorFromThrown made the classifier run
+      // String(err) on a plain object, which is "[object Object]" — it matched no
+      // pattern and collapsed to the CLICK_FAILED default. A navigation failure
+      // therefore reported `CLICK_FAILED: [object Object]` (observed live on a
+      // disconnected browser), which is both the wrong code and an unreadable message.
+      // Re-wrap the envelope with its own code instead of re-deriving it.
+      if (result.error?.code !== ErrCode.BROWSER_CRASHED) {
+        throw kruzError(result.error?.code ?? ErrCode.OPERATION_FAILED, {
+          subsystem: "session",
+          message: result.error?.message ?? `Navigation to ${url} failed.`,
+          retryable: result.error?.retryable,
+          help: result.error?.help,
+          cause: result.error,
+        });
+      }
       throw kruzError(ErrCode.BROWSER_CRASHED, { subsystem: "session", message: result.error?.message ?? "Browser disconnected during navigation.", cause: result.error });
     };
 
@@ -753,14 +1009,60 @@ export class ToolRouter {
     return this.pageIdCache;
   }
 
-  /** Refresh the cached tab id after an operation that may have changed it. */
-  private async refreshPageId(): Promise<void> { await this.activePageId().catch(() => {}); }
+  /** Refresh the cached tab id after an operation that may have changed it.
+   *
+   *  Bounded, because it runs on failure paths too — including immediately after
+   *  a route timeout, where the browser may be exactly the thing that is stuck.
+   *  An unbounded `listTabs()` here would trade a reported timeout for a hung
+   *  route, which is strictly worse. */
+  private async refreshPageId(): Promise<void> {
+    await this.boundedActivePageId();
+  }
 
-  /** Run a tab-mutating call, then re-read which tab is active. */
+  /**
+   * `activePageId()` with a hard ceiling, shared by EVERY caller.
+   *
+   * This exists because the bound was previously applied at one call site
+   * (`refreshPageId`) and forgotten at its sibling in `openWithRetry`, which called
+   * `activePageId()` bare. `activePageId()` reaches `engine.listTabs()`, which calls
+   * raw `page.title()` per tab — and `Page.getTitle` hangs indefinitely on a tab
+   * whose navigation is still in flight, which is precisely the state right after a
+   * `page.open` goto timeout.
+   *
+   * The measured consequence was severe and entirely self-inflicted: a `page.open`
+   * that had already finished correctly in 4.3s (ok:true, _warning:PAGE_NOT_READY)
+   * spent >51s inside this one decoration, overran the router's 55s route budget,
+   * and was reported to the agent as ACTION_TIMEOUT with `outcome:"unknown"` and
+   * `retry_safe:false` — i.e. the agent could no longer tell whether the navigation
+   * had happened at all. A tab id is decoration; it must never be able to convert a
+   * known answer into an unknown one.
+   *
+   * Returns null on expiry rather than leaving a dangling id in the response.
+   */
+  private async boundedActivePageId(ms = 1500): Promise<string | null> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        this.activePageId().catch(() => null),
+        new Promise<string | null>((r) => { timer = setTimeout(() => r(null), ms); timer.unref?.(); }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Run a tab-mutating call, then re-read which tab is active.
+   *
+   *  `finally`, not "after success": a tab op that throws or hangs may still have
+   *  switched the engine's active page before failing (switchTab assigns
+   *  `_page` before its focus ping), and a cache that only refreshes on success
+   *  then reports the OLD tab on the very response that most needed the new one. */
   private async tabOp<T>(fn: () => Promise<T>): Promise<T> {
-    const r = await fn();
-    await this.refreshPageId();
-    return r;
+    try {
+      return await fn();
+    } finally {
+      await this.refreshPageId();
+    }
   }
 
   /**

@@ -164,7 +164,12 @@ export class SessionManager {
       if (graceful && session.engine) {
         await closeBrowser(session.engine);
       } else if (session.engine) {
-        await session.engine.close();
+        // Hard close. This previously called engine.close(), which closes only the
+        // ACTIVE TAB and leaves the browser process — and every other tab — running.
+        // Chrome then kept holding the --user-data-dir lock and the next
+        // session.create failed with BROWSER_LAUNCH_FAILED. A forced close has to
+        // release the profile, so terminate the process (E-015).
+        await session.engine.terminate();
       }
     } catch {
       // Ignore close errors

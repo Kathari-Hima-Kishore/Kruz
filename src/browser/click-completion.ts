@@ -82,17 +82,23 @@ export async function completeClick(engine: BrowserEngine, before: Awaited<Retur
       // The clicked element disappeared, or its overlay/dialog root did. This is
       // the generic dismissal case: no navigation, no body-text change, and yet an
       // unmistakable browser-level effect.
+      //
+      // `navigation` is reported from the tracked flag rather than hardcoded. A link
+      // whose element vanishes BECAUSE the page navigated is a navigation, and
+      // claiming `none_observed` for it is exactly what made a successful
+      // example.com -> iana.org click look like a no-change click.
+      const nav = navigation ? 'completed' : 'none_observed';
       if (token && !options.wait_until && effect && effect.present === false) {
-        return {clicked:true,verified:true,verification:'target_disappeared',effect_observed:true,navigation:'none_observed',url:last.url,title:last.title,page_id:newTabId??activeId};
+        return {clicked:true,verified:true,verification:'target_disappeared',effect_observed:true,navigation:nav,url:last?.url,title:last?.title,page_id:newTabId??activeId};
       }
       if (token && !options.wait_until && effect && effect.present === true && effect.visible === false) {
-        return {clicked:true,verified:true,verification:'target_hidden',effect_observed:true,navigation:'none_observed',url:last.url,title:last.title,page_id:newTabId??activeId};
+        return {clicked:true,verified:true,verification:'target_hidden',effect_observed:true,navigation:nav,url:last?.url,title:last?.title,page_id:newTabId??activeId};
       }
       if (token && !options.wait_until && effect && effect.container_visible === false) {
-        return {clicked:true,verified:true,verification:'overlay_disappeared',effect_observed:true,navigation:'none_observed',url:last.url,title:last.title,page_id:newTabId??activeId};
+        return {clicked:true,verified:true,verification:'overlay_disappeared',effect_observed:true,navigation:nav,url:last?.url,title:last?.title,page_id:newTabId??activeId};
       }
       if(!navigation && !options.wait_until && options.wait_for!=='navigation' && Date.now()>=discoveryDeadline) {
-        return {clicked:true,verified:false,navigation:'none_observed',url:last.url,
+        return {clicked:true,verified:false,navigation:'none_observed',url:last?.url,
           ...(token ? {unverified_reason: effect && effect.present ? 'the clicked element and its overlay are still present, and nothing else on the page changed' : 'no observable change was detected within the discovery window'} : {})};
       }
     }

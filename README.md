@@ -6,7 +6,7 @@ A reliable, verification-first MCP server that gives AI agents a **visible Chrom
 |---|---|
 | **Version** | 1.7.1 |
 | **Transport** | stdio (MCP JSON-RPC) |
-| **Tools** | 49 registered |
+| **Tools** | 53 registered |
 | **Engine** | `puppeteer-core` + Chrome DevTools Protocol |
 | **Node** | >= 18 |
 | **License** | MIT |
@@ -21,7 +21,7 @@ A reliable, verification-first MCP server that gives AI agents a **visible Chrom
 
 ## What It Does
 
-Kruz launches a visible Chrome profile and exposes **49 tools** that let an agent navigate, observe, click, fill, select, extract, evaluate JavaScript, capture network responses, and run ATS (job-board) workflows across real sites — including Workday, Oracle HCM, iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters, SuccessFactors, Phenom, Taleo, Avature, and Eightfold career portals.
+Kruz launches a visible Chrome profile and exposes **53 tools** that let an agent navigate, observe, click, drag, fill, upload, select, extract, evaluate JavaScript, capture network responses, and run ATS (job-board) workflows across real sites - including Workday, Oracle HCM, iCIMS, Greenhouse, Lever, Ashby, SmartRecruiters, SuccessFactors, Phenom, Taleo, Avature, and Eightfold career portals.
 
 Four properties define Kruz:
 
@@ -80,7 +80,7 @@ npm test           # vitest run
 
 ---
 
-## Tools (49 registered)
+## Tools (53 registered)
 
 `KNOWN_TOOLS` (in `src/mcp/tool-names.ts`) is the single source of truth, enforced at startup against the actual registrations. MCP `tools/list` and the `kruz://tools` resource report the same set.
 
@@ -88,8 +88,8 @@ npm test           # vitest run
 | Tool | Purpose |
 |---|---|
 | `server.info` | Server/session/config diagnostics (no session needed) |
-| `session.create` | Create or reuse the headed Chrome session |
-| `session.status` | Session state, tabs, navigation trace |
+| `session.create` | Create or reuse the headed Chrome session. `browser.viewport` is the **measured** viewport (`window.innerWidth/innerHeight`); `browser.viewport_requested` is what was asked for. The viewport is **pinned** at the measured size so it cannot drift. `cdp_url` attaches to an already-running Chrome instead of launching one |
+| `session.status` | Session state, tabs, navigation trace, **live** `browser_viewport` + `viewport_drifted` |
 | `session.close` | Close the browser |
 | `session.pause` | Release control for manual work (login/CAPTCHA/2FA) |
 | `session.resume` | Hand control back to the model |
@@ -98,10 +98,17 @@ npm test           # vitest run
 `page.open` · `page.newTab` · `page.switchTab` · `page.listTabs` · `page.closeTab`
 
 ### Observation
-`page.observe` (scope + `detail`: `minimal` | `standard` | `full`) · `page.computerUseList` · `page.computerUseSnapshot`
+`page.observe` (scope + `detail`: `minimal` | `standard` | `full`) · `page.computerUseList` · `page.computerUseSnapshot` · `page.probe`
+
+### Vision
+`page.screenshot` — viewport, `full_page`, or a single element (`target`). Returns the real image as an MCP image content block for visual analysis (not OCR), plus `mime_type` / `width` / `height` / `bytes` / `mode` / `ref`. Captures are in **device pixels**; use `type: "jpeg"` for full-page.
 
 ### Clicking & input
-`page.click` · `page.clickAt` · `page.fill` · `page.press` · `page.select` · `page.check` · `page.uncheck` · `page.scroll` · `page.paginate` · `page.wait`
+`page.click` (with `modifiers` for shift/ctrl-click) · `page.clickAt` · **`page.drag`** · `page.fill` · `page.press` · `page.select` · `page.check` · `page.uncheck` · `page.scroll` · `page.paginate` · `page.wait` · **`page.setViewport`** · **`page.uploadFile`**
+
+- **`page.drag`** — trusted press→move→release between two `{x,y}` points or two targets, with real per-step timing (custom drag engines ignore a same-task gesture). `mode: "html5"` for the HTML5 drag API, with the `DataTransfer` payload seeded explicitly via `data`. Reports `verified` + `verification: navigation | dom_change | no_change`, and a drop that changed nothing returns `verified: false` with a reason rather than a false success.
+- **`page.setViewport`** — pin the CSS viewport (CDP device metrics; the OS window is untouched) so a responsive layout cannot flip under the agent. Preserves the device scale factor, so element captures stay in device pixels.
+- **`page.uploadFile`** — `DOM.setFileInputFiles` + change event. The only route a page cannot fake; the input may be `display:none`.
 
 ### Page interaction
 `page.handleOverlays` · `page.dialog` · `page.evaluate` · `page.frameObserve` · `page.frameEvaluate` · `extract.text`
@@ -197,6 +204,83 @@ Identity is compared **after URL resolution**: Kruz records both the raw `href` 
 
 Refs are scoped to a document. A ref minted in document A is refused in document B (`DOCUMENT_CHANGED`) even when the new page has a same-named element — that is a decoy, and it is never acted on for you.
 
+Recorded paths are built as **child chains** (`section > div > a:nth-of-type(2)`), not descendant chains. This matters: `:nth-of-type` is only emitted where an element has same-tag siblings, so a run of lone-child `div`s contributes bare `div` segments — joined as descendants those fan out and the "unique" path matches many nodes, which silently defeats tier 1 and pushes every ref onto name matching. On `makerbazar.in` the descendant form matched 4 unrelated anchors; the child form matches exactly 1.
+
+Successful actions report **`resolution_tier`** — `1` means the exact node was pinned, `0` that the target was resolved without the ref ladder (e.g. a `text` target). Tier 1 is the guarantee; tier 0 works but is weaker evidence about *which* element was hit.
+
+---
+
+## Vision
+
+`page.screenshot` returns the **actual pixels** as an MCP image content block — for image *analysis*, not OCR. The model receives the image and interprets it.
+
+```json
+{"type": "jpeg", "quality": 70}                        // viewport
+{"full_page": true, "type": "jpeg", "quality": 60}     // whole page
+{"target": {"ref": "e81"}, "type": "png"}             // one element
+{"target": {"css": ".collection-item"}, "path": "dump/card.png"}   // + keep a copy
+```
+
+This closes a real gap: the engine has always had `screenshot()` and `screenshotElement()`, but the tool was never registered — deleted on the reasoning that *"text-model runs never look at pixels"*, which was a claim about consumers rather than about the code. Vision-capable models are now the norm.
+
+**Captures are returned in DEVICE pixels** (`client rect × devicePixelRatio`) for both viewport and element modes — on a `dpr 1.25` display a `238×250` CSS card captures as `298×313`. Comparing a device-pixel capture against a CSS-pixel rect looks like a bug and is not one.
+
+Because `page.clickAt` takes **CSS** pixels, every capture declares its own coordinate space so the conversion is arithmetic rather than guesswork:
+
+```json
+"scale": 1.25, "viewport_css": { "width": 1536, "height": 730 },
+"image_space": "device_px", "target_space": "css_px"     // DOM coords = image coords / scale
+```
+
+Passing image pixels straight to `clickAt` hits a different element; a hit-test on
+Canva returned an unrelated `<h5>` instead of the intended chip. And `scale` is not
+stable across a session — another agent resizing the window changes it.
+
+Element captures echo the `ref` they used, so a visual finding can be clicked with no second resolve. `dump/` is a gitignored scratch folder for keeping captures.
+
+---
+
+## Human-in-the-loop indicator
+
+A persistent **top-left banner** states which of three states the browser is in; only
+the glow changes, and the banner itself never disappears.
+
+| State | Glow | Banner text | Input |
+|---|---|---|---|
+| `controlling` | blue, pulsing | `Controlled by Kruz` | locked |
+| `thinking` | amber, no pulse | `Model is thinking` | interactive |
+| `awaiting` | none | `Input needed on Browser/TUI` | interactive |
+
+A virtual cursor (blue state only) shows where the next action will land.
+
+**How the states are driven.** A page-side watchdog ticks every 50 ms off two clocks:
+`lastPing` (is a call in flight? → blue, within ~650 ms) and `lastEngaged` (did the
+model act recently? → amber within 20 s, clear after that). So the clear state happens
+on its own when the model's turn ends and nothing calls `session.pause` — the normal
+TUI case. `session.pause` / `human.takeover` set it immediately and report it as
+`overlay: {mode: "awaiting", banner: "..."}`; `session.resume` returns to amber.
+
+State has one mechanism: a heartbeat the page's own watchdog expires. There is no paired
+on/off call, so nothing can switch it off mid-call, and a crashed or hung server cannot
+strand it on. A duplicated server-side "force it off" call used to race the heartbeat and
+darken an in-flight call; it was removed, which also dropped a CDP round-trip from every
+call. A ping clears any explicit `awaiting` claim, so the banner can never claim it needs
+input while the model is working.
+
+Measured on a live session, 600 samples at 50 ms:
+
+```
+    54–  699ms  controlling   action in flight
+   753– 2505ms  thinking      heartbeat lapsed
+  2551– 5004ms  awaiting      session.pause
+  5052–25014ms  thinking      session.resume
+ 25062–30013ms  awaiting      auto-promoted, NO call made
+```
+
+A new document starts at `thinking` (the layer reinstalls with no heartbeat yet) and is
+promoted to blue on the next ping after a navigation. Lifecycle tools (`session.*`,
+`server.info`, `human.takeover`) never raise blue; they drive the banner explicitly.
+
 ---
 
 ## Action Semantics & Reliability
@@ -215,6 +299,19 @@ Refs are scoped to a document. A ref minted in document A is refused in document
 ### Recovery ladders
 - **click**: `dismiss-overlays` → `re-observe` → `visual-click`
 - **open**: `recreate-session` on `BROWSER_CRASHED`
+- **fill**: `re-observe-and-fill`
+
+When a fill recovers through its ladder the success is marked, so a caller can tell a
+straight write from a recovered one:
+
+```json
+{"ok": true, "recovered_by": "re-observe-and-fill", "result": {"value_written": true}}
+```
+
+This is a correctness fix, not a cosmetic one. The ladder's action used to re-throw
+unconditionally, so once its escalation had genuinely written the value, Kruz still
+reported a **failure** — telling the caller a field had not taken when it had, and
+inviting a retry that writes it twice. An escalation that wrote now reports success.
 - **type / fill**: `re-observe` → direct fill
 
 ### Error envelope
@@ -261,13 +358,95 @@ false bug reports against fields that were present and correct.
 
 **Retryable** (the same call may succeed shortly): `NO_SESSION`, `BROWSER_CRASHED`, `ELEMENT_OBSCURED`, `ELEMENT_NOT_VISIBLE`, `ELEMENT_DISABLED`, `STALE_ELEMENT`, `ACTION_TIMEOUT`, `NO_MATCH`, `INTERNAL_ERROR`.
 
-**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `NO_TAB`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `OVERLAY_NO_DISMISS_INTENT`.
+One deliberate exception: a `ROUTE_TIMEOUT` response reports `retryable: false` next to
+`retry_safe: false`, overriding the `ACTION_TIMEOUT` default above. Completion is
+*unknown* and work may still be running — a blind replay double-submits. Observed live:
+a click that timed out had in fact succeeded and opened a new tab. Inspect with
+`page.observe` or `session.status` before retrying.
+
+**Non-retryable** (replaying cannot work — reconsider or re-declare): `TARGET_NOT_FOUND`, `AMBIGUOUS_TARGET`, `STALE_REFERENCE`, `DOCUMENT_CHANGED`, `UNKNOWN_REFERENCE`, `CONDITION_NOT_MET`, `INVALID_TARGET`, `INVALID_INPUT`, `NO_TAB`, `UNKNOWN_TOOL`, `ELEMENT_NOT_FOUND`, `ELEMENT_NOT_EDITABLE`, `OVERLAY_NO_DISMISS_INTENT`, `FILL_NOT_RETAINED`.
+
+`FILL_NOT_RETAINED` means the field accepted the input event but did not keep the value — a script handler rejected or reformatted it. It is deliberately distinct from `CLICK_FAILED`: `force:true` and overlay checks are click remedies and are wrong here. If the app commits on blur, follow the fill with `page.press({key:"Tab"})` or `Enter`; for controlled inputs, fill one field at a time.
 
 > The same taxonomy, with recovery recipes, is in [`SKILL.md`](./SKILL.md) — that is what
 > agents read at runtime.
 
+### One Kruz per project: the single-instance contract
+
+This host (`opencode.jsonc` → `"Kruz": { cwd: "D:/project prototypes/Kruz" }`) spawns
+**one Kruz per project**, and every instance shares one ownership record, because the
+server's working directory is always the install directory.
+
+OpenCode restores **every workspace at once**, so a cold start spawns one Kruz per
+project within a few milliseconds of each other. Two failure modes came out of that,
+both fixed:
+
+1. **The kill-storm (the startup bug).** Under "newest wins", a newcomer terminated any
+   live server. On a simultaneous cold start they terminated *each other*, and the
+   killed spawns exited with code 1 — shown in `/mcp` verbatim as
+   `MCP server process exited with code 1: [kruz] single-instance: KRUZ_TAKEOVER=1 —
+   terminating live Kruz server pid=...`. A manual `/mcp` retry appeared to "fix" it
+   because the retry spawns a fresh process that wins the race. A newcomer now **leaves
+   a live owner alone and serves alongside it**; takeover terminates only a *recorded*
+   predecessor, never one merely inferred from a process scan (verified by
+   `dump/coldstart-verify.mjs`, which launches three servers in the same instant).
+2. **Killing the wrong process.** The record holds a pid, and Windows recycles pids, so
+   a record surviving a crash can later name an unrelated program. Kruz verifies the
+   command line *and* the OS start time before ever signalling, and treats an
+   unreadable identity as "do not kill". Not theoretical: a plain `node -e` process
+   recorded as the predecessor was SIGKILLed by the old code.
+
+The rules that now hold:
+
+- **Coexisting servers do not fight.** Several Kruz processes may be alive (one per
+  open workspace); the single-writer Chrome profile is what actually serialises the
+  browser, enforced at `session.create`.
+- **One browser owner.** A process becomes the record's owner only when no live owner
+  already exists. The owner reaps orphaned Chrome (and only when no peer is alive).
+- **`KRUZ_TAKEOVER=1`** restores destructive newest-wins — it terminates a *recorded*
+  predecessor. It no longer causes a cold-start error, because an unrecorded peer is
+  never a kill target; if you genuinely prefer one process and see a stray loser exit,
+  that is the price of newest-wins, not a crash.
+- **`KRUZ_SINGLE_INSTANCE=0`** disables the guard entirely.
+
+**To run Kruz in two projects at once, give each its own profile.** This is not
+optional — it was measured, not assumed (`dump/mcp-server-verify.mjs`):
+
+| Configuration | Result |
+|---|---|
+| Two sessions, **same** `profile_dir` | 2nd fails `BROWSER_LAUNCH_FAILED` — Chrome enforces a single-writer lock on a user-data-dir. |
+| Two sessions, **distinct** `profile_dir` | Both launch, both stay independently responsive. |
+
+So per project, give that project's Kruz entry its own `BROWSER_PROFILE_DIR` (e.g.
+`./browser-profile/<project>`) **and** `KRUZ_SINGLE_INSTANCE: "0"`. The trade-off is
+real and worth stating: separate profiles mean separate cookie jars, so logins are
+not shared between projects.
+
+### `BROWSER_LAUNCH_FAILED` — a locked profile, not necessarily a stale one
+
+`session.create` could not start Chrome on the profile. The profile is single-writer, so
+a second session cannot attach while another holds it. **Decide whether the holder is
+alive before killing processes** — the error message does not distinguish the two cases:
+
+| Lock holder | Correct action |
+|---|---|
+| **Orphan** — leftover Chrome with no session driving it | Kill the process tree. A separate `profile_dir` would *mask* the leak instead of fixing it. |
+| **Concurrent live session** — another agent is using Kruz right now | **Pass a separate `profile_dir`.** Killing the tree destroys real work, and that session's cookies and logins live in that profile. |
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+  Where-Object { $_.CommandLine -match 'Kruz\\browser-profile' } |
+  Select-Object ProcessId, ParentProcessId
+```
+
+A third cause is `session.close({ graceful: false })`, which used to close only the
+active tab and leave Chrome holding the lock — so the next `session.create` failed
+against a profile Kruz itself had orphaned. A hard close now terminates the browser
+process, so this case no longer arises from Kruz; `graceful: true` is still preferable
+because it preserves unsaved browser state.
+
 ### Timeouts
-25 s for most tools, 55 s for navigation-class tools (`session.create`, `page.open`, `page.reload`, `page.iCIMSSearch`, `ats.verifyPosting`).
+25 s for most tools, 55 s for navigation-class tools (`session.create`, `page.open`, `page.reload`, `page.iCIMSSearch`, `ats.verifyPosting`) and for `page.screenshot`, where a full-page capture of a long storefront outlasts the default.
 
 ### Timing
 Actions report their own server-side timing, so callers can spot a stall without wrapping
@@ -276,10 +455,11 @@ calls in external timestamps. Diagnostic metadata only — never a decision inpu
 | Tool | Fields |
 |---|---|
 | `page.probe` | `probe_ms` |
-| `page.open` | `_timing.total_ms` (+ `lifecycle_state`, `navigate_ms`, `poll_ms`) |
-| `page.click` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
+| `page.open` | `_timing.total_ms` (+ `lifecycle_state`, `navigate_ms`, `poll_ms`, `readiness_budget_ms`, `readiness_phase`) |
+| `page.click` | `timing.total_ms`, `capture_ms`, `dispatch_ms`, `complete_ms`, `feedback_ms` + `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.fill` | `timing.total_ms`, `resolve_ms`, `action_ms` |
 | `page.press` | `timing.total_ms`, `resolve_ms`, `action_ms`, `grace_ms` |
+| `page.drag` | `timing.total_ms`, `resolve_ms`, `action_ms`, `verify_ms` |
 | `page.clickAt` | `timing.total_ms`, `hit_test_ms`, `action_ms` |
 | `page.scroll` | `timing.total_ms`, `action_ms` |
 | `page.observe` | `timing.total_ms`, `generate_ms` |
@@ -289,11 +469,66 @@ calls in external timestamps. Diagnostic metadata only — never a decision inpu
 
 ## Human-in-the-loop
 
-- A **blue overlay** shows when Kruz is controlling the browser. It is **realtime**: a heartbeat (`ping`) keeps it visible only while a tool call is in flight. The moment the call ends — the model is back to thinking/deciding — the overlay turns itself off within ~650ms, even if the server process dies.
-- A **visible cursor** tracks every click and hover, so you can see exactly where the model is acting.
-- Page input is locked only while the overlay is alive; when it disappears the page is fully interactive again.
-- **`session.pause`** (or **`human.takeover`**) releases the lock and stands down for manual login/CAPTCHA/2FA; **`session.resume`** hands control back.
+- A **top-left banner** always shows what Kruz is doing: blue `Controlled by Kruz` while a tool call is in flight (plus a ~650 ms tail), amber `Model is thinking` between calls, and clear `Input needed on Browser/TUI` when a human is expected — automatically after 20 s of quiet, or immediately on `session.pause` / `human.takeover`.
+- A **visible cursor** tracks every click and hover while blue, so you can see exactly where the model is acting.
+- Page input is locked **only** while the banner is blue; in the amber and clear states the page is fully interactive again.
+- **`session.pause`** (or **`human.takeover`**) releases the lock and stands down for manual login/CAPTCHA/2FA; **`session.resume`** hands control back. Both report the state they set as `overlay: {mode, banner}`.
 - There is no automatic takeover button — pausing is model/client initiated and explicit.
+
+---
+
+## Performance
+
+Two flat costs dominated the original experience, and both are removed.
+
+### Navigation (the big one)
+
+`page.open` reported content as ready in ~7 ms but still cost **~20.2 s**, because the
+readiness guard awaited the navigation *lifecycle event* — `engine.navigate` capped at
+20 000 ms — instead of the content poll that had already answered. Readiness has always
+been content-based, so the lifecycle event was never needed to decide anything.
+
+The guard now polls content while the navigation settles in the background and returns
+as soon as the page is usable, and the leftover cleanup race dropped from 1500 ms to
+250 ms. Measured wall time on the reference storefront (`dump/speed-verify.mjs`):
+
+| Target | Before | After |
+|---|---|---|
+| `makerbazar.in` | ~20 200 ms | 1 300–2 500 ms |
+| `makerbazar.in/collections/…` | ~20 200 ms | 1 400–2 500 ms |
+| `example.com` | ~20 200 ms | 600–900 ms |
+
+**≈ 11–15× faster**, and no navigation now pays the lifecycle cap at all. The residual
+is genuine render time, not waiting.
+
+### Per-action floor
+
+`scrollHandleIntoView` slept 100 ms *before* its first stability comparison, so no
+click, fill or press could ever return sooner than 100 ms — charged on every action,
+including pages with no layout shift at all. The first probe is now after one frame
+(16 ms); only a rect that actually *moved* pays the full 100 ms to wait it out.
+
+Measured effect on a warm click (`dump/click-bench.mjs`): scroll step 127 ms → 47 ms,
+whole call 431 ms → 263 ms.
+
+### Where click time still goes
+
+`page.click` now reports its own split, which is the honest picture for a heavy
+storefront:
+
+| Phase | What it is | Typical |
+|---|---|---|
+| `capture_ms` | pre-click page snapshot | 10–80 ms |
+| `resolve_ms` | ref → live node + identity refresh | 80–800 ms (page-dependent) |
+| `action_ms` | visibility, scroll-settle, trusted dispatch | 80–1160 ms |
+| `complete_ms` | postcondition discovery window (≤1500 ms) | 150–1550 ms |
+| `feedback_ms` | post-action `state` | 2–10 ms |
+
+`resolve_ms` and `action_ms` vary with how busy the page's main thread is — a heavy
+Shopify homepage makes CDP evaluates queue — so they are measured per call rather than
+assumed. `complete_ms` is deliberately bounded: it is the verification that makes
+`verified: true` mean something, and shortening the discovery window trades correctness
+for latency.
 
 ---
 
@@ -337,7 +572,7 @@ Environment variables always override `config.json` (project root).
                         │  JSON-RPC over stdio
                         ▼
   src/index.ts  (entry, signals, global error handlers)
-      └─ createServer()  src/mcp/server.ts  ── 49 tools + 4 resources
+      └─ createServer()  src/mcp/server.ts  ── 53 tools + 4 resources
            ├─ ToolRouter  src/mcp/router.ts
            │    ├─ sanitizeToolName (tool-names.ts)
            │    ├─ timeouts · retry ladders · control-lock lifecycle
@@ -401,10 +636,48 @@ npm test        # Vitest: unit + integration (live headed pages + local fixture)
 - Integration suites run against a **real headed Chrome** and `tests/fixtures/` (shadow DOM, dialogs, cookies, lists), plus a local HTTP server so relative-href resolution is exercised against a real base URL.
 - Contract suites that guard the ref promise: `ref-contract`, `observe-ref-contract`, `href-identity`, `overlay-latency-timing`, `control-loop-fixes`, `reported-bugs`.
 
+> **Not every working copy carries `tests/`.** If `npm test` reports *"No test files found"*, the suite is absent from that checkout rather than failing — `vitest.config.ts` still points at `tests/unit` and `tests/integration`. For ad-hoc verification against the built output without a suite, a scratch harness can drive the router directly — import `dist/mcp/server.js` (not `dist/index.js`, which binds stdio on import) and call `router.route(tool, args)`. `dump/` is the conventional home for one.
+
+### Standing harnesses in `dump/`
+
+Each drives the built `dist` end-to-end and exits non-zero on failure:
+
+| Harness | Guards |
+|---|---|
+| `ref-verify` | ref resolution tier 1, same-href capture, viewport reconciliation |
+| `def5-verify` | reported viewport == measured viewport |
+| `errorlog-verify` | `FILL_NOT_RETAINED`, screenshot device/CSS scale metadata |
+| `overlay-verify` | heartbeat/watchdog control loop (no darkening mid-call) |
+| `overlay-states-verify` | the three banner states, top-left position, automatic transitions (`21/21`) |
+| `fill-verify` | fill recovery ladder, error taxonomy retryability |
+| `speed-verify` | no navigation pays a lifecycle cap; readiness honours its own declared budget (live wall clock reported, **not** asserted — a threshold on a live site tests the network, not Kruz) |
+| `readiness-verify` | the readiness budget is ONE real wall clock: a never-committing page costs the budget once (not twice, not 20x), every probe is clamped to the time remaining, and the answer is `PAGE_NOT_READY` rather than `ACTION_TIMEOUT`/`outcome:"unknown"` (`15/15`, local fixture, deterministic) |
+| `input-verify` | drag (targets, coords, steps, html5+payload, no-op honesty), modifier release, `uploadFile`, viewport pinning/drift, post-click navigation truth, CDP-attach contract (`54/54`) |
+| `netcap-verify` | `network.capture` actually truncates large bodies at 200 KB + honest `truncated` flag; the buffer survives a 600-request burst (`6/6`) |
+| `schema-verify` | the **input-schema layer**: `{x,y}`/ref/css/role+name drag endpoints survive validation, malformed ones are rejected, plus a sweep of all 53 tools / 167 argument slots for silently-stripped arguments (`36/36`) |
+| `call-bench` / `click-bench` | latency benchmarks (report, do not assert) |
+| `google-research` | drives Kruz's own browser to gather multi-source evidence (Google, with DuckDuckGo/Bing fallbacks for consent walls) before choosing a fix |
+| `mcp-server-verify` | the **real protocol**: spawns `node dist/index.js` exactly as the host does and speaks JSON-RPC over stdio — handshake, 53 tools, bad input, clean shutdown, and **stdout purity** (one stray `console.log` corrupts the stream and the host drops the connection). Also measures whether two sessions can share one profile dir (`13/13`) |
+| `single-instance-verify` | ownership-record safety: a recycled pid naming an unrelated process is never signalled, takeover terminates only a *recorded* predecessor, an *unrecorded* live peer is left alone, start-time mismatch is caught, and a clean exit leaves no record (`13/13`) |
+| `coldstart-verify` | **the startup bug**: launches **three** servers in the same instant (what a cold start really does), and asserts all three answer `initialize`, all three list 53 tools, and none prints `terminating live Kruz server` — the exact error `/mcp` reported. Fails 7/16 with the old newest-wins logic, verified (`16/16`) |
+| `host-config-verify` | the **deployed** config: reads the real `~/.config/opencode/opencode.jsonc`, spawns the `Kruz` entry verbatim (command, cwd, env) and serves JSON-RPC; forces the takeover path with a seeded lockfile so `KRUZ_TAKEOVER=1` is verified rather than assumed (`10/10`) |
+
+> **⚠ These harnesses own the single-instance slot.** `host-config-verify`,
+> `mcp-server-verify` and `single-instance-verify` spawn *real* `node dist/index.js`
+> servers. They no longer kill a peer, but they do write and release the ownership
+> record, so running them can briefly change who reaps orphaned Chrome. `coldstart-verify`
+> spawns three at once by design. Run them when you do not mind a reconnect, and
+> restart OpenCode afterwards if the MCP list shows Kruz as errored.
+
+> `overlay-states-verify` takes ~35 s: 20 s of it is the real `awaiting` auto-promotion window, which cannot be shortened without testing a different constant.
+
+> **`router.route(name, args)` does not run zod.** A harness that drives the router directly exercises the controller and engine but skips input validation entirely — which is how `page.drag`'s `{x,y}` endpoints passed 54/54 checks while being unusable for every real client (the schema stripped them). Anything about *argument shape* must be tested against `server._registeredTools[name].inputSchema`, as `schema-verify` does; anything about *browser behaviour* is fine on the router.
+
 ---
 
 ## Known Limitations
 
+- **Google-account sign-in is not supported.** Google classifies a Puppeteer-*launched* Chrome as automation and rejects sign-in with *"This browser or app may not be secure"*, **even when a human types the credentials by hand** during `session.pause`. The check is transport-level, not page-visible: `navigator.webdriver` is masked, `window.chrome.runtime` is present, plugin counts look normal, and it still rejects. Use `session.create {cdp_url}` to attach to a real daily-driver Chrome, or point `profile_dir` at a copy of a profile that already carries the Google session. See SKILL.md → *Known unsupported flow*.
 - **Observation caps** (`minimal` 120 / `standard` 400 / `full` 2000 elements) can starve very dense pages.
 - **Closed shadow roots** are not pierced (open shadow roots and same-origin iframes are).
 - **Cross-origin iframes** are skipped for evaluation.

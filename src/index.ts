@@ -9,20 +9,31 @@
  */
 
 import { createServer } from "./mcp/server.js";
+import { claimSingleInstance, releaseSingleInstance } from "./single-instance.js";
 
 // Track server start time for uptime reporting
 (globalThis as any).__KRUZ_START__ = Date.now();
 
 async function main() {
+  // Single-instance guard (kruz-bugs.md #6): claim the ownership record so this
+  // process — the browser owner — can reap orphaned Chrome from a crashed
+  // predecessor before serving. A LIVE peer is never terminated: OpenCode restores
+  // every workspace at once, and killing peers here was the cold-start error the
+  // host reported as "MCP server process exited with code 1". Opt out:
+  // KRUZ_SINGLE_INSTANCE=0.
+  await claimSingleInstance();
+
   const { server } = await createServer();
 
   // Keep process alive
   process.on("SIGINT", async () => {
+    releaseSingleInstance();
     await server.close();
     process.exit(0);
   });
 
   process.on("SIGTERM", async () => {
+    releaseSingleInstance();
     await server.close();
     process.exit(0);
   });

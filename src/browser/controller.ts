@@ -7,6 +7,35 @@ function normalizeUrl(u: string): string {
   }
 }
 
+/** Identity of the document that was on screen before a navigation was requested. */
+type PreNavDoc = { url: string; timeOrigin: number | null };
+
+/**
+ * Is the document now on screen a DIFFERENT one from the pre-navigation document?
+ *
+ * `performance.timeOrigin` is stamped once per Document and is already Kruz's
+ * document identity everywhere else (router `stateOf`, click-completion, the
+ * ref registry's `docIdCache`), so this adds no new concept — it reuses the one
+ * the codebase already trusts. It is exact for the case that matters: a fresh
+ * Document always has a fresh `timeOrigin`, including when navigating to the
+ * URL you are already on.
+ *
+ * The URL fallback exists only for the rare page where `timeOrigin` is
+ * unavailable, and it is deliberately permissive: a changed URL counts as a new
+ * document even across a host change, because a legitimate cross-host redirect
+ * (a shortener, a country redirect, an SSO bounce) really is a new document and
+ * really can be ready. It is only ever a fallback — when `timeOrigin` is present
+ * on both sides it is authoritative, so a same-URL reload still registers.
+ *
+ * `preNav` undefined means "no navigation was in flight" (every non-open caller,
+ * e.g. a post-click completion probe), which is always a fresh document.
+ */
+export function isNewDocument(preNav: PreNavDoc | undefined, currentUrl: string, timeOrigin: number | null): boolean {
+  if (!preNav) return true;
+  if (preNav.timeOrigin !== null && timeOrigin !== null) return timeOrigin !== preNav.timeOrigin;
+  return normalizeUrl(currentUrl) !== normalizeUrl(preNav.url);
+}
+
 import type { BrowserEngine, KruzElement } from "./engine.js";
 import type { Target, Fallback } from "../types/schema.js";
 import { resolveElement, resolveElementWithRef, tryResolveElement } from "./selectors.js";
@@ -18,6 +47,7 @@ import type { SessionManager, SessionState } from "../session/manager.js";
 import type { Observation } from "../types/observation.js";
 import { extractExperienceSignals } from "./ats-tools.js";
 
+import { existsSync, statSync } from "node:fs";
 import { bulkHarvest, type TargetCompany } from "./ats-json.js";
 import { kruzError, kruzErrorFromThrown, ErrCode, isErrCode, withRetry, type Subsystem } from "../errors.js";
 
@@ -133,6 +163,10 @@ export class BrowserController {
       // Speed: bringToFront + listener attach run concurrently with navigation
       // instead of serially — saves 1-2 round-trips per page.open.
       await this.listen(engine).catch(() => {});
+      // Identity of the document we are on BEFORE goto is issued. Everything
+      // below races that goto, so without this the readiness poll can (and
+      // regularly did) snapshot the outgoing page and report it as the answer.
+      const preNav = await this.capturePreNav(engine);
       const tNav0 = Date.now();
       // BUG-005: the lifecycle event and the readiness poll were SERIALISED, so
       // a page that is fully rendered and usable while `domcontentloaded` never
@@ -151,7 +185,25 @@ export class BrowserController {
         .then(() => { navSettledMs = Date.now() - tNav0; });
       await engine.bringToFront().catch(() => {});
       const tPoll0 = Date.now();
-      let pic = await this.pollForContent(engine, url, Math.min(rawTimeout, 15000), 250);
+      // ── ONE monotonic readiness budget, shared by every phase below. ─────────
+      // Phase 1 (this first content poll) and phase 2 (the pre-commit re-poll)
+      // each used to allocate their OWN `min(rawTimeout, 15000)`. They run in
+      // series, so a page that is neither ready at first contact nor committed yet
+      // cost up to 15s + 15s = 30s of readiness work inside a single page.open —
+      // and up to 38s when the optional networkidle wait sat on top of it.
+      //
+      // Two stacked budgets is the SITE-INDEPENDENT cause of the multi-second and
+      // occasionally ~12s opens seen on exactly the heavy portals this tool exists
+      // to drive (Shopify storefronts, Workday, Oracle HCM): the total was a
+      // function of phase ORDERING, not of the caller's timeout. One shared
+      // deadline makes the worst case a function of the timeout alone, on every
+      // site, and it cannot be re-armed by any phase.
+      const readyBudgetMs = Math.min(rawTimeout, 15000);
+      const readyDeadline = tPoll0 + readyBudgetMs;
+      // Which phase actually produced the verdict, reported back so a slow open is
+      // explainable from the response instead of requiring a debugger.
+      let readinessPhase = "content-poll";
+      let pic = await this.pollForContent(engine, url, readyBudgetMs, 250, preNav);
       // Bounded network-idle wait. Runs AFTER the content poll on purpose: run
       // earlier it would sample a page that has not loaded yet and declare
       // "idle" instantly, which is worse than not offering the option.
@@ -159,7 +211,12 @@ export class BrowserController {
       let networkIdleReached: boolean | null = null;
       if (requestedWait === "networkidle") {
         const tNi = Date.now();
-        const budgetMs = Math.min(Math.max(rawTimeout, 1000), 8000);
+        // Never let the opt-in network-idle wait push readiness past the shared
+        // deadline. On a page holding a live socket it would otherwise spend its
+        // whole 8s window here and starve the content poll that actually decides
+        // readiness. On the fast path (content already ready) `remain` is large,
+        // so this is a no-op and the previous 8s ceiling still applies unchanged.
+        const budgetMs = Math.min(Math.max(rawTimeout, 1000), 8000, Math.max(readyDeadline - tNi, 0));
         const QUIET_MS = 500;
         while (Date.now() - tNi < budgetMs) {
           const q = await this.networkQuiescence(engine);
@@ -177,13 +234,59 @@ export class BrowserController {
       // navigation out here costs nothing on the fast path: when content really
       // was ready, the branch is never entered.
       if (!pic.loaded && navSettledMs === null) {
-        await navP.catch(() => {});
-        pic = await this.pollForContent(engine, url, Math.min(rawTimeout, 15000), 250);
+        // Keep polling CONTENT while the navigation settles — readiness is
+        // content-based, so the page being rendered is the answer, not the event.
+        //
+        // This used to `await navP` outright, which blocked for the entire navigate
+        // cap (20s) whenever the first poll landed before commit. That is the
+        // reported slowness: a Shopify storefront whose domcontentloaded is delayed
+        // by third-party scripts was already rendered and usable, yet page.open cost
+        // a flat ~20.2s (measured: navigate resolves at 20273ms, the re-poll then
+        // returns in 7ms). The guard exists so a not-ready verdict is not issued on
+        // the PRE-navigation document, and polling the target host preserves that
+        // without waiting for an event nobody needs.
+        readinessPhase = "pre-commit-repoll";
+        // Spend the REMAINING shared budget, not a second fresh 15s. Every poll
+        // slice is additionally clamped to what is actually left, so the loop
+        // cannot overshoot the deadline by a whole poll either.
+        while (!pic.loaded) {
+          const remain = readyDeadline - Date.now();
+          if (remain <= 0) break;
+          await engine.waitMs(Math.min(200, remain)).catch(() => {});
+          const slice = readyDeadline - Date.now();
+          if (slice <= 0) break;
+          pic = await this.pollForContent(engine, url, Math.min(800, slice), 250, preNav);
+          // The lifecycle event firing is a useful signal that the document
+          // committed, but it is not required: keep going purely on content.
+          if (pic.loaded) break;
+          // Bounded like every other probe here — a bare `await snapshotPage` in this loop
+          // was one more unbounded await inside the readiness path.
+          const snapSettled = navSettledMs !== null
+            ? await this.beforeDeadline(this.snapshotPage(engine, url, preNav).catch(() => null), readyDeadline, null)
+            : null;
+          if (snapSettled?.loaded === true) {
+            const left = readyDeadline - Date.now();
+            if (left <= 0) break;
+            // The snapshot and the poll read the DOM at different instants, so on a
+            // skeleton that gains body text between them they legitimately disagree.
+            // The old code took the snapshot's "yes" and broke unconditionally — which
+            // exits with pic.loaded === false and reports PAGE_NOT_READY for a page
+            // that WAS ready. That is a false negative on precisely the slow-portal
+            // case this branch exists to rescue. Keep the poll's own verdict instead,
+            // and only stop once it agrees.
+            const recheck = await this.pollForContent(engine, url, Math.min(800, left), 250, preNav);
+            pic = recheck;
+            if (recheck.loaded) break;
+          }
+        }
+        if (!pic.loaded) readinessPhase = "budget-exhausted";
       }
       // Let an in-flight lifecycle wait finish in the background rather than
-      // leaving a dangling navigation, but never block on it: by now the content
-      // poll has already decided readiness one way or the other.
-      await Promise.race([navP, engine.waitMs(1500).catch(() => {})]);
+      // leaving a dangling navigation. Short on purpose: content readiness has
+      // already been decided above, so this is cleanup, not a wait. It was 1500ms,
+      // which added ~1.5s to every navigation for no benefit — the content loop
+      // above already knows whether the page is usable.
+      await Promise.race([navP, engine.waitMs(250).catch(() => {})]);
       // Distinguish "never resolved" from "still running when we stopped looking".
       // Reporting the latter as a timeout produced a false LIFECYCLE_NOT_RESOLVED
       // on fast navigations whose event simply had not landed inside the grace
@@ -199,9 +302,6 @@ export class BrowserController {
       if (!engine.connected) {
         return this.err("BROWSER_CRASHED", "Browser disconnected during navigation (renderer crash or process death).", true) as any;
       }
-      if (!engine.connected) {
-        return this.err("BROWSER_CRASHED", "Browser disconnected during content poll (renderer crash or process death).", true) as any;
-      }
       const tFg = Date.now();
       // Accuracy: NO auto cookie-banner dismissal here. Auto-clicking overlays is
       // the same failure class as the Apply-control mis-clicks (wrong-element
@@ -214,9 +314,13 @@ export class BrowserController {
         url: pic.currentUrl || url,
         title: pic.title,
         _ready: pic.loaded,
-        _ready_check: "content-based: body text > 100 chars, or a settled document (readyState != 'loading') with a title or interactive elements (P0-B thin-page fix) — polled every 250ms up to 15s",
+        _ready_check: "content-based: body text > 100 chars, or a settled document (readyState != 'loading') with a title or interactive elements (P0-B thin-page fix) — polled every 250ms up to 15s, AND the document must differ from the pre-navigation one (performance.timeOrigin), so a poll can never be satisfied by the page being left",
         _waited_ms: pic.elapsedMs,
         body_length: pic.bodyLength,
+        // What we navigated away from, whenever that is not where we ended up.
+        // Makes "the poll answered about the old page" diagnosable from the
+        // response instead of requiring the caller to have kept the URL itself.
+        ...(pic.fresh ? {} : { _pre_nav_url: preNav.url || null }),
         ...(pic.thin ? { _thin_page: true } : {}),
         _timing: {
           listen_ms: tNav0 - t0,
@@ -228,6 +332,13 @@ export class BrowserController {
           lifecycle_state: lifecycleState,
           navigate_ms: tPoll0 - tNav0,
           poll_ms: tFg - tPoll0,
+          // The ONE readiness budget shared by all phases, and which phase produced
+          // the verdict. Together these make an open self-explaining: `poll_ms` near
+          // `readiness_budget_ms` with phase "budget-exhausted" means the page never
+          // rendered in the window the CALLER allowed, which is a different problem
+          // from Kruz having waited on something it should not have.
+          readiness_budget_ms: readyBudgetMs,
+          readiness_phase: readinessPhase,
           overlay_ms: tEnd - tFg,
           total_ms: tEnd - t0,
         },
@@ -257,7 +368,9 @@ export class BrowserController {
           result._navigate_error ??= `The '${effectiveWait}' lifecycle event never resolved within ${navBudgetMs}ms.`;
         }
         result._warning = "PAGE_NOT_READY";
-        result.message = `Navigation committed but no real content detected after ${pic.elapsedMs}ms poll (body_length=${pic.bodyLength}). The page may show a bot-challenge, consent wall, or is still hydrating. Call page.observe or extract.text to see what is actually on screen.`;
+        result.message = pic.fresh
+          ? `Navigation committed but no real content detected after ${pic.elapsedMs}ms poll (body_length=${pic.bodyLength}). The page may show a bot-challenge, consent wall, or is still hydrating. Call page.observe or extract.text to see what is actually on screen.`
+          : `Navigation did not commit within ${pic.elapsedMs}ms — the browser is still showing the previous document${preNav.url ? ` (${preNav.url})` : ""}. Readiness was NOT inferred from that page. This is a slow or blocked navigation, not an empty result; retry with a longer timeout_ms or wait_for:"commit".`;
         result.hint = "Do NOT loop on page.open. Use page.wait with condition:'content' and a predicate (e.g. predicate: 'document.querySelector(\".jobs-list\")') to wait for the specific element you need.";
       }
       return { ok: true, result };
@@ -274,11 +387,63 @@ export class BrowserController {
     }
   }
 
+  /**
+   * Race a probe against an absolute deadline, returning `fallback` on expiry.
+   *
+   * This is the mechanism that makes a stated budget a real bound. The engine
+   * already caps a single CDP evaluate (evaluateTimeoutMs = 5s), but a readiness
+   * poll is a SEQUENCE of probes, so N slow probes add up. Racing each one
+   * against the remaining budget means a caller can trust `maxMs` regardless of
+   * how badly the page is behaving.
+   *
+   * On expiry the underlying promise is deliberately left to settle on its own:
+   * it is already bounded by the engine, nothing awaits it, and killing a CDP
+   * call mid-flight is what leaves a renderer wedged. `fallback` must therefore
+   * be a truthful "unknown", never an optimistic "ready".
+   */
+  private async beforeDeadline<T>(p: Promise<T>, deadline: number, fallback: T): Promise<T> {
+    const remain = deadline - Date.now();
+    if (remain <= 0) return fallback;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<T>((res) => { timer = setTimeout(() => res(fallback), remain); }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   /** Poll for real rendered content after navigation — lets slow SPAs hydrate without
-   *  trusting a lifecycle event. Returns the observed state + how long the poll took. */
-  private async pollForContent(engine: BrowserEngine, targetUrl: string, maxMs = 15000, intervalMs = 250): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; thin: boolean; elapsedMs: number }> {
+   *  trusting a lifecycle event. Returns the observed state + how long the poll took.
+   *
+   *  `preNav` is threaded into every snapshot so a poll can never be satisfied by the
+   *  document we are leaving — see isNewDocument. Omitting it reintroduces the stale
+   *  `_ready: true` this whole path exists to prevent. */
+  private async pollForContent(engine: BrowserEngine, targetUrl: string, maxMs = 15000, intervalMs = 250, preNav?: PreNavDoc): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; thin: boolean; elapsedMs: number; fresh: boolean }> {
     const started = Date.now();
-    let snap = await this.snapshotPage(engine, targetUrl);
+    // ── A REAL wall-clock deadline. ───────────────────────────────────────────
+    // The loop below used to be bounded by an ITERATION COUNT (`elapsed +=
+    // intervalMs`), which is not a time bound at all. Every iteration also runs
+    // one or more in-page probes, and each of those is independently bounded to
+    // 5s by the engine's evaluateTimeoutMs. So on a page whose renderer is
+    // stalling mid-commit — precisely when the probe is SLOWEST — the real cost
+    // was (maxMs/intervalMs) x (intervalMs + slowest probe) ~= 16 x 5.25s ~= 84s
+    // for a caller who asked for 4s. That overran the router's 55s route budget,
+    // which returned ACTION_TIMEOUT with outcome:"unknown" and retry_safe:false:
+    // the worst possible outcome, because the agent cannot even tell whether the
+    // navigation happened. Measured 56.5s wall for timeout_ms:4000.
+    //
+    // `maxMs` is now an actual deadline, and every probe is additionally clamped
+    // to the time remaining, so no single slow probe can outrun it.
+    const deadline = started + Math.max(maxMs, 0);
+    // Shape used when a probe cannot answer in time. Deliberately "do not know"
+    // rather than "ready": an unanswered probe must never manufacture readiness.
+    const unknown = { loaded: false, currentUrl: "", title: "", bodyLength: 0, thin: false, fresh: false };
+    const probe = async () => this.beforeDeadline(this.snapshotPage(engine, targetUrl, preNav).catch(() => unknown), deadline, unknown);
+
+    let snap = await probe();
     if (snap.loaded && !snap.thin) return { ...snap, elapsedMs: Date.now() - started };
 
     // Issue A (manual report): a React shell reported `_ready: true` with
@@ -291,12 +456,20 @@ export class BrowserController {
     const thinWindow = 3000;
     let lastMut = -1;
     let lastChangeAt = Date.now();
-    for (let elapsed = 0; elapsed < maxMs; elapsed += intervalMs) {
-      await engine.waitMs(intervalMs).catch(() => {});
-      snap = await this.snapshotPage(engine, targetUrl);
+    // Real elapsed time, not a synthetic counter — see the deadline note above.
+    while (Date.now() < deadline) {
+      await engine.waitMs(Math.min(intervalMs, Math.max(deadline - Date.now(), 0))).catch(() => {});
+      if (Date.now() >= deadline) break;
+      snap = await probe();
       if (snap.loaded && !snap.thin) return { ...snap, elapsedMs: Date.now() - started };
+      // Still on the document we started from: the navigation has not committed.
+      // Check this BEFORE the thin-page shortcuts below — the outgoing page is
+      // normally a full, meaningful document, so `thin === false` would otherwise
+      // return `loaded: false` on the very first poll and report the slow page as
+      // never-ready. Nothing about the outgoing document is evidence either way.
+      if (!snap.fresh) { lastChangeAt = Date.now(); continue; }
       if (!snap.thin) return { ...snap, elapsedMs: Date.now() - started };
-      const mut = await this.mutationCount(engine);
+      const mut = await this.beforeDeadline(this.mutationCount(engine), deadline, null);
       const now = Date.now();
       // No tracker means no evidence of continued mounting: without a positive
       // signal that the page is still growing, a thin page is taken at face
@@ -346,20 +519,42 @@ export class BrowserController {
     return typeof v === "number" ? v : null;
   }
 
+  /** The identity of the document currently on screen, for the pre-navigation
+   *  freshness check. One CDP round-trip, and a failure is non-fatal: `url: ""`
+   *  simply disables the check rather than blocking the navigation. */
+  private async capturePreNav(engine: BrowserEngine): Promise<PreNavDoc> {
+    const url = await engine.url().catch(() => "");
+    const r = await engine
+      .evaluate(`(() => { try { return (typeof performance !== 'undefined' && typeof performance.timeOrigin === 'number') ? performance.timeOrigin : null; } catch (e) { return null; } })()`)
+      .catch(() => null);
+    const timeOrigin = r?.ok && typeof r.result === "number" ? r.result : null;
+    return { url: url ?? "", timeOrigin };
+  }
+
   /** Lightweight snapshot: is there anything rendered, even if the load event never fired?
    *  P0-B: readiness no longer requires >100 chars of body text. A settled document with a
    *  title or usable interactive DOM counts as ready, so legitimate thin pages (login walls,
-   *  canvas apps, empty states, small utilities) never pay the full readiness poll. */
-  private async snapshotPage(engine: BrowserEngine, targetUrl: string): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; thin: boolean }> {
+   *  canvas apps, empty states, small utilities) never pay the full readiness poll.
+   *
+   *  `preNav` is the identity of the document we were on BEFORE this navigation was
+   *  requested. Without it the readiness answer is structurally wrong, because the
+   *  poll races `page.goto`: it routinely wins, snapshots the document we are LEAVING,
+   *  finds 10 000 characters in it, and reports `_ready: true` with the old page's URL.
+   *  Observed live: `page.open("https://careers.cognizant.com/...")` returned
+   *  `_ready: true, url: "https://freshersdunia.in/cognizant-genc-..."` in 6ms —
+   *  a confident answer about a page that was never navigated to. See `isNewDocument`. */
+  private async snapshotPage(engine: BrowserEngine, targetUrl: string, preNav?: PreNavDoc): Promise<{ loaded: boolean; currentUrl: string; title: string; bodyLength: number; thin: boolean; fresh: boolean }> {
     try {
       const currentUrl: string = await engine.url();
       // One evaluate for title/body/interactive/ready instead of three round trips.
+      // `timeOrigin` rides along because it is the only cheap, exact identity for
+      // "this is a different document than the one we were on" (see isNewDocument).
       const r = await engine.evaluate(`(() => {
         const bodyLen = document.body ? (document.body.innerText || '').trim().length : 0;
         const interactive = document.querySelectorAll('a[href],button,input,select,textarea,summary,[role],[onclick],[tabindex]').length;
-        return { bodyLen, interactive, ready: document.readyState !== 'loading', title: document.title || '' };
+        return { bodyLen, interactive, ready: document.readyState !== 'loading', title: document.title || '', timeOrigin: (typeof performance !== 'undefined' && typeof performance.timeOrigin === 'number') ? performance.timeOrigin : null };
       })()`).catch(() => ({ ok: false as const }));
-      const v = (r.ok ? r.result : null) as { bodyLen?: number; interactive?: number; ready?: boolean; title?: string } | null;
+      const v = (r.ok ? r.result : null) as { bodyLen?: number; interactive?: number; ready?: boolean; title?: string; timeOrigin?: number | null } | null;
       const bodyLength = v?.bodyLen ?? 0;
       const title = v?.title ?? "";
       const interactive = v?.interactive ?? 0;
@@ -369,10 +564,13 @@ export class BrowserController {
       // interactive control is the thin-page fallback (P0-B).
       const meaningful = bodyLength > 100;
       const thinButUsable = docReady && !meaningful && (title.trim().length > 0 || interactive > 0);
-      const loaded = !isHttpBlank && (meaningful || thinButUsable);
-      return { loaded, currentUrl, title, bodyLength, thin: thinButUsable };
+      // Gate on the document having actually changed. Content alone cannot tell
+      // "the page we are leaving" from "the page we asked for" — only identity can.
+      const fresh = isNewDocument(preNav, currentUrl, v?.timeOrigin ?? null);
+      const loaded = !isHttpBlank && fresh && (meaningful || thinButUsable);
+      return { loaded, currentUrl, title, bodyLength, thin: thinButUsable, fresh };
     } catch {
-      return { loaded: false, currentUrl: "", title: "", bodyLength: 0, thin: false };
+      return { loaded: false, currentUrl: "", title: "", bodyLength: 0, thin: false, fresh: false };
     }
   }
 
@@ -396,7 +594,7 @@ export class BrowserController {
 
   // ═══ CLICK VARIANTS ══════════════════════════════════════════════════════
 
-  async click(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000, _strict = true, button: "left" | "right" | "middle" = "left", clickCount: 1 | 2 | 3 = 1, opts: { force?: boolean; ignoreVisibility?: boolean; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow" } = {}): Promise<ActionResult> {
+  async click(target: Target, fallback?: Fallback, scope?: string, timeoutMs = 5000, _strict = true, button: "left" | "right" | "middle" = "left", clickCount: 1 | 2 | 3 = 1, opts: { force?: boolean; ignoreVisibility?: boolean; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow"; modifiers?: string[] } = {}): Promise<ActionResult> {
     const t0 = Date.now();
     let tResolved = 0;
     const e = this.engine(); if (!e) return this.noSession();
@@ -429,7 +627,7 @@ export class BrowserController {
       resolved = true;
       tResolved = Date.now() - t0;
       const tDispatch = Date.now();
-      await e.click(el, {timeoutMs, button, clickCount, force:forceClick, visual: opts.visual, speed: opts.speed});
+      await e.click(el, {timeoutMs, button, clickCount, force:forceClick, visual: opts.visual, speed: opts.speed, modifiers: opts.modifiers});
       const tAction = Date.now() - tDispatch;
       this.bump();
       const tVerify = Date.now();
@@ -455,6 +653,205 @@ export class BrowserController {
     }
   }
 
+
+  // ═══ DRAG & FILE INPUT ════════════════════════════════════════════════════
+
+  /**
+   * A drag endpoint is either absolute CSS-pixel coordinates or a target the caller
+   * can already click. `{x,y}` is unambiguous against every target field, so no
+   * discriminator is needed: any object without numeric x/y is treated as a target.
+   *
+   * `el` is carried through when the endpoint was a target, which is what lets
+   * `mode:'html5'` reuse the engine's HTML5 drag path for the sites that need it.
+   */
+  async dragPoint(e: BrowserEngine, ep: any, timeoutMs: number): Promise<{ x: number; y: number; el?: any } | { error: any }> {
+    if (ep && typeof ep.x === "number" && typeof ep.y === "number") {
+      return { x: ep.x, y: ep.y };
+    }
+    await this.refreshIdentity(e);
+    const r = await resolveForAction(
+      { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+      ep as Target, undefined, undefined, "clickable",
+      { allowHidden: false, waitMs: Math.min(timeoutMs, 1200) },
+    );
+    if (!r.ok) {
+      return { error: kruzError(r.code as any, { subsystem: "controller", message: r.message, retryable: r.retryable, help: r.help }).toJSON() };
+    }
+    const pt = await e.viewportPoint(r.el).catch(() => null);
+    if (!pt) {
+      return { error: kruzError(ErrCode.ELEMENT_NOT_VISIBLE, {
+        subsystem: "controller",
+        message: "Drag endpoint resolved to an element with no rendered area, so it has no point to press on.",
+        help: "Scroll it into view or reveal its section first.",
+      }).toJSON() };
+    }
+    return { x: pt.x, y: pt.y, el: r.el };
+  }
+
+  /**
+   * Trusted press → move → release drag.
+   *
+   * The missing primitive behind "no input path works on this editor": palette tiles
+   * into a canvas, handles on a slider, cards into a reorderable list. Click and
+   * press cannot express it, and an in-page synthetic PointerEvent drag is *ignored*
+   * by custom drag engines — which looks healthy while doing nothing.
+   *
+   * The unverified case is explicit by design: a drag that changed nothing reports
+   * `verified: false` plus a reason, never a bare success.
+   */
+  async drag(
+    from: any, to: any,
+    opts: { steps?: number; button?: "left" | "right" | "middle"; speed?: "instant" | "fast" | "normal" | "slow"; modifiers?: string[]; timeoutMs?: number; settleMs?: number; mode?: "pointer" | "html5"; data?: Record<string, string> } = {},
+  ): Promise<ActionResult> {
+    const t0 = Date.now();
+    const e = this.engine(); if (!e) return this.noSession();
+    if (!from || !to) {
+      return this.err(ErrCode.INVALID_INPUT, "page.drag needs both `from` and `to` (each {x,y} or a target).", false, { operation: "page.drag" });
+    }
+    const mode = opts.mode === "html5" ? "html5" : "pointer";
+    if (mode === "html5" && (typeof from?.x === "number" || typeof to?.x === "number")) {
+      return this.err(ErrCode.INVALID_INPUT, "page.drag mode:'html5' needs two TARGETS, not {x,y} points — an HTML5 drag is dispatched between elements so it can carry a DataTransfer.", false, { operation: "page.drag" });
+    }
+
+    const tR0 = Date.now();
+    const a = await this.dragPoint(e, from, opts.timeoutMs ?? 5000);
+    if ("error" in a) return { ok: false, timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - tR0, action_ms: 0, verify_ms: 0 }, error: a.error };
+    const b = await this.dragPoint(e, to, opts.timeoutMs ?? 5000);
+    if ("error" in b) return { ok: false, timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - tR0, action_ms: 0, verify_ms: 0 }, error: b.error };
+    const resolveMs = Date.now() - tR0;
+
+    const before = await this.pageFeedback(e, null, { includeLists: false }).catch(() => null);
+    const tA0 = Date.now();
+    let gesture: { steps: number; duration_ms: number; modifiers: string[] };
+    try {
+      if (mode === "html5") {
+        // Sites with a real HTML5 drag tree (some file panels, dashboards) need
+        // dragstart/dragover/drop carrying a DataTransfer; trusted pointer events
+        // alone are ignored by them.
+        await e.html5Drag(a.el, b.el, opts.data);
+        gesture = { steps: 1, duration_ms: Date.now() - tA0, modifiers: opts.modifiers ?? [] };
+      } else {
+        gesture = await e.dragPath(a, b, { steps: opts.steps, button: opts.button, speed: opts.speed, modifiers: opts.modifiers });
+      }
+    } catch (err) {
+      const env = kruzErrorFromThrown(err) as any;
+      return { ok: false, timing: { total_ms: Date.now() - t0, resolve_ms: resolveMs, action_ms: Date.now() - tA0, verify_ms: 0 }, error: env.toJSON ? env.toJSON() : env };
+    }
+    const actionMs = Date.now() - tA0;
+    this.bump();
+
+    // Some editors commit on drop rather than on release; give them a moment before
+    // deciding whether anything happened.
+    const settle = opts.settleMs ?? 250;
+    if (settle) await e.waitMs(settle).catch(() => {});
+
+    const tV0 = Date.now();
+    const after = await this.pageFeedback(e, before, { includeLists: false }).catch(() => null);
+    const changed = !!after && !!(after.url_changed || after.document_changed || after.dom_changed);
+    const verification = !after ? "unknown"
+      : (after.document_changed || after.url_changed) ? "navigation"
+      : after.dom_changed ? "dom_change" : "no_change";
+
+    return {
+      ok: true,
+      timing: { total_ms: Date.now() - t0, resolve_ms: resolveMs, action_ms: actionMs, verify_ms: Date.now() - tV0 },
+      result: {
+        dragged: true,
+        verified: changed,
+        verification,
+        // The resolved points, without the internal element handles.
+        from: { x: a.x, y: a.y },
+        to: { x: b.x, y: b.y },
+        mode,
+        steps: gesture.steps,
+        modifiers: gesture.modifiers,
+        state: after ?? undefined,
+        ...(changed ? {} : {
+          unverified_reason: "nothing observable changed within the settle window after the drop",
+          hint: "Canvas/WebGL editors draw without changing the DOM — confirm with page.screenshot. Otherwise the source probably refused to be grabbed: retry with more steps, speed 'slow', or explicit {x,y} endpoints.",
+        }),
+      },
+    };
+  }
+
+  /**
+   * Attach files to a file input. Uses CDP DOM.setFileInputFiles, the only route a
+   * page cannot fake: an in-page `DataTransfer` cannot populate a real file input.
+   */
+  async uploadFile(target: any, paths: string[], opts: { scope?: string; fallback?: Fallback; timeoutMs?: number } = {}): Promise<ActionResult> {
+    const t0 = Date.now();
+    const e = this.engine(); if (!e) return this.noSession();
+    const list = (Array.isArray(paths) ? paths : [paths]).filter((p) => typeof p === "string" && p.length > 0);
+    if (!list.length) {
+      return this.err(ErrCode.INVALID_INPUT, "page.uploadFile needs at least one local file path.", false, { operation: "page.uploadFile" });
+    }
+    const missing = list.filter((p) => !existsSync(p));
+    if (missing.length) {
+      return this.err(ErrCode.INVALID_INPUT, `No such file: ${missing.join(", ")}. Paths are resolved on the machine running Kruz.`, false, { operation: "page.uploadFile" });
+    }
+    await this.refreshIdentity(e);
+    const tR0 = Date.now();
+    // allowHidden: a file input is normally `display:none` behind a styled button,
+    // so requiring it to be visible would refuse essentially every upload.
+    const r = await resolveForAction(
+      { engine: e, registry: this.refs(), pageId: this.activePageId, documentId: this.docIdCache, revision: this.revisionCache },
+      target as Target, opts.fallback, opts.scope, "fillable",
+      { allowHidden: true, waitMs: Math.min(opts.timeoutMs ?? 5000, 1500) },
+    );
+    if (!r.ok) {
+      return { ok: false, timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - tR0, action_ms: 0, verify_ms: 0 }, error: kruzError(r.code as any, { subsystem: "controller", message: r.message, retryable: r.retryable, help: r.help }).toJSON() };
+    }
+    const tA0 = Date.now();
+    try {
+      const out = await e.uploadFileTo(r.el, list);
+      this.bump();
+      return {
+        ok: true,
+        timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - tR0, action_ms: Date.now() - tA0, verify_ms: 0 },
+        result: { uploaded: true, files: out.files, sizes: list.map((p) => ({ path: p, bytes: statSync(p).size })) },
+      };
+    } catch (err) {
+      const env = kruzErrorFromThrown(err) as any;
+      return { ok: false, timing: { total_ms: Date.now() - t0, resolve_ms: Date.now() - tR0, action_ms: Date.now() - tA0, verify_ms: 0 }, error: env.toJSON ? env.toJSON() : env };
+    }
+  }
+
+  /**
+   * Pin the CSS viewport for the rest of the session.
+   *
+   * The recovery tool that was missing when a responsive layout flipped under the
+   * agent: once a site serves its mobile variant below a breakpoint, the desktop menu
+   * is not in the DOM at all, and the only way back was to close the session and lose
+   * every tab. This is Emulation device metrics, so it does not touch the OS window.
+   */
+  async setViewport(width: number, height: number): Promise<ActionResult> {
+    const t0 = Date.now();
+    const e = this.engine(); if (!e) return this.noSession();
+    const w = Math.max(200, Math.min(Math.round(width) || 0, 10000));
+    const h = Math.max(200, Math.min(Math.round(height) || 0, 10000));
+    if (w <= 200 || h <= 200) {
+      return this.err(ErrCode.INVALID_INPUT, `page.setViewport needs plausible dimensions, got ${width}x${height}.`, false, { operation: "page.setViewport" });
+    }
+    await e.setViewportSize(w, h);
+    this.bump();
+    const actual = await e.viewportSize().catch(() => null);
+    const dpr = (e as any).deviceScaleFactor ?? null;
+    return {
+      ok: true,
+      timing: { total_ms: Date.now() - t0 },
+      result: {
+        viewport_requested: { width: w, height: h },
+        browser_viewport: actual,
+        viewport_drifted: !!(actual && (actual.width !== w || actual.height !== h)),
+        device_scale_factor: dpr,
+        // Restated so the caller does not have to remember it: crops stay in DEVICE
+        // pixels, so image dimensions stay css * dpr even though the CSS viewport
+        // is now explicitly emulated.
+        image_space: "device_px",
+        target_space: "css_px",
+      },
+    };
+  }
 
   // ═══ OBSERVATION / FEEDBACK (P1-A) ══════════════════════════════════════
 
@@ -805,6 +1202,14 @@ export class BrowserController {
       // Recovery ladder via the shared retry policy: re-observe to refresh refs
       // (SPA churn), then re-resolve and write. A non-editable target is terminal
       // and must NOT be retried into a wrong-element write.
+      //
+      // `escalated` records that the escalation actually performed the write. Without
+      // it the ladder's action below re-threw unconditionally, so withRetry surfaced a
+      // FAILURE for a fill that had already been applied — telling the caller a field
+      // did not take when it had, and inviting a retry that writes it twice.
+      let escalated = false;
+      // (SPA churn), then re-resolve and write. A non-editable target is terminal
+      // and must NOT be retried into a wrong-element write.
       const reobserve = async (): Promise<boolean> => {
         const s = this.getActiveSession();
         if (!s?.engine) return false;
@@ -821,11 +1226,19 @@ export class BrowserController {
         const editable2 = await e.evaluateOn(again.el, "(() => (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement || this.isContentEditable))()").catch(() => ({ ok: false as const }));
         if (!(editable2?.ok && !!editable2.result)) return false;
         await e.fill(again.el, value, { timeoutMs, force: forceFill });
+        escalated = true;
         this.bump();
         return true;
       };
       try {
-        return await withRetry(async () => { throw err; }, {
+        return await withRetry(async () => {
+          if (escalated) {
+            return { ok: true, recovered_by: "re-observe-and-fill",
+                     timing: { total_ms: Date.now() - t0 },
+                     result: { value_written: true } };
+          }
+          throw err;
+        }, {
           retryOn: [ErrCode.TARGET_NOT_FOUND, ErrCode.ELEMENT_NOT_FOUND, ErrCode.STALE_ELEMENT, ErrCode.ELEMENT_NOT_VISIBLE, ErrCode.STALE_REFERENCE, ErrCode.DOCUMENT_CHANGED],
           escalations: [{ name: "re-observe-and-fill", run: reobserve }],
         });
@@ -1316,44 +1729,6 @@ export class BrowserController {
     } catch (err) { return this.err("page.wait", `Wait failed (${condition}): ${err}`, true); }
   }
 
-  // ═══ DRAG & DROP ════════════════════════════════════════════════════════
-
-  async drag(s: Target, d: Target, sf?: Fallback, df?: Fallback, scope?: string, _timeoutMs = 5000): Promise<ActionResult> {
-    const e = this.engine(); if (!e) return this.noSession();
-    try {
-      const rm = this.getRefMap();
-      const srcEl = (await resolveElementWithRef(e, s, rm, sf, scope)).el;
-      const dstEl = (await resolveElementWithRef(e, d, rm, df, scope)).el;
-      if (!srcEl || !dstEl) return this.err(ErrCode.INVALID_INPUT, "page.drag: source or destination was not visible; pass visible x/y for both.", false);
-      const [src, dst] = await Promise.all([e.boundingBox(srcEl), e.boundingBox(dstEl)]);
-      if (!src || !dst) return this.err(ErrCode.INVALID_INPUT, "page.drag: source or destination was not visible; pass visible x/y for both.", false);
-      const sx = src.x + src.width / 2, sy = src.y + src.height / 2;
-      const dx = dst.x + dst.width / 2, dy = dst.y + dst.height / 2;
-      await e.mouseMove(sx, sy);
-      await e.mouseDown();
-      for (let i = 1; i <= 10; i++) {
-        await e.mouseMove(sx + (dx - sx) * (i / 10), sy + (dy - sy) * (i / 10));
-        await new Promise(r => setTimeout(r, 20));
-      }
-      await e.mouseUp();
-      this.bump();
-      return { ok: true };
-    } catch (err) { return this.err("page.drag", `Drag failed: ${err}`, true); }
-  }
-
-  async html5Drag(s: Target, d: Target, sf?: Fallback, df?: Fallback, scope?: string, _timeoutMs = 5000): Promise<ActionResult> {
-    const e = this.engine(); if (!e) return this.noSession();
-    try {
-      const rm = this.getRefMap();
-      const srcEl = (await resolveElementWithRef(e, s, rm, sf, scope)).el;
-      const dstEl = (await resolveElementWithRef(e, d, rm, df, scope)).el;
-      if (!srcEl || !dstEl) return this.err(ErrCode.INVALID_INPUT, "page.html5Drag: source or destination was not visible; pass visible x/y for both.", false);
-      await e.html5Drag(srcEl, dstEl);
-      this.bump();
-      return { ok: true };
-    } catch (err) { return this.err("page.html5Drag", `HTML5 drag failed: ${err}`, true); }
-  }
-
   // ═══ DIALOGS ═══════════════════════════════════════════════════════════
 
   async dialog(action: "accept" | "dismiss", value?: string): Promise<ActionResult> {
@@ -1540,18 +1915,6 @@ export class BrowserController {
     }
   }
 
-  // ═══ FILE UPLOAD ═══════════════════════════════════════════════════════
-
-  async uploadFile(target: Target, filePaths: string[], fallback?: Fallback, scope?: string, _timeoutMs = 5000): Promise<ActionResult> {
-    const e = this.engine(); if (!e) return this.noSession();
-    try {
-      const el = await this.resolveEl(e, target, "input[type='file']", fallback, scope);
-      await e.setFiles(el, filePaths);
-      this.bump();
-      return { ok: true };
-    } catch (err) { return this.err("page.uploadFile", `File upload failed: ${err}`, true); }
-  }
-
   // ═══ COORDINATE CLICKS ═════════════════════════════════════════════════
 
   async clickAt(x: number, y: number, button: "left" | "right" | "middle" = "left"): Promise<ActionResult> {
@@ -1654,16 +2017,72 @@ export class BrowserController {
 
   // ═══ SCREENSHOT ════════════════════════════════════════════════════════
 
-  async screenshot(target?: Target, fallback?: Fallback, scope?: string, filePath?: string, fullPage = false): Promise<ActionResult> {
+  /**
+   * Capture the viewport, the full page, or a single element.
+   *
+   * Returns base64 image data so a vision-capable model can actually LOOK at the
+   * page. This is image analysis, not OCR: the caller receives pixels and does the
+   * interpreting. `ref` is echoed back whenever one was used to resolve the crop,
+   * so a visual finding can be turned straight into a click without re-resolving.
+   *
+   * A written filePath is additive, not exclusive — the bytes are returned either
+   * way, so a caller can keep a copy without losing the ability to see it.
+   */
+  async screenshot(target?: Target, fallback?: Fallback, scope?: string, filePath?: string, fullPage = false, type: "png" | "jpeg" | "webp" = "png", quality?: number, timeoutMs = 15000): Promise<ActionResult> {
     const e = this.engine(); if (!e) return this.noSession();
+    const started = Date.now();
+    const mimeType = type === "png" ? "image/png" : type === "jpeg" ? "image/jpeg" : "image/webp";
+    // Measured once and reused for the coordinate-space declaration (E-008).
+    let scale = { scale: 1, viewport: { width: null as number | null, height: null as number | null } };
     try {
+      const vp = await e.viewportSize().catch(() => null);
+      if (vp?.width) scale = { scale: vp.dpr ?? 1, viewport: { width: vp.width, height: vp.height } };
+    } catch { /* advisory only; never fail a capture over it */ }
+    try {
+      let buf: Buffer;
+      let mode: "viewport" | "full_page" | "element";
+      let ref: string | undefined;
       if (target) {
-        const { el } = await this.resolve(target, fallback, scope, 5000);
-        const buf = await e.screenshotElement(el, { path: filePath });
-        return { ok: true, result: filePath ? { path: filePath } : { base64: buf.toString("base64") } };
+        const { el } = await this.resolve(target, fallback, scope, timeoutMs);
+        // Echo the caller's ref so a visual finding can be turned straight into a
+        // click without re-resolving. Only meaningful when they supplied one.
+        ref = typeof target.ref === "string" ? target.ref : undefined;
+        buf = await e.screenshotElement(el, { path: filePath, type, quality });
+        mode = "element";
+      } else {
+        buf = await e.screenshot({ fullPage, path: filePath, type, quality });
+        mode = fullPage ? "full_page" : "viewport";
       }
-      const buf = await e.screenshot({ fullPage, path: filePath });
-      return { ok: true, result: filePath ? { path: filePath } : { base64: buf.toString("base64") } };
+      const dims = e.imageDimensions(buf);
+      return {
+        ok: true,
+        ref,
+        result: {
+          mime_type: mimeType,
+          width: dims.width,
+          height: dims.height,
+          bytes: buf.length,
+          mode,
+          // Coordinate-space declaration (E-008).
+          //
+          // Captures come back in DEVICE pixels while `page.clickAt` takes DOM/CSS
+          // pixels, so a caller who reads coordinates off an image and clicks them
+          // directly lands on the wrong element — measured on Canva: a hit-test
+          // returned an unrelated `<h5>` instead of the intended chip.
+          //
+          // Rather than leave that as arithmetic to infer, the capture states its own
+          // scale and the DOM-space equivalent, so converting is mechanical:
+          //   DOM coords = image coords / scale
+          scale: scale.scale,
+          viewport_css: scale.viewport,
+          image_space: "device_px",
+          target_space: "css_px",
+          ...(ref ? { ref } : {}),
+          ...(filePath ? { path: filePath } : {}),
+          base64: buf.toString("base64"),
+        },
+        timing: { total_ms: Date.now() - started },
+      };
     } catch (err) { return this.err("page.screenshot", `Screenshot failed: ${err}`, true); }
   }
 

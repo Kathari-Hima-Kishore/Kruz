@@ -98,6 +98,42 @@ export function computePath(from: Point, to: Point, opts: PathOptions = {}): Poi
   return out;
 }
 
+/**
+ * Resample a path to exactly `n` points, preserving its shape.
+ *
+ * Used to honour an explicit step count on a drag. The curve comes from computePath
+ * (human easing); only the density is changed, because "how many intermediate moves"
+ * and "what the trajectory looks like" are independent decisions — some drag engines
+ * refuse to start until the pointer has moved far enough, which is a count question.
+ */
+export function resamplePath(path: Point[], n: number): Point[] {
+  if (path.length === 0) return path;
+  if (n <= 1) return [path[path.length - 1]];
+  if (n >= path.length) {
+    // Subdivide each segment so a larger request still interpolates smoothly.
+    const out: Point[] = [];
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = path[i], b = path[i + 1];
+      const segs = Math.max(1, Math.round((n - 1) / (path.length - 1)));
+      for (let k = 0; k < segs; k++) {
+        const t = k / segs;
+        out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+      }
+    }
+    out.push(path[path.length - 1]);
+    return out.slice(0, n);
+  }
+  const out: Point[] = [];
+  for (let i = 0; i < n; i++) {
+    const idx = (i / (n - 1)) * (path.length - 1);
+    const lo = Math.floor(idx);
+    const hi = Math.min(lo + 1, path.length - 1);
+    const t = idx - lo;
+    out.push({ x: path[lo].x + (path[hi].x - path[lo].x) * t, y: path[lo].y + (path[hi].y - path[lo].y) * t });
+  }
+  return out;
+}
+
 /** Total glide duration for a path. Long travel takes longer (Fitts's law). */
 export function pathDurationMs(from: Point, to: Point, opts: PathOptions = {}): number {
   const speed = opts.speed ?? "normal";
@@ -142,6 +178,12 @@ export function visualLayerScript(): string {
   const NS = 'kruz-visual';
   // A ping is valid for this long. The router pings every ~200 ms while acting.
   const IDLE_MS = 650;
+  // No ping for this long means the turn has ended and a human is expected, so the
+  // banner switches from "Model is thinking" to "Input needed on Browser/TUI".
+  // Generous on purpose: a model can legitimately think between tool calls, and a
+  // false "input needed" is worse than a slightly late one. An explicit
+  // session.pause / human.takeover switches immediately.
+  const AWAIT_MS = 20000;
   const host = document.createElement('div');
   host.setAttribute('data-kruz', 'control');
   // position:fixed + inset:0 → viewport-sized, never affects layout or scrollbars.
@@ -165,6 +207,18 @@ export function visualLayerScript(): string {
         50%     { box-shadow: inset 0 0 0 5px rgba(59,130,246,1), inset 0 0 34px 6px rgba(147,197,253,.75), inset 0 0 110px 20px rgba(37,99,235,.45), inset 0 34px 58px -16px rgba(59,130,246,.75); }
       }
       .dot { width:8px; height:8px; border-radius:50%; background:#3b82f6; box-shadow:0 0 10px #3b82f6; }
+      .dot.thinking { background:#facc15; box-shadow:0 0 10px #facc15; }
+      .dot.awaiting { background:#e5e7eb; box-shadow:0 0 8px #9ca3af; }
+      /* State 2 — model is thinking, not driving the browser. Amber, no pulse:
+         the page is still the user's, but Kruz is mid-task and may act again. */
+      .glow.thinking {
+        box-shadow: inset 0 0 0 3px rgba(234,179,8,.9),
+                    inset 0 0 26px 4px rgba(250,204,21,.45),
+                    inset 0 0 80px 12px rgba(202,138,4,.28);
+      }
+      /* State 3 — waiting on a human. Deliberately NO glow: the absence of colour
+         is the signal that the page is unattended and needs input. */
+      .glow.awaiting { display:none !important; }
       .cur {
         position:fixed; top:0; left:0; width:0; height:0;
         transform:translate3d(-100px,-100px,0);
@@ -202,12 +256,17 @@ export function visualLayerScript(): string {
     <div class="glow pulse" style="display:none"></div>
     <div class="cur hidden"><div class="wave"></div><div class="ring"></div><div class="core"></div></div>\`;
 
-  // Takeover bubble lives in LIGHT DOM (not the closed shadow): the user must
+  // Takeover banner lives in LIGHT DOM (not the closed shadow): the user must
   // be able to click Takeover/Resume, tests must reach the buttons, and
   // assistive tech must see them. all:initial + inline styles isolate it.
+  //
+  // Positioned TOP-LEFT on request: it used to sit top-centre, where it covered
+  // page chrome (search bars, primary nav) and moved as the viewport resized.
+  // Top-left is out of the way of page headers on most sites and gives the three
+  // states one stable, predictable anchor.
   const bubble = document.createElement('div');
   bubble.setAttribute('data-kruz', 'bubble');
-  bubble.style.cssText = 'all:initial;position:fixed;top:4px;left:50%;transform:translateX(-50%);z-index:2147483646;pointer-events:none;display:none;';
+  bubble.style.cssText = 'all:initial;position:fixed;top:10px;left:10px;z-index:2147483646;pointer-events:none;display:none;';
   const PILL_CSS = 'display:flex;align-items:center;gap:8px;font:700 12.5px/1 ui-sans-serif,system-ui,sans-serif;color:#ffffff;background:linear-gradient(180deg,#2563eb,#1d4ed8);border:1px solid rgba(147,197,253,.95);border-radius:999px;padding:8px 14px;letter-spacing:.2px;white-space:nowrap;box-shadow:0 4px 18px rgba(29,78,216,.55),0 0 0 1px rgba(255,255,255,.12) inset;';
   const DOT_CSS = 'width:8px;height:8px;border-radius:50%;background:#bfdbfe;box-shadow:0 0 10px #93c5fd;flex:none;';
 
@@ -291,11 +350,24 @@ export function visualLayerScript(): string {
     try { if (!bubble.isConnected) parent.appendChild(bubble); } catch (err) {}
     return host.isConnected && bubble.isConnected;
   };
-  const showStatus = (text) => {
+  /**
+   * Status text per state. Kept here so the banner and the glow cannot drift.
+   */
+  const MODE_TEXT = {
+    controlling: 'Controlled by Kruz',
+    thinking: 'Model is thinking',
+    awaiting: 'Input needed on Browser/TUI',
+  };
+
+  const showStatus = (text, state) => {
     while (bubble.firstChild) bubble.removeChild(bubble.firstChild);
     const pill = document.createElement('div');
     pill.style.cssText = PILL_CSS;
-    const dot = document.createElement('span'); dot.style.cssText = DOT_CSS; pill.appendChild(dot);
+    const dot = document.createElement('span');
+    dot.style.cssText = DOT_CSS;
+    if (state === 'thinking') dot.classList.add('thinking');
+    if (state === 'awaiting') dot.classList.add('awaiting');
+    pill.appendChild(dot);
     const txt = document.createElement('span'); txt.setAttribute('data-kruz-text', '1'); txt.textContent = text;
     pill.appendChild(txt);
     bubble.appendChild(pill);
@@ -303,28 +375,71 @@ export function visualLayerScript(): string {
   };
 
   // ── Realtime overlay lifecycle ────────────────────────────────────
-  // lastPing is the single source of truth. The watchdog reads it every 50 ms
-  // and toggles the overlay on the IDLE_MS deadline, so visibility is driven by
-  // the heartbeat rather than by paired on/off calls.
+  // Two clocks, because they answer two different questions:
+  //
+  //   lastPing     "is a tool call in flight RIGHT NOW?"  -> controlling (blue)
+  //   lastEngaged  "did the model do anything recently?"   -> thinking (amber)
+  //
+  // Three states:
+  //
+  //   controlling  blue glow    a call is in flight (ping within IDLE_MS)
+  //   thinking     amber glow   nothing in flight, but the model engaged within
+  //                             AWAIT_MS, so it is mid-task and may act again
+  //   awaiting     no glow      either declared (session.pause / human.takeover)
+  //                             or quiet for AWAIT_MS, meaning the turn has ended
+  //                             and a human is expected
+  //
+  // Two decisions worth spelling out:
+  //
+  //  - The banner is ALWAYS visible; only the glow changes. The glow keeps its
+  //    meaning as the input-lock indicator, so the page is freely interactive in
+  //    thinking and awaiting.
+  //  - The explicit "awaiting" flag is sticky until a ping, because pause and
+  //    takeover are declarations of intent, not states that should lapse. The
+  //    "thinking" case is NOT sticky: it is a deadline on lastEngaged, so a page
+  //    that has been quiet for AWAIT_MS auto-promotes to awaiting. Without that,
+  //    session.resume would show "Model is thinking" forever and the very TUI
+  //    case this banner exists for (model stopped, waiting for input) could never
+  //    happen on its own.
   let lastPing = 0;
+  let lastEngaged = 0;
+  let mode = 'controlling';
+  let explicitAwaiting = false;
   let visible = false;
   let watchdog = 0;
 
-  const applyVisible = (on) => {
-    if (on === visible) return;
-    visible = on;
-    lockOn = on;
-    setLockListeners(on);
-    if (glow) glow.style.display = on ? '' : 'none';
-    if (cur) cur.classList.toggle('hidden', !on);
-    if (on) showStatus('Kruz is controlling this browser');
-    else bubble.style.display = 'none';
+  const applyMode = (next) => {
+    // tick() runs every 50ms. Rebuilding the banner node on every tick would
+    // churn the DOM 20x/second for a ~12-char text change, so act only on an
+    // actual state transition (plus the one forced first paint).
+    const changed = next !== mode;
+    if (!changed && bubble.style.display === 'block') return;
+    mode = next;
+    const locked = next === 'controlling';
+    if (changed) { visible = locked; lockOn = locked; setLockListeners(locked); }
+    if (glow) {
+      glow.classList.toggle('thinking', next === 'thinking');
+      glow.classList.toggle('awaiting', next === 'awaiting');
+      // the pulse animation drives a blue box-shadow, so it must not fight the
+      // amber state; pulse is re-enabled only while controlling.
+      glow.classList.toggle('pulse', next === 'controlling');
+      glow.style.display = next === 'awaiting' ? 'none' : '';
+    }
+    if (cur) cur.classList.toggle('hidden', next !== 'controlling');
+    showStatus(MODE_TEXT[next] ?? MODE_TEXT.thinking, next);
   };
 
   const tick = () => {
     try {
-      if (lastPing && (Date.now() - lastPing) <= IDLE_MS) applyVisible(true);
-      else applyVisible(false);
+      const now = Date.now();
+      const pingAge = lastPing ? now - lastPing : Infinity;
+      const quietFor = lastEngaged ? now - lastEngaged : Infinity;
+      // Order matters: a call in flight wins over everything, an explicit
+      // pause/takeover wins over inference, and only then is it inferred.
+      if (pingAge <= IDLE_MS) applyMode('controlling');
+      else if (explicitAwaiting) applyMode('awaiting');
+      else if (quietFor <= AWAIT_MS) applyMode('thinking');
+      else applyMode('awaiting');
     } catch (err) {}
   };
   const startWatchdog = () => {
@@ -338,7 +453,13 @@ export function visualLayerScript(): string {
      * overlay stays on for IDLE_MS after the last ping and turns itself off.
      */
     ping() {
-      lastPing = Date.now();
+      const now = Date.now();
+      lastPing = now;
+      lastEngaged = now;
+      // A ping clears any explicit "awaiting" claim — otherwise the page would be
+      // stuck on "Input needed" forever after session.pause, because tick() gives
+      // explicitAwaiting priority over the activity it just recorded.
+      explicitAwaiting = false;
       ensureAttached();
       startWatchdog();
       tick();
@@ -371,21 +492,72 @@ export function visualLayerScript(): string {
     },
     setGlow(active) { if (glow) glow.style.display = active === false ? 'none' : ''; return true; },
     /**
-     * Explicit toggle (sessions, pause/resume). true pings now; false forces
-     * the overlay off immediately and clears the heartbeat so it stays off.
+     * Set the banner state explicitly. awaiting is the one a caller normally
+     * needs - it is how session.pause / human.takeover announce that a human is
+     * required. Passing thinking or controlling clears the explicit flag so the
+     * watchdog resumes driving the state from activity.
+     */
+    setMode(next) {
+      ensureAttached();
+      if (next === 'awaiting') {
+        explicitAwaiting = true;
+      } else if (next === 'controlling') {
+        explicitAwaiting = false;
+        lastPing = lastEngaged = Date.now();
+      } else {
+        // thinking: the model holds the page but is not mid-action. Marking it
+        // ENGAGED (not pinged) is what puts it in the amber state instead of
+        // blue, and restarts the AWAIT_MS window that will later promote it to
+        // awaiting on its own.
+        explicitAwaiting = false;
+        lastEngaged = Date.now();
+      }
+      startWatchdog();
+      tick();
+      return true;
+    },
+    /** Current banner state: 'controlling' | 'thinking' | 'awaiting'. */
+    getMode() { return mode; },
+    /**
+     * Explicit toggle (sessions, pause/resume). true pings now; false marks the
+     * page as awaiting a human, so the banner says so instead of going blank.
      */
     setLock(on) {
       ensureAttached();
       const next = on === true;
-      if (next) { lastPing = Date.now(); startWatchdog(); }
-      else { lastPing = 0; }
+      if (next) { explicitAwaiting = false; lastPing = Date.now(); startWatchdog(); }
+      else { explicitAwaiting = true; }
       tick();
       return true;
     },
-    /** Diagnostic: is the model currently in control? */
-    isLocked() { return visible; },
+    /** Diagnostic: is Kruz actively driving (glow up, input locked)? */
+    isLocked() { return mode === 'controlling'; },
     /** Diagnostic: who owns the page right now. */
-    owner() { return visible ? 'model' : 'idle'; },
+    owner() { return mode === 'controlling' ? 'model' : 'idle'; },
+    /**
+     * Diagnostic read-out of everything the three states depend on. The glow
+     * lives in a CLOSED shadow root, so neither page scripts nor a harness can
+     * otherwise see whether the amber ring or the "no glow" rule is in effect —
+     * only the mode itself is reachable from outside. Tests assert on this.
+     */
+    snapshot() {
+      const r = bubble.getBoundingClientRect();
+      return {
+        mode,
+        locked: mode === 'controlling',
+        explicit_awaiting: !!explicitAwaiting,
+        ping_age_ms: lastPing ? Date.now() - lastPing : null,
+        quiet_ms: lastEngaged ? Date.now() - lastEngaged : null,
+        banner_text: (bubble.querySelector('[data-kruz-text]') || {}).textContent || null,
+        banner_display: bubble.style.display || 'none',
+        banner_top: r.top,
+        banner_left: r.left,
+        glow_classes: glow ? String(glow.className) : null,
+        glow_display: glow ? (glow.style.display || 'inline') : null,
+        idle_ms: IDLE_MS,
+        await_ms: AWAIT_MS,
+      };
+    },
     destroy() {
       try { if (watchdog) clearInterval(watchdog); } catch (err) {}
       watchdog = 0;
@@ -396,9 +568,14 @@ export function visualLayerScript(): string {
     },
   };
   Object.defineProperty(window, '__kruzVisual', { value: api, configurable: true, writable: true });
-  // Cold start: visible cannot be true without a heartbeat, so explicitly
-  // guarantee the overlay and cursor are hidden until the first ping.
-  applyVisible(false);
+  // Cold start: no ping has ever arrived, so Kruz is not driving and blue would
+  // be a lie — but showing nothing is worse than showing something. The model has
+  // just created this session and is working out what to do, which is "thinking";
+  // if nothing pings within AWAIT_MS it promotes itself to awaiting. A ping (the
+  // next action) promotes it to controlling.
+  lastEngaged = Date.now();
+  explicitAwaiting = false;
+  applyMode('thinking');
   return 'ok';
 })()`;
 }

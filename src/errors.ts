@@ -67,6 +67,15 @@ export const ErrCode = {
   CONDITION_NOT_MET: "CONDITION_NOT_MET",
   // input / pages
   CLICK_FAILED: "CLICK_FAILED",
+  /**
+   * A `fill`/`select` was dispatched but the control did not keep the value — a
+   * framework handler rejected or transformed it, or a reactive control reverted
+   * it. Distinct from CLICK_FAILED because the remediation is completely different:
+   * an overlay and `force:true` have nothing to do with it. Previously every such
+   * failure fell through to the CLICK_FAILED default and told the caller to retry
+   * with `force:true` (reported from a Canva numeric field).
+   */
+  FILL_NOT_RETAINED: "FILL_NOT_RETAINED",
   INVALID_TARGET: "INVALID_TARGET",
   INVALID_INPUT: "INVALID_INPUT",
   /** The named tab is not open. A caller mistake, not a browser failure. */
@@ -280,6 +289,7 @@ const HELP: Partial<Record<ErrCode, string>> = {
   [ErrCode.UNKNOWN_TOOL]: "Check the tool name against the registered tool list.",
   [ErrCode.RETRY_EXHAUSTED]: "Every recovery attempt failed. Inspect the page with page.observe before retrying.",
   [ErrCode.CLICK_FAILED]: "The click could not be dispatched. Inspect the target with page.observe; retry with force:true if an overlay is in the way.",
+  [ErrCode.FILL_NOT_RETAINED]: "The field took the input event but did not keep the value, so a script handler rejected or reformatted it. Do NOT retry with force:true — that is for clicks. Read the field's current value; if the app commits on blur, follow the fill with page.press({key:'Tab'}) or Enter. For controlled inputs, set one field at a time.",
   [ErrCode.CU_NO_TARGET]: "No computer-use target at that index. Call page.computerUseList to get the current targets, then retry.",
   [ErrCode.CU_LIST]: "Could not read interactive targets. The page may be mid-navigation; observe and retry.",
   [ErrCode.CU_SNAPSHOT]: "Could not read the computer-use snapshot. Observe and retry.",
@@ -365,27 +375,29 @@ export function classify(code: string): Subsystem {
     case ErrCode.RESUME_FAILED:
     case ErrCode.BROWSER_LAUNCH_FAILED:
       return "session";
-    case ErrCode.ELEMENT_OBSCURED:
-    case ErrCode.ELEMENT_DISABLED:
-    case ErrCode.ELEMENT_NOT_VISIBLE:
-    case ErrCode.ELEMENT_NOT_EDITABLE:
-    case ErrCode.ELEMENT_NOT_FOUND:
-    case ErrCode.STALE_ELEMENT:
-    case ErrCode.CLICK_FAILED:
+    // Ref lifecycle and target lookup are the *selector's* business, so they report
+    // as "selector". These used to sit in the "engine" arm with a second, unreachable
+    // duplicate arm below it claiming "selector" — the earlier arm always won, so the
+    // intended classification was dead code and every ref error reported "engine".
     case ErrCode.AMBIGUOUS_TARGET:
     case ErrCode.TARGET_NOT_FOUND:
-    case ErrCode.TARGET_NOT_ACTIONABLE:
-    case ErrCode.STALE_REFERENCE:
-    case ErrCode.UNKNOWN_REFERENCE:
-    case ErrCode.DOCUMENT_CHANGED:
-    case ErrCode.FRAME_CHANGED:
-    case ErrCode.CONDITION_NOT_MET:
-      return "engine";
+    case ErrCode.ELEMENT_NOT_FOUND:
     case ErrCode.STALE_REFERENCE:
     case ErrCode.UNKNOWN_REFERENCE:
     case ErrCode.DOCUMENT_CHANGED:
     case ErrCode.FRAME_CHANGED:
       return "selector";
+    // Acting on a resolved node.
+    case ErrCode.ELEMENT_OBSCURED:
+    case ErrCode.ELEMENT_DISABLED:
+    case ErrCode.ELEMENT_NOT_VISIBLE:
+    case ErrCode.ELEMENT_NOT_EDITABLE:
+    case ErrCode.STALE_ELEMENT:
+    case ErrCode.CLICK_FAILED:
+    case ErrCode.FILL_NOT_RETAINED:
+    case ErrCode.TARGET_NOT_ACTIONABLE:
+    case ErrCode.CONDITION_NOT_MET:
+      return "engine";
     case ErrCode.OVERLAY_NO_DISMISS_INTENT:
       return "overlay";
     case ErrCode.ACTION_TIMEOUT:
@@ -401,9 +413,6 @@ export function classify(code: string): Subsystem {
     case ErrCode.CU_SCROLL:
     case ErrCode.CU_NO_TARGET:
       return "computer-use";
-    case ErrCode.TARGET_NOT_FOUND:
-    case ErrCode.ELEMENT_NOT_FOUND:
-      return "selector";
     default:
       return "internal";
   }
@@ -477,6 +486,12 @@ export function kruzErrorFromThrown(err: unknown, opts: { subsystem?: Subsystem;
   }
   if (/Element not found/i.test(raw)) {
     return kruzError(ErrCode.TARGET_NOT_FOUND, { subsystem: opts.subsystem ?? "engine", message: raw.replace(/^Error:\s*/, ""), cause: err, trace: opts.trace });
+  }
+  // A fill that was dispatched but did not stick. Must be matched BEFORE the
+  // CLICK_FAILED default, which would otherwise claim an overlay caused it and
+  // recommend force:true — wrong tool, wrong cause, wrong remedy.
+  if (/Fill did not retain/i.test(raw)) {
+    return kruzError(ErrCode.FILL_NOT_RETAINED, { subsystem: opts.subsystem ?? "engine", message: "The field accepted the input event but did not keep the value; a script handler likely rejected or transformed it.", cause: err, trace: opts.trace });
   }
   if (/Ambiguous target/i.test(raw)) {
     return kruzError(ErrCode.AMBIGUOUS_TARGET, { subsystem: opts.subsystem ?? "engine", message: "Multiple elements match this target across child frames.", cause: err, trace: opts.trace });

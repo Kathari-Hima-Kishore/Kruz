@@ -24,7 +24,7 @@ import type {
 } from "../engine.js";
 import type { Target, Fallback } from "../../types/schema.js";
 import type { P1Config } from "../../config.js";
-import { computePath, stepDelaysMs, visualLayerScript } from "../visual-cursor.js";
+import { computePath, stepDelaysMs, resamplePath, visualLayerScript } from "../visual-cursor.js";
 import { stealthScript } from "../stealth.js";
 
 /* ── tiny helpers ──────────────────────────────────────────────────── */
@@ -45,6 +45,15 @@ const NAV_WAIT_MAP: Record<string, "networkidle0" | "networkidle1" | "domcontent
   commit: "domcontentloaded",
 };
 
+// Real cap for captured response bodies. The run log's Workday crash arrived with
+// network.capture on: memory accumulated because the body buffer was never actually
+// truncated (the `truncated` flag was set but the body kept in full) and the event
+// list grew without bound.
+const NETWORK_BODY_MAX_CHARS = 200_000;
+// Ring cap on retained events: drop the oldest past this many. Without it, a full
+// capture session on a response-rich SPA grew the array for the whole run.
+const NETWORK_EVENT_CAP = 500;
+
 /* ── engine ───────────────────────────────────────────────────────── */
 
 export class PuppeteerEngine implements BrowserEngine {
@@ -61,11 +70,31 @@ export class PuppeteerEngine implements BrowserEngine {
   private _networkEvents: NetworkEvent[] = [];
   private _networkEnabled = false;
   private _captureBodies = false;
+  /**
+   * Whether request interception is currently INSTALLED on `_page`
+   * (`null` = unknown, so the next call re-asserts instead of assuming).
+   *
+   * This exists because `setRequestInterception` was being re-issued on every
+   * single `page.open` (via controller.listen) and on every `switchTab`, to put
+   * a page into a state it was usually already in. That is not free: see
+   * `setInterception` below for why the redundant call was the expensive part.
+   */
+  private _interceptionOn: boolean | null = null;
   private _consoleEvents: ConsoleEvent[] = [];
   private _consoleEnabled = false;
   private _dialogQueue: { page: Page; dialog: Dialog; event: DialogEvent }[] = [];
   private _dialogPolicy?: { action: "accept" | "dismiss"; value?: string };
   private _config: P1Config | null = null;
+  /**
+   * The display's REAL device pixel ratio, captured before any viewport emulation.
+   *
+   * Puppeteer's `page.setViewport` defaults `deviceScaleFactor` to 1. Applying a
+   * viewport without restoring the real ratio would silently change every element
+   * crop from DEVICE pixels to CSS pixels (a 238x250 CSS box is 298x313 at dpr
+   * 1.25 today, and would become 238x250) — which breaks the vision pipeline's
+   * `image_space: device_px` contract and every size assertion built on it.
+   */
+  private _dpr = 1;
   private evaluateTimeoutMs = 5000;
   /** Last point the visible cursor acted on, so a later glide starts there. */
   private _lastCursor?: { x: number; y: number };
@@ -106,6 +135,10 @@ export class PuppeteerEngine implements BrowserEngine {
     const pages = await this._browser.pages();
     this._page = pages[0] ?? (await this._browser.newPage());
     this.attachHandlers(this._page);
+    // Capture the display's real DPR before any Emulation override is applied, so
+    // setViewportSize() can pin the CSS viewport WITHOUT collapsing device pixels.
+    const dpr = await this.page.evaluate(() => window.devicePixelRatio).catch(() => 1);
+    if (typeof dpr === "number" && dpr > 0) this._dpr = dpr;
     // Automation tells are removed in-page at document_start (see stealth.ts) —
     // this replaces the --disable-blink-features=AutomationControlled flag, which
     // Chrome answers with an "unsupported command-line flag" infobar.
@@ -172,11 +205,27 @@ export class PuppeteerEngine implements BrowserEngine {
       if (this._captureBodies && (res.headers()["content-type"] || "").includes("json")) {
         try {
           const txt = await res.text();
-          evt.body = txt;
-          evt.truncated = txt.length > 200_000;
+          // Previously `evt.body = txt` stored the FULL body while `truncated` was
+          // still only ever a flag saying it *would* be 200KB — contradicting itself.
+          // SYMMETRIC FIX: truncate the stored body for real, keep the flag honest.
+          // On Workday's JSON-heavy board that turned the buffer into an unbounded,
+          // multi-hundred-KB-per-response copy of the session.
+          if (txt.length > NETWORK_BODY_MAX_CHARS) {
+            evt.body = txt.slice(0, NETWORK_BODY_MAX_CHARS);
+            evt.truncated = true;
+          } else {
+            evt.body = txt;
+            evt.truncated = false;
+          }
         } catch { /* ignore */ }
       }
       this._networkEvents.push(evt);
+      // Bound the buffer: drop oldest so a long capture session cannot retain
+      // every response — with bodies now capped per event, the cap per EVENT was the
+      // remaining growth vector.
+      if (this._networkEvents.length > NETWORK_EVENT_CAP) {
+        this._networkEvents.splice(0, this._networkEvents.length - NETWORK_EVENT_CAP);
+      }
     });
   }
 
@@ -188,11 +237,50 @@ export class PuppeteerEngine implements BrowserEngine {
     try { return await this.withEvaluateTimeout(this.page.title()); }
     catch { return ""; }
   }
-  async viewportSize(): Promise<{ width: number; height: number }> {
+  /**
+ * The page's REAL layout viewport, measured in-page.
+ *
+ * This deliberately does NOT use `page.viewport()`. That returns the CDP emulation
+ * override — i.e. what Puppeteer was told to emulate — and falls back to a hardcoded
+ * 1280x720 when emulation is off. So it can never disagree with what was requested,
+ * which made it useless as the read-back in `mkSession`: the reported "measured"
+ * viewport was the request echoed back, and a headed window at a genuinely different
+ * size went unreported (DEF-5).
+ *
+ * `window.innerWidth/innerHeight` is the layout viewport the page actually renders
+ * into, and it is what responsive breakpoints key off — so it is the number that
+ * determines which elements exist. Falls back to the emulation value only if the
+ * page cannot be evaluated.
+ */
+async viewportSize(): Promise<{ width: number; height: number; dpr?: number }> {
+    // NOTE: `this.page.evaluate` is the raw Puppeteer page, so it resolves to the
+    // value itself — NOT the engine's `{ ok, result }` EvalResult wrapper. Reading
+    // `.ok`/`.result` here silently always failed and fell through to the hardcoded
+    // default, which is why the first attempt at this fix appeared to do nothing.
+    const m: any = await this.page
+      .evaluate(() => ({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio }))
+      .catch(() => null);
+    if (m && typeof m.width === "number" && m.width > 0 && typeof m.height === "number" && m.height > 0) {
+      // `dpr` rides along so a capture can declare its own coordinate space
+      // (device px vs the CSS px `clickAt` expects) instead of leaving the caller
+      // to infer the ratio — see controller.screenshot (E-008).
+      return { width: m.width, height: m.height, dpr: typeof m.dpr === "number" && m.dpr > 0 ? m.dpr : 1 };
+    }
     const vp = this.page.viewport();
-    return vp ? { width: vp.width, height: vp.height } : { width: 1280, height: 720 };
+    return vp ? { width: vp.width, height: vp.height, dpr: 1 } : { width: 1280, height: 720, dpr: 1 };
   }
-  async setViewportSize(w: number, h: number): Promise<void> { await this.page.setViewport({ width: w, height: h }); }
+  async setViewportSize(w: number, h: number): Promise<void> {
+    // Pin the CSS viewport for determinism WITHOUT touching the device scale
+    // factor. Responsive layouts flip between mobile and desktop variants at a
+    // media-query breakpoint, so an agent that lets window.innerWidth follow the
+    // window manager can find a control it observed simply gone after the user
+    // un-maximizes. But Puppeteer defaults deviceScaleFactor to 1, which would
+    // turn every element crop from device pixels into CSS pixels.
+    await this.page.setViewport({ width: w, height: h, deviceScaleFactor: this._dpr });
+  }
+
+  /** The real device pixel ratio this engine preserves across viewport emulation. */
+  get deviceScaleFactor(): number { return this._dpr; }
   async bringToFront(): Promise<void> {
     // K31: Page.bringToFront CDP can hang without responding right after a goto timeout.
     // It's a focus ping on an already-active page (we just navigated it), so a short bound
@@ -200,7 +288,41 @@ export class PuppeteerEngine implements BrowserEngine {
     try { await this.withEvaluateTimeout(this.page.bringToFront(), 1500); }
     catch { /* best-effort; the page is already active if we just navigated it */ }
   }
-  async close(): Promise<void> { await this.page.close().catch(() => {}); }
+  /**
+ * Close the ACTIVE TAB only. The browser process and every other tab keep running.
+ *
+ * This is what `session.close({graceful:false})` used to call, which made "hard
+ * close" the *weakest* close available: Chrome survived with all its tabs, still
+ * holding the `--user-data-dir` lock, so the next `session.create` failed with
+ * BROWSER_LAUNCH_FAILED (13 orphaned chrome.exe reported). Use `terminate()` to
+ * actually release the profile.
+ */
+async close(): Promise<void> { await this.page.close().catch(() => {}); }
+
+/**
+ * Terminate the whole browser process, releasing the profile directory lock.
+ *
+ * `shutdown()` only closes Chrome when Kruz launched it; when Kruz merely attached
+ * to an existing browser it calls `disconnect()`, which deliberately leaves the
+ * user's browser running. Neither is right for a forced teardown, so this escalates:
+ * close the browser, then kill the process if it is still alive.
+ *
+ * Used by `session.close({graceful:false})` — the caller has explicitly asked for a
+ * hard stop and accepts losing unsaved browser state.
+ */
+async terminate(): Promise<void> {
+  const browser: any = this._browser;
+  if (!browser) { await this.shutdown().catch(() => {}); return; }
+  try { await browser.close(); } catch { /* already gone, or refusing to close */ }
+  // Chrome's main process owns the profile lock. If it outlived close(), kill it.
+  const proc = typeof browser.process === "function" ? browser.process() : null;
+  if (proc && typeof proc.exitCode !== "number") {
+    try { proc.kill("SIGKILL"); } catch { /* already exited */ }
+  }
+  this._page = null;
+  this._browser = null;
+  this._connected = false;
+}
   async content(): Promise<string> { return this.page.content(); }
 
   /* ── navigation ─────────────────────────────────────────────── */
@@ -377,16 +499,23 @@ export class PuppeteerEngine implements BrowserEngine {
     // tab to front and every subsequent action ran against the wrong page.
     this._page = p;
     if (url) await p.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
-    await p.bringToFront().catch(() => {});
+    await this.withEvaluateTimeout(p.bringToFront(), 1500).catch(() => {});
     return { id: this.tabId(p), url: p.url(), title: await p.title().catch(() => ""), isActive: true };
   }
   async listTabs(): Promise<KruzTab[]> {
-    const pages = await this._browser!.pages();
+    // Bounded at the source, not just at the callers. `page.listTabs` is an
+    // agent-facing tool, so an unbounded hang here is reachable directly and not
+    // only through internal page_id decoration.
+    const pages = await this.withEvaluateTimeout(this._browser!.pages(), 3000).catch(() => []);
     const active = this._page;
     return Promise.all(pages.map(async (p) => ({
       id: this.tabId(p),
       url: p.url(),
-      title: await p.title().catch(() => ""),
+      // Bound, for the same reason the engine's own `title()` is: Page.getTitle
+      // hangs indefinitely on a tab whose navigation is still in flight — exactly
+      // the state right after a goto timeout. A title is decoration; when it
+      // cannot be read in time, an empty string is the honest answer.
+      title: await this.withEvaluateTimeout(p.title(), 1500).catch(() => ""),
       isActive: p === active,
       openerId: (() => { const opener = pages.find(q => q.target() === p.target().opener()); return opener ? this.tabId(opener) : undefined; })(),
       isBlank: p.url() === "about:blank",
@@ -407,10 +536,23 @@ export class PuppeteerEngine implements BrowserEngine {
     if (!p) throw new Error(`No open tab '${tabId}'`);
     this.attachHandlers(p);
     this._page = p;
+    // A freshly-activated tab has never had interception applied, so the
+    // bookkeeping flag is per-tab-unknown here: force the toggle by clearing it.
+    this._interceptionOn = null;
     // Keep interception live on the newly-active tab so network capture
-    // (ATS feed bodies) keeps working after a switch.
-    if (this._networkEnabled) await p.setRequestInterception(true).catch(() => {});
-    await p.bringToFront().catch(() => {});
+    // (ATS feed bodies) keeps working after a switch. Bounded + deduped: this
+    // used to be a bare `setRequestInterception(true)` on every switch, which is
+    // the call that can block until the new tab's in-flight requests drain.
+    //
+    // It also keyed off `_networkEnabled` and always passed `true`, so body
+    // capture being ON was not actually what decided interception — defeating the
+    // "only pay the per-request CDP round-trip when bodies are wanted" rule
+    // documented in enableNetworkCapture. `_captureBodies` is the real condition.
+    if (this._networkEnabled) await this.setInterception(p, this._captureBodies);
+    // Same hazard as bringToFront() above: an unbounded focus ping here used to
+    // hang switchTab past the router's 25s budget, so the tool reported
+    // ACTION_TIMEOUT for a switch that had already succeeded.
+    await this.withEvaluateTimeout(p.bringToFront(), 1500).catch(() => {});
   }
 
   /* ── eval ────────────────────────────────────────────────────── */
@@ -448,6 +590,42 @@ export class PuppeteerEngine implements BrowserEngine {
       if (timer) clearTimeout(timer);
     }
   }
+
+  /**
+   * Install (or remove) request interception, bounded and idempotent.
+   *
+   * `Page.setRequestInterception` is a CDP call that does not settle until every
+   * already-in-flight intercepted request has been handled. On a heavy page that
+   * means it blocks for as long as the page keeps issuing requests — and on a
+   * renderer mid-navigation it can simply never answer. The old call sites wrapped
+   * it in `.catch(() => {})`, which handles a REJECTION and does nothing at all
+   * about a HANG, so `controller.listen()` blocked on it before `page.open` had
+   * even started navigating. That is the observed `ACTION_TIMEOUT ... outcome:
+   * "unknown"` on careers.cognizant.com, twice, where the navigation never ran.
+   *
+   * Two changes, both needed:
+   *  1. Skip the call when the page is already in the requested state. On a normal
+   *     run capture is off, so this is the overwhelmingly common path and it now
+   *     costs nothing.
+   *  2. Bound the call, so a genuine state change on a busy page degrades to
+   *     "interception unavailable" (network.body returns nothing) instead of
+   *     wedging the route until the router's budget expires.
+   *
+   * The flag is set BEFORE the await, so concurrent callers dedupe against each
+   * other rather than both issuing the same toggle. That makes it optimistic: if
+   * the toggle times out we believe interception is on when it may not be. The
+   * failure mode is a missing body for `network.body`, which the caller can see
+   * and retry deliberately — strictly better than an un-resumable route.
+   */
+  private async setInterception(p: Page, on: boolean, budgetMs = 2000): Promise<void> {
+    if (this._interceptionOn === on) return;
+    this._interceptionOn = on;
+    try {
+      await this.withEvaluateTimeout(p.setRequestInterception(on), budgetMs);
+    } catch {
+      /* interception is an optimisation, never a correctness requirement */
+    }
+  }
   async readVariable<T = unknown>(name: string): Promise<T | undefined> {
     try {
       const result = await this.page.evaluate((n: string) => (globalThis as any)[n], name);
@@ -459,9 +637,50 @@ export class PuppeteerEngine implements BrowserEngine {
 
   /* ── screenshot ──────────────────────────────────────────────── */
 
-  async screenshot(opts: { fullPage?: boolean; path?: string }): Promise<Buffer> {
-    const buf = await this.page.screenshot({ fullPage: opts.fullPage ?? false, path: opts.path, type: "png" });
+  async screenshot(opts: { fullPage?: boolean; path?: string; type?: "png" | "jpeg" | "webp"; quality?: number }): Promise<Buffer> {
+    const type = opts.type ?? "png";
+    const buf = await this.page.screenshot({
+      fullPage: opts.fullPage ?? false,
+      path: opts.path as any,
+      type,
+      // `quality` is only meaningful for lossy types; passing it with png is rejected.
+      ...(type === "png" ? {} : { quality: opts.quality ?? 80 }),
+    });
     return Buffer.from(buf);
+  }
+
+  /** Intrinsic size of the captured image, without a second screenshot round trip. */
+  private imageSize(buf: Buffer): { width: number | null; height: number | null } {
+    try {
+      // PNG: IHDR width/height are big-endian uint32 at byte offsets 16 and 20.
+      if (buf.length > 24 && buf.readUInt32BE(0) === 0x89504e47) {
+        return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+      }
+      // JPEG: walk the segment chain to the SOFn frame header.
+      if (buf.length > 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+        let off = 2;
+        while (off + 9 < buf.length) {
+          if (buf[off] !== 0xff) { off++; continue; }
+          const marker = buf[off + 1];
+          const len = buf.readUInt16BE(off + 2);
+          if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+            return { height: buf.readUInt16BE(off + 5), width: buf.readUInt16BE(off + 7) };
+          }
+          off += 2 + len;
+        }
+      }
+      // WebP (VP8X / VP8 / VP8L): dimensions are 24-bit little-endian after a chunk header.
+      if (buf.length > 30 && buf.slice(8, 12).toString("latin1") === "WEBP") {
+        const fmt = buf.slice(12, 16).toString("latin1");
+        if (fmt === "VP8X") return { width: 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16)), height: 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16)) };
+        if (fmt === "VP8 ") return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+        if (fmt === "VP8L") {
+          const b = buf.readUInt32LE(21);
+          return { width: (b & 0x3fff) + 1, height: ((b >> 14) & 0x3fff) + 1 };
+        }
+      }
+    } catch { /* dimensions are advisory; never fail a capture over them */ }
+    return { width: null, height: null };
   }
 
   /* ── frames ──────────────────────────────────────────────────── */
@@ -740,12 +959,18 @@ export class PuppeteerEngine implements BrowserEngine {
 
   /* ── element operations ──────────────────────────────────────── */
 
-  async click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow" }): Promise<void> {
+  async click(el: KruzElement, opts?: { button?: "left" | "right" | "middle"; clickCount?: number; force?: boolean; timeoutMs?: number; visual?: boolean; speed?: "instant" | "fast" | "normal" | "slow"; modifiers?: string[] }): Promise<void> {
     // Open the dispatch window BEFORE any waiting: the obscured check, the
     // scroll and Puppeteer's actionability wait are all part of this click.
     await this.expectInput(Math.max(3000, opts?.timeoutMs ?? 5000));
+    // Held modifiers are what make shift-click multi-select / ctrl-click additive
+    // selection work in canvas editors. Key COMBOS (page.press "Control+g") cannot
+    // cover this: a combo is atomic, while multi-select needs the modifier down
+    // across the whole click.
+    const modifiers = (opts?.modifiers ?? []).filter((m) => !!m);
+    for (const m of modifiers) await this.page.keyboard.down(m as any).catch(() => {});
     const handle = await this.resolveHandle(el);
-    if (!handle) throw new Error(`Element not found: ${el.handle}`);
+    if (!handle) { for (const m of [...modifiers].reverse()) await this.page.keyboard.up(m as any).catch(() => {}); throw new Error(`Element not found: ${el.handle}`); }
     try {
       const enabled = await handle.evaluate((node: any) => !node.disabled && node.getAttribute('aria-disabled') !== 'true');
       if (!enabled) throw new Error('ELEMENT_DISABLED');
@@ -851,6 +1076,9 @@ export class PuppeteerEngine implements BrowserEngine {
     } finally {
       // Disposal waits on renderer execution while a native dialog is open.
       if (!this._dialogQueue.some(d => d.page === this.page)) await handle.dispose().catch(() => {});
+      // Always release: a modifier stuck down makes every subsequent click a
+      // shift-click, which is far worse than the modifier never landing.
+      for (const m of [...modifiers].reverse()) await this.page.keyboard.up(m as any).catch(() => {});
       this.endInput();
     }
   }
@@ -1034,11 +1262,19 @@ export class PuppeteerEngine implements BrowserEngine {
     // sticky headers, SPA layout shifts keep shifting it). Clicks issued
     // mid-shift land on the wrong node with no error — the classic "click went
     // through but hit the wrong thing" on job portals.
+    //
+    // The first probe is after ONE FRAME, not after a flat 100ms. The old loop
+    // slept 100ms before its first comparison, so no action could ever return
+    // sooner than 100ms even when the rect had not moved at all — a 110-200ms
+    // floor measured on every click, fill and press, on pages with no layout
+    // shift whatsoever. An instant scroll has already applied by the next frame,
+    // so an unchanged rect has nothing to settle; only a rect that has MOVED
+    // pays the full 100ms to wait it out.
     try {
       const rectOf = (n: any) => { const r = n.getBoundingClientRect(); return [r.x, r.y, r.width, r.height].join(","); };
       let last: string = await handle.evaluate(rectOf);
       for (let i = 0; i < 10; i++) {
-        await sleep(100);
+        await sleep(i === 0 ? 16 : 100);
         const cur: string = await handle.evaluate(rectOf);
         if (cur === last) break;
         last = cur;
@@ -1420,12 +1656,22 @@ export class PuppeteerEngine implements BrowserEngine {
     return this.page.$$(sel).then((els) => els.length).catch(() => 0);
   }
 
-  async screenshotElement(el: KruzElement, opts?: { path?: string }): Promise<Buffer> {
+  async screenshotElement(el: KruzElement, opts?: { path?: string; type?: "png" | "jpeg" | "webp"; quality?: number }): Promise<Buffer> {
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
-    const buf = await handle.screenshot({ type: "png", path: opts?.path as any }) as Buffer;
+    const type = opts?.type ?? "png";
+    const buf = await handle.screenshot({
+      type,
+      path: opts?.path as any,
+      ...(type === "png" ? {} : { quality: opts?.quality ?? 80 }),
+    }) as Buffer;
     await handle.dispose().catch(() => {});
     return Buffer.from(buf);
+  }
+
+  /** Intrinsic dimensions of a PNG/JPEG/WebP buffer. Advisory; never throws. */
+  imageDimensions(buf: Buffer): { width: number | null; height: number | null } {
+    return this.imageSize(buf);
   }
 
   async queryOneInFrame(frameId: string, target: Target, fallback?: Fallback): Promise<KruzElement | null> {
@@ -1508,20 +1754,120 @@ export class PuppeteerEngine implements BrowserEngine {
     await this.page.mouse.up();
   }
 
-  async html5Drag(src: KruzElement, dst: KruzElement): Promise<void> {
+  async dragPath(
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    opts?: { steps?: number; button?: "left" | "right" | "middle"; speed?: "instant" | "fast" | "normal" | "slow"; modifiers?: string[]; pressHoldMs?: number; releaseSettleMs?: number },
+  ): Promise<{ steps: number; duration_ms: number; modifiers: string[] }> {
+    const speed = opts?.speed ?? "normal";
+    const button = (opts?.button ?? "left") as any;
+    const modifiers = (opts?.modifiers ?? []).filter((m) => !!m);
+    const t0 = Date.now();
+    // Held keys make the browser apply the modifier to the generated mouse events,
+    // which is what shift-click multi-select and ctrl-click additive selection in
+    // canvas editors actually listen for.
+    for (const m of modifiers) await this.page.keyboard.down(m as any);
+    let steps = 0;
+    try {
+      await this.expectInput(Math.max(3000, 5000));
+      // Approach the grab point and pause: a press with no prior hover registers as a
+      // cold hit-test miss on engines that require a hover target.
+      await this.page.evaluate((x: number, y: number) => { try { (window as any).__kruzVisual?.setPos(x, y); } catch { /* layer absent */ } }, from.x, from.y).catch(() => {});
+      await this.page.mouse.move(from.x, from.y);
+      await sleep(speed === "instant" ? 0 : 40);
+
+      await this.page.evaluate(() => { try { (window as any).__kruzVisual?.press(true); } catch { /* layer absent */ } }).catch(() => {});
+      await this.page.mouse.down({ button });
+      const pressHold = opts?.pressHoldMs ?? (speed === "instant" ? 0 : 60);
+      if (pressHold) await sleep(pressHold);
+
+      // Walk a real trajectory with per-step delays. Every intermediate move is
+      // dispatched while the button is held (puppeteer tracks the pressed buttons),
+      // so the page sees a continuous pointer drag rather than two teleports.
+      //
+      // `steps` is honoured by resampling the human trajectory, not by replacing
+      // it: the easing curve is what makes the gesture look human, and the count is
+      // what decides whether the page starts a drag at all. Ignoring `steps` made a
+      // documented knob a no-op (asked for 30, got the speed default).
+      const raw = computePath(from, to, { speed });
+      const want = opts?.steps && opts.steps > 1 ? Math.min(opts.steps, 200) : raw.length;
+      const path = resamplePath(raw, want);
+      const delays = stepDelaysMs(path, { speed });
+      for (let i = 0; i < path.length; i++) {
+        const p = path[i];
+        await this.page.evaluate((x: number, y: number) => { try { (window as any).__kruzVisual?.setPos(x, y); } catch { /* layer absent */ } }, p.x, p.y).catch(() => {});
+        await this.page.mouse.move(p.x, p.y);
+        steps++;
+        const d = delays[i] ?? 0;
+        if (d > 0) await sleep(d);
+      }
+
+      // Settle on the target before releasing. Releasing on the same task as the last
+      // move is a recognised way to lose a drop.
+      const settle = opts?.releaseSettleMs ?? (speed === "instant" ? 0 : 80);
+      if (settle) await sleep(settle);
+      await this.page.mouse.up({ button });
+      await this.page.evaluate(() => { try { const v = (window as any).__kruzVisual; v?.press(false); v?.ripple(); } catch { /* layer absent */ } }).catch(() => {});
+    } finally {
+      // Release must happen even if the gesture failed, or the page keeps a stuck
+      // primary button — which silently disables every later click.
+      try { await this.page.mouse.up({ button }); } catch { /* already up */ }
+      for (const m of [...modifiers].reverse()) await this.page.keyboard.up(m as any).catch(() => {});
+      this.endInput();
+    }
+    return { steps, duration_ms: Date.now() - t0, modifiers };
+  }
+
+  async viewportPoint(el: KruzElement): Promise<{ x: number; y: number } | null> {
+    const handle = await this.resolveHandle(el);
+    if (!handle) return null;
+    try {
+      await this.scrollHandleIntoView(handle);
+      return await handle.evaluate((n: any) => {
+        const r = n.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return null;
+        // getBoundingClientRect is viewport-relative, which is exactly the space
+        // trusted mouse input is dispatched in.
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      });
+    } finally {
+      await handle.dispose().catch(() => {});
+    }
+  }
+
+  async uploadFileTo(el: KruzElement, paths: string[]): Promise<{ files: string[] }> {
+    // Same CDP DOM.setFileInputFiles route as setFiles(), kept as a named method
+    // because "attach a file" is the operation a caller is actually expressing.
+    await this.setFiles(el, paths);
+    return { files: paths };
+  }
+
+  async html5Drag(src: KruzElement, dst: KruzElement, payload?: Record<string, string>): Promise<void> {
     const srcHandle = await this.resolveHandle(src);
     const dstHandle = await this.resolveHandle(dst);
     if (!srcHandle || !dstHandle) throw new Error("Source or dest not found");
     try {
-      await srcHandle.evaluate((s: any, d: any) => {
+      await srcHandle.evaluate((s: any, d: any, data: Record<string, string> | null) => {
         const dt = new DataTransfer();
-        const dragStart = new DragEvent("dragstart", { bubbles: true, dataTransfer: dt });
-        s.dispatchEvent(dragStart);
-        const drop = new DragEvent("drop", { bubbles: true, dataTransfer: dt });
-        d.dispatchEvent(drop);
-        const dragEnd = new DragEvent("dragend", { bubbles: true, dataTransfer: dt });
-        s.dispatchEvent(dragEnd);
-      }, dstHandle);
+        // Seed the payload DIRECTLY rather than trusting the page's own dragstart
+        // listener. Measured in this Chrome: `dt.setData()` called straight from
+        // script survives, but the SAME call made inside a `dragstart` handler on a
+        // synthetic DataTransfer is discarded — the drop handler then read an empty
+        // string even though dragstart had fired. So a synthetic HTML5 drag cannot
+        // rely on the app populating its own transfer, and `data` is the way through.
+        if (data) { for (const k of Object.keys(data)) { try { dt.setData(k, String(data[k])); } catch { /* type rejected */ } } }
+        try { dt.effectAllowed = "all"; dt.dropEffect = "move"; } catch { /* older shape */ }
+        s.dispatchEvent(new DragEvent("dragstart", { bubbles: true, cancelable: true, dataTransfer: dt }));
+        // dragenter/dragover before drop: most real drop handlers only accept the
+        // drop once dragover has been preventDefault()-ed, so skipping them makes a
+        // correct handler ignore an otherwise well-formed drop.
+        for (const type of ["dragenter", "dragover"]) {
+          const e = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt });
+          d.dispatchEvent(e);
+        }
+        d.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+        s.dispatchEvent(new DragEvent("dragend", { bubbles: true, cancelable: true, dataTransfer: dt }));
+      }, dstHandle, payload ?? null);
     } catch {
       // fallback: pointer events drag
       const srcBox = await srcHandle.boundingBox();
@@ -1601,13 +1947,13 @@ export class PuppeteerEngine implements BrowserEngine {
     // round-trip. Only pay for it when body capture is actually on (ATS feed
     // reads via network.body). Default browsing runs interception-free.
     // The "response" listener (URL/method/status log) works regardless.
-    if (this._captureBodies) await this.page.setRequestInterception(true).catch(() => {});
-    else await this.page.setRequestInterception(false).catch(() => {});
+    if (this._captureBodies) await this.setInterception(this.page, true);
+    else await this.setInterception(this.page, false);
   }
   async disableNetworkCapture(): Promise<void> {
     this._networkEnabled = false;
     this._captureBodies = false;
-    await this.page.setRequestInterception(false).catch(() => {});
+    await this.setInterception(this.page, false);
   }
   drainNetworkEvents(): NetworkEvent[] {
     const out = [...this._networkEvents];
