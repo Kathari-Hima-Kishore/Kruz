@@ -44,7 +44,18 @@ export function stealthScript(): string {
         navigator.permissions.query = function (params) {
           const name = params && params.name;
           if (name === 'notifications') {
-            return Promise.resolve({ state: Notification.permission === 'denied' ? 'denied' : Notification.permission, onchange: null });
+            // Notification.permission is a legacy 3-value enum (granted |
+            // denied | default), while the Permission API's
+            // PermissionStatus.state for notifications is (granted |
+            // denied | prompt). 'default' leaked through verbatim before, so
+            // any page checking status.state === 'prompt' - the value a real,
+            // never-granted profile reports - saw an invalid PermissionState
+            // and took a bot-detection branch.
+            const legacy = Notification.permission;
+            const state = legacy === 'granted' ? 'granted'
+              : legacy === 'denied' ? 'denied'
+              : 'prompt';
+            return Promise.resolve({ state, onchange: null });
           }
           return origQuery.call(this, params);
         };

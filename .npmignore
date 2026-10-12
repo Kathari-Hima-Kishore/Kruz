@@ -1,0 +1,41 @@
+# NPM package manifest.
+# See package.json "files" for what IS included. Everything else here is excluded.
+# Mirrors .gitignore with additions specific to npm publishing.
+
+# Source tree — not shipped; consumers install from dist/
+src/
+scripts/
+tests/
+dump/
+!dump/README.md
+
+# Dev-only files (not needed at runtime)
+MODEL_GUIDE.md
+SKILL.md
+kruz-bugs.md
+
+# Config artifacts (written by build; machine-specific)
+opencode.json
+opencode.jsonc
+.opencode/
+
+# Generated state
+browser-profile/
+downloads/
+
+# Node / editor / OS noise
+node_modules/
+dist/
+.env
+.env.local
+config.local.json
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+npm-debug.log*
+qa/
+*.tsbuildinfo
+.git/
+.gitignore

@@ -11,6 +11,7 @@ import { z } from "zod";
 import { ToolRouter } from "./router.js";
 
 import { loadConfig } from "../config.js";
+import { fileURLToPath } from "node:url";
 
 
 
@@ -754,13 +755,37 @@ export async function createServer(): Promise<{ server: McpServer; router: ToolR
 
     const path = await import("node:path");
 
+    // `new URL(import.meta.url).pathname` is percent-ENCODED, so on this repo
+    // it yields "/D:/project%20prototypes/Kruz/dist/mcp/server.js". Joining that
+    // produced "D:\D:\project%20prototypes\Kruz\SKILL.md" — a path that does
+    // not exist — so the fallback threw ENOENT and the resource read REJECTED
+    // for any client that spawned the server with a cwd other than the repo
+    // root (the normal case, since OpenCode sets cwd to the workspace).
+    // `fileURLToPath` decodes the escaping and yields a real Windows path.
+    const selfDir = path.dirname(fileURLToPath(import.meta.url));
+
     const skillPath = path.resolve(process.cwd(), "SKILL.md");
 
-    const fallbackPath = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../SKILL.md");
+    // dist/mcp/server.js and src/mcp/server.ts both sit two levels below the
+    // project root, so walk up until SKILL.md is actually found.
+    let fallbackPath = "";
+    let dir = selfDir;
+    for (let i = 0; i < 6 && !fallbackPath; i++) {
+      const candidate = path.resolve(dir, "SKILL.md");
+      if (fs.existsSync(candidate)) { fallbackPath = candidate; break; }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
 
     const filePath = fs.existsSync(skillPath) ? skillPath : fallbackPath;
 
-    const text = fs.readFileSync(filePath, "utf-8");
+    // Last resort: report the resource rather than rejecting the read. The skill
+    // is the agent's contract; an unreadable one must be visibly broken, not a
+    // hard transport error that looks like the MCP server itself failed.
+    const text = filePath
+      ? fs.readFileSync(filePath, "utf-8")
+      : `# Kruz skill unavailable\n\nSKILL.md could not be located. Searched ${skillPath} and the directories above ${selfDir}.\n`;
 
     return {
 

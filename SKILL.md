@@ -9,8 +9,8 @@ description: Kruz browser automation MCP server - 53 tools for driving a headed 
 
 This skill is the **global** runtime contract, and it is the shorter of the two
 documents by design. The project-local manual is
-[`MODEL_GUIDE.md`](./MODEL_GUIDE.md) in the Kruz repository
-(`D:/project prototypes/Kruz/MODEL_GUIDE.md`).
+[`MODEL_GUIDE.md`](./MODEL_GUIDE.md), which sits next to this file in the Kruz
+install directory.
 
 **Do this at the start of a Kruz task, not "if something goes wrong":** open and
 read `MODEL_GUIDE.md` before your first `page.open`. It carries what this file

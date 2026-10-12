@@ -8,13 +8,22 @@
     "kruz": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/write-opencode-config.mjs",
+    "build:only": "tsc",
+    "register": "node scripts/write-opencode-config.mjs",
+    "register:global": "node scripts/write-opencode-config.mjs --global",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --passWithNoTests",
     "test:watch": "vitest"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "scripts/write-opencode-config.mjs",
+    ".npmignore"
+  ],
   "keywords": [
     "mcp",
     "browser-automation",

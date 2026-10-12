@@ -36,7 +36,9 @@ Four properties define Kruz:
 
 ### 1. Prerequisites
 - **Node.js** v18+ — https://nodejs.org
-- **Google Chrome** — https://www.google.com/chrome/
+- **A Chromium-based browser** — Google Chrome is the default target, but Chromium,
+  Microsoft Edge and Brave are all detected and work identically (they speak the
+  same DevTools Protocol). Nothing needs to be installed if you already have one.
 
 ### 2. Build
 
@@ -45,28 +47,92 @@ npm install
 npm run build
 ```
 
-### 3. Register with your MCP client
+`npm run build` does two things:
 
-Add Kruz to your client config (example — `opencode.json` in this repo is already set up):
+1. compiles TypeScript to `dist/`, and
+2. **writes your OpenCode MCP registration** (see below).
 
-```json
+### 3. Registration is generated — nothing to edit by hand
+
+After `npm run build`, an `opencode.json` sits next to `package.json` containing
+a fully-formed `kruz` server entry:
+
+```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "kruz": {
-      "type": "local",
-      "command": ["node", "D:/project prototypes/Kruz/dist/index.js"],
-      "cwd": "D:/project prototypes/Kruz",
-      "enabled": true,
-      "timeout": 60000
+    "servers": {
+      "kruz": {
+        "type": "local",
+        "command": ["C:\\path\\to\\node.exe", "C:\\path\\to\\kruz\\dist\\index.js"],
+        "cwd": "C:\\path\\to\\kruz",
+        "environment": { "LOG_LEVEL": "info" },
+        "timeout": 60000
+      }
     }
   },
-  "permission": { "kruz_*": "allow" }
+  "permissions": [
+    { "action": "kruz_*", "resource": "*", "effect": "allow" }
+  ]
 }
 ```
 
-Then restart the client and ask: *"Use kruz to open https://example.com."*
+Then restart OpenCode and ask: *"Use kruz to open https://example.com."*
 
-> After rebuilding `dist/`, close the old Kruz session and reconnect the MCP server.
+#### Why it is generated rather than committed
+
+Every path above is **discovered at build time**, not stored in the repository:
+
+| Value | How it is resolved | Why |
+|---|---|---|
+| `command[0]` (node) | `process.execPath` — the interpreter running the build | OpenCode launches MCP servers with an inherited environment where a bare `node` is often **not on PATH** (GUI launch, nvm/Volta, service account). That fails as `ENOENT` and the server shows as errored. |
+| `command[1]` / `cwd` | derived from the build script's own location | Correct on `C:\tools\kruz`, `D:\project prototypes\kruz`, or a UNC share alike. |
+
+Because the file is machine-specific, it is **gitignored**. Committing it would
+hand every other checkout the first developer's paths — the exact hardcoded-path
+failure this setup removes. Re-running `npm run build` regenerates it correctly
+for whoever cloned. Move or rename the checkout and rebuild; you will never edit
+a path by hand.
+
+#### What it will not do
+
+- **It never touches your personal config.** The project-local `opencode.json` is
+  the default target. To register Kruz for *every* project on the machine:
+
+  ```bash
+  npm run register:global     # writes ~/.config/opencode/opencode.json
+  ```
+
+- **It never mixes config dialects.** OpenCode V1 placed servers directly under
+  `mcp`; V2 nests them under `mcp.servers`. Writing the wrong shape is not a
+  syntax error — the entry is simply **ignored and the server never connects**.
+  The writer detects which dialect your existing file uses and matches it, so an
+  older config keeps working instead of becoming a half-connected hybrid.
+
+- **It never clobbers your settings.** Every unrelated key in the file —
+  providers, models, permissions, your other MCP servers — is preserved,
+  including comments and trailing commas in `.jsonc` files. If the existing
+  config cannot be parsed, the build **fails loudly instead of overwriting it**.
+
+- **It never registers a broken build.** If `dist/index.js` does not exist (a
+  failed `tsc`), nothing is written.
+
+Useful commands:
+
+```bash
+npm run register          # rewrite the project-local entry only
+npm run register:global   # write the user-wide entry
+npm run build:only        # compile without touching config
+```
+
+#### Other MCP clients
+
+The generated file is OpenCode-specific, but the server is plain MCP over stdio,
+so any client works. Point it at the built entry point with node as the command:
+
+```bash
+node "<install-dir>/dist/index.js"
+```
 
 ### 4. Running
 
@@ -74,9 +140,12 @@ Then restart the client and ask: *"Use kruz to open https://example.com."*
 npm start          # Production (compiled dist/)
 npm run dev        # Development (tsx, no build)
 npm run typecheck  # tsc --noEmit
-npm run build      # tsc -> dist/
+npm run build      # tsc -> dist/, then writes opencode.json
 npm test           # vitest run
 ```
+
+> After rebuilding `dist/`, close the old Kruz session and reconnect the MCP
+> server — a rebuild does not change an already-running process.
 
 ---
 
@@ -373,9 +442,8 @@ a click that timed out had in fact succeeded and opened a new tab. Inspect with
 
 ### One Kruz per project: the single-instance contract
 
-This host (`opencode.jsonc` → `"Kruz": { cwd: "D:/project prototypes/Kruz" }`) spawns
-**one Kruz per project**, and every instance shares one ownership record, because the
-server's working directory is always the install directory.
+The generated `opencode.json` sets each entry's `cwd` to the install directory, so
+every Kruz process spawned against the same install shares **one ownership record**.
 
 OpenCode restores **every workspace at once**, so a cold start spawns one Kruz per
 project within a few milliseconds of each other. Two failure modes came out of that,
@@ -420,7 +488,9 @@ optional — it was measured, not assumed (`dump/mcp-server-verify.mjs`):
 So per project, give that project's Kruz entry its own `BROWSER_PROFILE_DIR` (e.g.
 `./browser-profile/<project>`) **and** `KRUZ_SINGLE_INSTANCE: "0"`. The trade-off is
 real and worth stating: separate profiles mean separate cookie jars, so logins are
-not shared between projects.
+not shared between projects. Orphaned Chrome is reaped by **profile directory**,
+matched on the `--user-data-dir` argument with a path-boundary check — so
+`browser-profile` is never reaped and `browser-profile-2` is never touched by it.
 
 ### `BROWSER_LAUNCH_FAILED` — a locked profile, not necessarily a stale one
 
@@ -534,11 +604,15 @@ for latency.
 
 ## Configuration
 
-Environment variables always override `config.json` (project root).
+Environment variables always override `config.json` (project root). Values are
+validated: an unrecognised `LOG_LEVEL` or `SAFETY_POLICY` falls back to its
+default instead of silently becoming an invalid value, and a non-numeric
+`BROWSER_TIMEOUT_MS` falls back to `30000` rather than becoming `NaN` (which
+would quietly disable every timeout downstream).
 
 | Variable | Default | Description |
 |---|---|---|
-| `BROWSER_PATH` | Auto-detected | Chrome executable path |
+| `BROWSER_PATH` | Auto-detected | Browser executable. Auto-detection derives every candidate path from `PROGRAMFILES`, `PROGRAMFILES(X86)`, `LOCALAPPDATA` and `PROGRAMW6432` — **no drive letter is assumed** — then falls back to the `App Paths` registry key, so a relocated or per-user install is still found. Chromium, Edge and Brave are accepted alongside Chrome. |
 | `BROWSER_HEADLESS` | `false` | Run headless (Kruz is headed by design) |
 | `BROWSER_VIEWPORT_WIDTH` / `BROWSER_VIEWPORT_HEIGHT` | `1280` / `720` | Viewport size |
 | `BROWSER_PROFILE_DIR` | `./browser-profile` | Persistent profile directory |
@@ -553,15 +627,52 @@ Environment variables always override `config.json` (project root).
 | `SAFETY_POLICY` | `off` | `strict` \| `lenient` \| `off` |
 | `OBSERVATION_CACHE_SIZE` | `100` | LRU cache size for observations |
 
-```json
+```jsonc
 {
-  "browserPath": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  // Optional — leave browserPath out entirely to use auto-detection.
+  "browserPath": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "headless": false,
   "viewportWidth": 1280,
   "viewportHeight": 720,
   "safetyPolicy": "off"
 }
 ```
+
+### Running without a writable install directory
+
+`browser-profile` and `downloads` default to directories beside the project. When
+that location is **not writable** — a global npm prefix under `%APPDATA%\npm`, a
+copy inside Program Files, a read-only container image — those two defaults are
+relocated automatically to a per-user location (`%LOCALAPPDATA%\kruz\…` on
+Windows, `~/Library/Application Support/kruz/…` on macOS,
+`$XDG_STATE_HOME/kruz/…` on Linux) instead of failing at `session.create`.
+Setting either variable explicitly always wins.
+
+### Running two projects at once
+
+The Chrome profile is single-writer, so each project needs its own profile **and**
+its own instance slot:
+
+```jsonc
+{
+  "mcp": {
+    "servers": {
+      "kruz": {
+        "type": "local",
+        "command": ["node", "dist/index.js"],
+        "cwd": ".",
+        "environment": {
+          "BROWSER_PROFILE_DIR": "./browser-profile/<project-name>",
+          "KRUZ_SINGLE_INSTANCE": "0"
+        }
+      }
+    }
+  }
+}
+```
+
+The trade-off is real: separate profiles mean separate cookie jars, so logins are
+not shared between projects.
 
 ---
 
@@ -595,7 +706,8 @@ Environment variables always override `config.json` (project root).
 | Path | Role |
 |---|---|
 | `src/index.ts` | Entry point; stdio; signal + global error handling |
-| `src/config.ts` | Env + `config.json` resolution |
+| `src/config.ts` | Env + `config.json` resolution; project-root discovery; browser auto-detection |
+| `scripts/write-opencode-config.mjs` | Generates the OpenCode `mcp.servers.kruz` entry on build |
 | `src/errors.ts` | Error taxonomy, envelopes, retry policies |
 | `src/mcp/` | MCP server, tool registry, router, name sanitization |
 | `src/session/manager.ts` | Session lifecycle, tabs, navigation trace |
@@ -608,6 +720,41 @@ Environment variables always override `config.json` (project root).
 | `tests/` | Vitest unit + integration suites (fixtures included) |
 | `SKILL.md` | Agent-facing runtime contract, served as `kruz://skill` |
 | `MODEL_GUIDE.md` | Deeper local manual: worked examples, recipes, ATS playbook |
+
+---
+
+## Portability
+
+Kruz is designed to run from a clone anywhere on any Windows machine (and on
+macOS/Linux) without editing a single path.
+
+**Nothing in the source encodes a location.** The rules that keep it that way:
+
+- **The project root is discovered, not assumed.** It is found by walking up from
+  the running module to the nearest `package.json`, so `src/`, `dist/`, a bundler
+  output, or a future nested layout all resolve to the same root. Previously it
+  was hardcoded to "one level above this file", which happened to be correct only
+  because of the current layout.
+- **Browser detection is environment-derived.** Every Windows candidate is built
+  from `PROGRAMFILES`, `PROGRAMFILES(X86)`, `PROGRAMW6432` and `LOCALAPPDATA`.
+  There is no `C:` literal anywhere, so a machine whose system drive is `D:`, or
+  whose Chrome is installed per-user, is detected correctly. The registry
+  `App Paths` key is consulted next, which covers a relocated custom install that
+  no well-known-path list can reach.
+- **Unwritable installs relocate rather than crash.** Profile and download
+  directories fall back to a per-user location when the install directory is
+  read-only.
+- **Path comparisons respect separators.** "Is this path inside our directory?"
+  is answered with a separator-boundary test, not a string `startsWith`. A plain
+  prefix test matches `D:\Kruz-tools` when the root is `D:\Kruz`, which
+  misidentifies unrelated processes as Kruz servers and can get them killed.
+- **Paths containing spaces work everywhere.** Module URLs are converted with
+  `fileURLToPath`, never `URL.pathname` — the latter is percent-encoded, so a
+  checkout under `D:\project prototypes\…` resolved to a path containing
+  `%20` and pointed at a file that did not exist.
+
+To move a checkout: copy it anywhere, run `npm install && npm run build`. The
+OpenCode registration is rewritten for the new location automatically.
 
 ---
 
@@ -636,7 +783,15 @@ npm test        # Vitest: unit + integration (live headed pages + local fixture)
 - Integration suites run against a **real headed Chrome** and `tests/fixtures/` (shadow DOM, dialogs, cookies, lists), plus a local HTTP server so relative-href resolution is exercised against a real base URL.
 - Contract suites that guard the ref promise: `ref-contract`, `observe-ref-contract`, `href-identity`, `overlay-latency-timing`, `control-loop-fixes`, `reported-bugs`.
 
-> **Not every working copy carries `tests/`.** If `npm test` reports *"No test files found"*, the suite is absent from that checkout rather than failing — `vitest.config.ts` still points at `tests/unit` and `tests/integration`. For ad-hoc verification against the built output without a suite, a scratch harness can drive the router directly — import `dist/mcp/server.js` (not `dist/index.js`, which binds stdio on import) and call `router.route(tool, args)`. `dump/` is the conventional home for one.
+> **Not every working copy carries `tests/`.** `tests/` is not part of the published
+> package, so a fresh install legitimately has none — `npm test` then exits **0**
+> with "No test files found". That is deliberate: an absent suite and a *failing*
+> suite must not look alike, and a non-zero exit for a missing suite reads as a
+> broken build in CI. `vitest.config.ts` sets `passWithNoTests` for exactly this
+> reason. For ad-hoc verification against the built output without a suite, a
+> scratch harness can drive the router directly — import `dist/mcp/server.js` (not
+> `dist/index.js`, which binds stdio on import) and call `router.route(tool, args)`.
+> `dump/` is the conventional home for one.
 
 ### Standing harnesses in `dump/`
 
@@ -675,7 +830,62 @@ Each drives the built `dist` end-to-end and exits non-zero on failure:
 
 ---
 
-## Known Limitations
+## Changes
+
+### 1.7.2 — Portability and correctness fixes (2026-10-12)
+
+**Portability: no hardcoded paths anywhere**
+
+- **Project root is discovered, not assumed.** Walks up from the running module to the nearest `package.json` instead of hardcoding "one level above `src/config.ts`". Works from `dist/`, a nested install, or any future layout.
+- **Browser auto-detection is environment-derived.** Every Windows candidate is built from `PROGRAMFILES`, `PROGRAMFILES(X86)`, `PROGRAMW6432` and `LOCALAPPDATA`. No drive letter is assumed. The `App Paths` registry key is consulted next, which covers a relocated custom install that no well-known-path list can reach. Chromium, Edge and Brave are accepted alongside Chrome.
+- **Unwritable installs relocate rather than crash.** When the project root is read-only (global npm prefix, Program Files copy, container image), `browser-profile` and `downloads` fall back to a per-user location (`%LOCALAPPDATA%\kruz\…` on Windows, `~/Library/Application Support/kruz/…` on macOS, `$XDG_STATE_HOME/kruz/…` on Linux) instead of failing at `session.create`.
+- **Path comparisons respect separators.** "Is this path inside ours?" is now answered with a boundary check (`a === root || a.startsWith(root + "\\")`) rather than a string `startsWith`. A plain prefix test matched `D:\Kruz-tools` when the root was `D:\Kruz`, which misidentified unrelated Node processes as Kruz servers.
+- **Path names with spaces work everywhere.** Module URLs are converted with `fileURLToPath` (which decodes `%20`), never `URL.pathname` (which leaves it encoded). A checkout under `D:\project prototypes\Kruz` previously resolved to a path containing `%20` that did not exist.
+
+**OpenCode registration is generated, never committed**
+
+- `npm run build` now runs `scripts/write-opencode-config.mjs` to write a project-local `opencode.json` containing `mcp.servers.kruz` with `command[0]` set to `process.execPath` (the absolute node binary path) and `cwd` set to the install root. Both are discovered at build time.
+- The generated file is gitignored — it contains another developer's absolute paths if committed. Re-running `npm run build` after moving or renaming the checkout rewrites it correctly.
+- A V1/V2 dialect detector preserves your existing file shape. It will not write a hybrid config where some servers connect and others are silently ignored.
+- `--global` / `KRUZ_OPENCODE_SCOPE=global` opt in to writing the user-wide config; the default is project-local and never touches your personal settings.
+- The build refuses to write anything when `dist/index.js` does not exist or the existing config file cannot be parsed.
+
+**Configuration is now validated, not cast**
+
+- `SAFETY_POLICY`, `LOG_LEVEL` and other enum fields are now coerced to their valid set. A typo like `SAFETY_POLICY=Strict` fell back to `"off"` instead of being silently accepted as a value the safety layer could not match (which treated *every* action as safe).
+- `BROWSER_TIMEOUT_MS=abc` falls back to `30000` instead of becoming `NaN`, which previously disabled every timeout in the process.
+
+**Bugs fixed**
+
+| Bug | Severity | Impact |
+|---|---|---|
+| `kruz://skill` resource path built from `URL.pathname` | high | Path contained `%20` on repos with spaces; resource read rejected. Agent received no skill contract. |
+| Heartbeat re-armed forever via `idleReleaseTimer` (never assigned) | high | Overlay stayed blue permanently; page input locked while the model was idle. |
+| Click feedback diffed against a click-completion snapshot | medium | `state.navigation` reported `"completed"` on every click, contradicting `result.navigation`. |
+| `shapeError` dropped `cause` and `operation` from envelopes | medium | Call-site provenance lost on all structured errors. |
+| `single-instance` path-prefix test without separator boundary | high | Matched sibling dirs like `D:\Kruz-tools`; could kill unrelated Node processes. |
+| Chrome reaping matched profile dir by substring | high | `browser-profile-2` was killed when the owner was `browser-profile` — the exact layout the docs recommend. |
+| `detectHumanNeeded` called Playwright `.locator()` on Puppeteer pages | medium | CAPTCHA / password / 2FA detection returned `{needed:false}` unconditionally. |
+| `page.uncheck` clicked unconditionally (toggled instead of setting) | medium | Unchecking an already-off checkbox checked it. |
+| `session.attach()` leaked the previous browser session | medium | Next `session.create` failed with `BROWSER_LAUNCH_FAILED` against a profile the old session still held. |
+| `queryOneInFrame` / `queryAllInFrame` used handle formats `resolveHandle` could not parse | high | iCIMS iframe job links silently returned zero results. |
+| `dblclick`, `dragPointer` never opened the model-dispatch window | medium | Actions cancelled by the in-page control lock while overlay was blue. |
+| `viewportPoint` used `&&` instead of `||` for collapsed-element check | low | A 0×40px element returned a point on its left edge instead of being rejected. |
+| `press` fell through to `keyboardPress` when element resolved to null | medium | Key combo typed into whatever happened to hold focus. |
+| `countElements` leaked probe handles for the life of the document | medium | Remote-object accumulation on heavy pages. |
+| `queryOnePiercing` started its shadow walk at `document` (nodeType 9) | medium | Shadow-piercing silently degraded to plain query on every call. |
+| `document-start-injection` capability reported `false` despite being true | low | Capability gates were told the opposite of what the engine actually does. |
+| `Notification.permission` leak returned `'default'` (invalid PermissionState) | low | Pages checking `status.state === 'prompt'` saw an invalid enum and took a bot-detection branch. |
+| Closed sessions never removed from the manager map | medium | Unbounded retention of observer caches and ref registries over a long session. |
+| Attach session built a 2-field `P1Config` literal cast | low | `server.info` reported `undefined` viewport and locale; observer cache defaulted to 1000 instead of the configured size. |
+
+**Test harnesses**
+
+- Added `npm run register` and `npm run register:global` for manual config regeneration.
+- `npm test` now exits `0` when the `tests/` directory is absent (not part of the published package), so a missing suite and a failing suite are distinguishable in CI.
+- `tests/unit/readiness-freshness.test.ts` restored (deleted from the working tree before this session). 7/7 passing.
+
+---
 
 - **Google-account sign-in is not supported.** Google classifies a Puppeteer-*launched* Chrome as automation and rejects sign-in with *"This browser or app may not be secure"*, **even when a human types the credentials by hand** during `session.pause`. The check is transport-level, not page-visible: `navigator.webdriver` is masked, `window.chrome.runtime` is present, plugin counts look normal, and it still rejects. Use `session.create {cdp_url}` to attach to a real daily-driver Chrome, or point `profile_dir` at a copy of a profile that already carries the Google session. See SKILL.md → *Known unsupported flow*.
 - **Observation caps** (`minimal` 120 / `standard` 400 / `full` 2000 elements) can starve very dense pages.

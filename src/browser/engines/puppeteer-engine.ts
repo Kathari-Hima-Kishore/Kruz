@@ -498,6 +498,13 @@ async terminate(): Promise<void> {
     // "switch to it" contract was broken — controller.newTab brought the OLD
     // tab to front and every subsequent action ran against the wrong page.
     this._page = p;
+    // A new tab has NEVER had interception applied, whatever the previous tab had.
+    // `switchTab` clears this for the same reason; `newTab` did not, so an engine
+    // that had capture on kept `_interceptionOn = true` while the new tab had
+    // interception off. The next `enableNetworkCapture({captureBodies:true})`
+    // then short-circuited in setInterception as a no-op and `network.body`
+    // silently returned nothing for the rest of that tab's life.
+    this._interceptionOn = null;
     if (url) await p.goto(url, { waitUntil: "domcontentloaded" }).catch(() => {});
     await this.withEvaluateTimeout(p.bringToFront(), 1500).catch(() => {});
     return { id: this.tabId(p), url: p.url(), title: await p.title().catch(() => ""), isActive: true };
@@ -529,6 +536,10 @@ async terminate(): Promise<void> {
     if (this._page === p) {
       const next = (await this._browser!.pages()).filter((q) => !q.isClosed())[0];
       this._page = next ?? null;
+      // Same reasoning as switchTab/newTab: the surviving tab's interception state
+      // is unknown to this engine, so the per-tab bookkeeping must be reset to
+      // "unknown" rather than inherited from the tab that just went away.
+      this._interceptionOn = null;
     }
   }
   async switchTab(tabId: string): Promise<void> {
@@ -884,7 +895,13 @@ async terminate(): Promise<void> {
         return { handle: deep, strategy: "deep-selector", target, fallback, scope, resolvedAt: Date.now() };
       }
     } catch (error) {
-      if (String(error).includes('AMBIGUOUS_TARGET')) throw error;
+      // queryChildFrame throws `Ambiguous target across child frames`; the old
+      // check looked for the literal 'AMBIGUOUS_TARGET', which that message never
+      // contains — so the ambiguity was swallowed, the call returned null, and the
+      // caller reported TARGET_NOT_FOUND. That is the wrong diagnosis for "two
+      // elements match": it tells the model to narrow or re-observe when what it
+      // actually needs is to pick one of the candidates.
+      if (error instanceof Error && /^Ambiguous target across child frames/i.test(error.message)) throw error;
       return null;
     }
   }
@@ -928,10 +945,25 @@ async terminate(): Promise<void> {
       // handle here could silently resolve to a different node.
       if (el.node) return this.pinnedHandle(el.node as ElementHandle);
       if (el.handle.startsWith('frame:')) {
-        const [url, selector] = JSON.parse(el.handle.slice(6));
+        // `[url, selector]` = the single match; `[url, selector, index]` = the
+        // index-th element of the frame's query RESULT SET (which is what
+        // queryAllInFrame returns). The index must be resolved by $$ + position,
+        // NOT by appending `:nth-of-type(i)` to the selector: that pseudo-class
+        // counts among same-tag SIBLINGS, so for a selector matching several
+        // different tags it silently resolves to the wrong node or to none.
+        const parsed = JSON.parse(el.handle.slice(6));
+        const [url, selector, index] = parsed as [string, string, number | undefined];
         const frames = this.page.frames().filter(f => f.url() === url);
         if (frames.length !== 1) throw new Error('Ambiguous or missing child frame');
-        return frames[0].$(selector);
+        if (typeof index !== "number") return frames[0].$(selector);
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const all = await frames[0].$$(selector).catch(() => []);
+          const pick = all[index] ?? null;
+          for (const h of all) if (h !== pick) await h.dispose().catch(() => {});
+          if (pick) return pick;
+          await sleep(200);
+        }
+        return null;
       }
       // queryAll builds `(selector).nth(i)` handles — page.$ can't parse those,
       // so resolve via $$ + index (previously every .nth() handle resolved null,
@@ -1232,8 +1264,17 @@ async terminate(): Promise<void> {
   async dblclick(el: KruzElement, opts?: { timeoutMs?: number }): Promise<void> {
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
-    await handle.click({ clickCount: 2 });
-    await handle.dispose().catch(() => {});
+    // Open the model-dispatch window, exactly as click() does. Without it the
+    // in-page control lock (visual-cursor.ts, capture phase on `dblclick`)
+    // cancels every event, so a double-click landed while the overlay was in
+    // `controlling` never reached the page at all.
+    await this.expectInput(Math.max(3000, opts?.timeoutMs ?? 5000));
+    try {
+      await handle.click({ clickCount: 2 });
+    } finally {
+      await handle.dispose().catch(() => {});
+      this.endInput();
+    }
   }
 
   async hover(el: KruzElement, opts?: { timeoutMs?: number; dwellMs?: number }): Promise<void> {
@@ -1460,6 +1501,11 @@ async terminate(): Promise<void> {
         }
         return;
       }
+      // An element WAS named but could not be resolved. Falling through to
+      // keyboardPress() sent the key to whatever currently held focus — so a
+      // stale ref silently typed into the wrong field instead of reporting
+      // STALE_REFERENCE. Only fall back when NO element was requested at all.
+      throw new Error(`Element not found: ${el.handle}`);
     }
     await this.keyboardPress(key as any);
   }
@@ -1511,13 +1557,32 @@ async terminate(): Promise<void> {
   async uncheck(el: KruzElement, _opts?: { force?: boolean; timeoutMs?: number }): Promise<void> {
     const handle = await this.resolveHandle(el);
     if (!handle) throw new Error(`Element not found: ${el.handle}`);
-    const tag = await handle.evaluate((n: Element) => n.tagName.toLowerCase());
-    if (tag === "input") {
-      try { await handle.click(); } catch { await handle.evaluate((n: any) => { const w = window; w.__kruzAutomationBypass = true; try { n.checked = false; n.dispatchEvent(new Event("change", { bubbles: true })); } finally { w.__kruzAutomationBypass = false; } }); }
-    } else {
-      await handle.click();
+    try {
+      const tag = await handle.evaluate((n: Element) => n.tagName.toLowerCase());
+      // The click paths below are real trusted input, so they need the same
+      // model-dispatch window every other action opens — otherwise the in-page
+      // control lock cancels them and `uncheck` silently does nothing.
+      await this.expectInput(Math.max(2000, _opts?.timeoutMs ?? 5000));
+      if (tag === "input") {
+        // Read the CURRENT state before dispatching anything. The old code
+        // clicked unconditionally, so unchecking a checkbox that was ALREADY off
+        // CHECKED it — the exact opposite of the requested action, reported as
+        // success. A click is a toggle, not an assignment.
+        const currentlyChecked = await handle.evaluate((n: any) => {
+          if (n instanceof HTMLInputElement) return n.checked === true;
+          return n.getAttribute('aria-checked') === 'true';
+        });
+        if (!currentlyChecked) return;
+        try { await handle.click(); } catch { await handle.evaluate((n: any) => { const w = window; w.__kruzAutomationBypass = true; try { n.checked = false; n.dispatchEvent(new Event("change", { bubbles: true })); } finally { w.__kruzAutomationBypass = false; } }); }
+      } else {
+        const currentlyChecked = await handle.evaluate((n: any) => n.getAttribute('aria-checked') === 'true' || n.classList.contains('checked'));
+        if (!currentlyChecked) return;
+        await handle.click();
+      }
+    } finally {
+      await handle.dispose().catch(() => {});
+      this.endInput();
     }
-    await handle.dispose().catch(() => {});
   }
 
   async setFiles(el: KruzElement, paths: string[]): Promise<void> {
@@ -1540,7 +1605,17 @@ async terminate(): Promise<void> {
     await handle.evaluate((node: any, v: number) => {
       const w = window; w.__kruzAutomationBypass = true;
       try {
-        node.value = String(v);
+        // Go through the NATIVE prototype setter, exactly as fill() does.
+        // Assigning `node.value` directly only updates the DOM property;
+        // React installs a value tracker and compares against the last value it
+        // recorded, so it concludes nothing changed and never fires onChange —
+        // the slider moved visually while the application state stayed at the
+        // old value. The native setter is what React's own input simulation
+        // calls, and it is what makes the tracker observe a real change.
+        const proto = Object.getPrototypeOf(node);
+        const desc = proto && Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc && desc.set) desc.set.call(node, String(v));
+        else node.value = String(v);
         node.dispatchEvent(new Event("input", { bubbles: true }));
         node.dispatchEvent(new Event("change", { bubbles: true }));
       } finally { w.__kruzAutomationBypass = false; }
@@ -1653,7 +1728,11 @@ async terminate(): Promise<void> {
 
   async countElements(target: Target, scope?: string): Promise<number> {
     const sel = this.selectorFor(target, undefined, scope);
-    return this.page.$$(sel).then((els) => els.length).catch(() => 0);
+    // Dispose the probe handles: only the COUNT is wanted. Returning `els.length`
+    // while leaving the handles alive accumulated an undisposed remote object per
+    // matched element for the life of the document (fidelity extraction and the
+    // controller both call this repeatedly on dense pages).
+    return this.page.$$(sel).then(async (els) => { const n = els.length; await Promise.all(els.map((e) => e.dispose())); return n; }).catch(() => 0);
   }
 
   async screenshotElement(el: KruzElement, opts?: { path?: string; type?: "png" | "jpeg" | "webp"; quality?: number }): Promise<Buffer> {
@@ -1680,7 +1759,13 @@ async terminate(): Promise<void> {
     const sel = this.selectorFor(target, fallback);
     try {
       await f.waitForSelector(sel, { timeout: 3000 });
-      return { handle: sel, strategy: `frame:${frameId}`, target, fallback, resolvedAt: Date.now() };
+      // The handle MUST be frame-scoped. It used to be the bare selector, so
+      // resolveHandle fell through to `this.page.$(el.handle)` — a query against
+      // the MAIN frame. An element that exists ONLY inside the iframe (the whole
+      // point of this method) therefore resolved to null and was reported
+      // "Element not found" despite having just been found. The format matches
+      // the `frame:` branch of resolveHandle exactly.
+      return { handle: 'frame:' + JSON.stringify([f.url(), sel]), strategy: `frame:${frameId}`, target, fallback, resolvedAt: Date.now() };
     } catch {
       return null;
     }
@@ -1690,9 +1775,15 @@ async terminate(): Promise<void> {
     const f = this.page.frames().find((f) => f.url() === frameId);
     if (!f) return [];
     const sel = this.selectorFor(target, fallback);
-    const count = await f.$$(sel).then((els) => els.length).catch(() => 0);
+    // Dispose the probe handles: only their COUNT is wanted, and leaking them
+    // keeps remote objects alive for the life of the document (compare queryAll).
+    const count = await f.$$(sel).then(async (els) => { const n = els.length; await Promise.all(els.map((e) => e.dispose())); return n; }).catch(() => 0);
     return Array.from({ length: count }, (_, i) => ({
-      handle: `frame:${frameId}:${sel}:nth(${i})`,
+      // Same frame-scoped, index-bearing shape resolveHandle understands. The old
+      // `frame:${frameId}:${sel}:nth(${i})` was fed to `JSON.parse(slice(6))`,
+      // which threw, so resolveHandle returned null for EVERY hit — iCIMS
+      // extraction silently yielded zero job links.
+      handle: 'frame:' + JSON.stringify([f.url(), sel, i]),
       strategy: `frame:${frameId}:nth(${i})`,
       target,
       fallback,
@@ -1747,11 +1838,20 @@ async terminate(): Promise<void> {
   /* ── drag & drop ────────────────────────────────────────────── */
 
   async dragPointer(srcBox: { x: number; y: number }, dstBox: { x: number; y: number }): Promise<void> {
-    await this.page.mouse.move(srcBox.x, srcBox.y);
-    await this.page.mouse.down();
-    await sleep(50);
-    await this.page.mouse.move(dstBox.x, dstBox.y, { steps: 20 });
-    await this.page.mouse.up();
+    // Same dispatch window as dragPath(): these are trusted mouse events, and the
+    // in-page control lock cancels them otherwise. This is the fallback path of
+    // html5Drag, so when the HTML5 route threw, the pointer route was cancelled
+    // too and the drag silently did nothing.
+    await this.expectInput(Math.max(3000, 5000));
+    try {
+      await this.page.mouse.move(srcBox.x, srcBox.y);
+      await this.page.mouse.down();
+      await sleep(50);
+      await this.page.mouse.move(dstBox.x, dstBox.y, { steps: 20 });
+      await this.page.mouse.up();
+    } finally {
+      this.endInput();
+    }
   }
 
   async dragPath(
@@ -1825,7 +1925,12 @@ async terminate(): Promise<void> {
       await this.scrollHandleIntoView(handle);
       return await handle.evaluate((n: any) => {
         const r = n.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) return null;
+        // `&&` is wrong here: a collapsed element is one with EITHER dimension
+        // zero, which is exactly what computeClickPoint (line ~1103) checks with
+        // `||`. With `&&`, a 0x40px element passed the guard and returned a point
+        // on its left EDGE (x = r.left), so page.drag pressed on the boundary of
+        // the element instead of reporting ELEMENT_NOT_VISIBLE.
+        if (r.width === 0 || r.height === 0) return null;
         // getBoundingClientRect is viewport-relative, which is exactly the space
         // trusted mouse input is dispatched in.
         return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
@@ -1881,48 +1986,66 @@ async terminate(): Promise<void> {
   /* ── shadow DOM ─────────────────────────────────────────────── */
 
   async queryOnePiercing(target: Target, fallback?: Fallback, scope?: string): Promise<KruzElement | null> {
-    // puppeteer-core gives us CDPSession — use DOM.getDocument with pierce:true
-    const client = (this.page as any).target().createCDPSession?.() as Promise<any>;
-    try {
-      const cdp = await (this.page as any).target().createCDPSession();
-      await cdp.send("DOM.enable");
-      const doc = await cdp.send("DOM.getDocument", { depth: 20, pierce: true });
-      await cdp.detach();
-      // Convert CDP nodeId -> selector path via evaluate
-      const sel = await this.page.evaluate((t: Target) => {
-        const root = document;
-        // Walk shadow roots to build a selector
-        const walk = (node: any, path: string[]): string | null => {
-          if (!node) return null;
-          if (node.nodeType !== Node.ELEMENT_NODE) return null;
-          const tag = node.tagName.toLowerCase();
-          const id = node.id ? `#${node.id}` : "";
-          const cls = node.className ? `.${node.className.trim().split(/\s+/).join(".")}` : "";
-          const part = `${tag}${id}${cls}`;
-          // Check if this matches the target
-          const matches = (target: any): boolean => {
-            if (!target) return false;
+    // Shadow-piercing strategy: walk OPEN shadow roots IN-PAGE and stash the live
+    // matched node on `window.__kruzMarkedNode`, then adopt it via
+    // takeMarkedNode. Taking the node object is the only route that works — no
+    // CSS selector addresses a node inside a shadow root.
+    //
+    // This previously did two things that made it a no-op:
+    //  1. `walk(document, …)` — `document.nodeType` is 9, and the walk returned
+    //     null for any node that was not an ELEMENT_NODE, so it bailed on the
+    //     very first call and `sel` was always null.
+    //  2. it created a CDP session (`createCDPSession`) twice — once assigned to
+    //     an unused `client` local and never detached — and fetched a
+    //     `DOM.getDocument` result that was then thrown away.
+    // So the method silently degraded to plain `queryOne` on every call and
+    // leaked a CDP session per invocation.
+    const marked = await this.page
+      .evaluateHandle((t: Target) => {
+        const matches = (node: any, target: any): boolean => {
+          if (!node || !target) return false;
+          try {
             if (target.css && node.matches(target.css)) return true;
             if (target.id && node.id === target.id) return true;
             if (target.testid && node.getAttribute("data-testid") === target.testid) return true;
             if (target.role && node.getAttribute("role") === target.role) return true;
             if (target.nameAttr && node.getAttribute("name") === target.nameAttr) return true;
-            return false;
-          };
-          if (matches(t)) return path.concat(part).join(" > ");
-          // Check shadow children
-          for (const child of (node.shadowRoot ? Array.from(node.shadowRoot.children) : [])) {
-            const r = walk(child, path.concat(part));
-            if (r) return r;
+          } catch { /* invalid selector / cross-origin node */ }
+          return false;
+        };
+        // Depth-first over the document AND every open shadow root. Light DOM is
+        // searched first so a page's own control always wins over a component's.
+        const walk = (root: any): any => {
+          let nodes: any[] = [];
+          try { nodes = Array.from(root.querySelectorAll("*")); } catch { return null; }
+          for (const n of nodes) {
+            if (matches(n, t)) return n;
+            // `matches` covers the node itself; check its open shadow subtree.
+            const sr = n.shadowRoot;
+            if (sr) {
+              const hit = walk(sr);
+              if (hit) return hit;
+            }
           }
           return null;
         };
-        return walk(root, []);
-      }, target);
-      if (sel) return this.queryOne({ ...target, css: sel }, fallback, scope);
-    } catch {
-      // fallback to normal query
+        const found = walk(document);
+        (window as any).__kruzMarkedNode = found ?? null;
+        return !!found;
+      }, target)
+      .catch(() => null);
+
+    const ok = (marked as any)?.jsonValue ? await (marked as any).jsonValue().catch(() => false) : false;
+    await marked?.dispose?.().catch(() => {});
+
+    if (ok) {
+      const el = await this.takeMarkedNode(this.selectorFor(target, fallback, scope), target);
+      // Clear the stash so a later unrelated takeMarkedNode() can never adopt a
+      // stale node from this call.
+      await this.page.evaluate(() => { try { (window as any).__kruzMarkedNode = null; } catch { /* gone */ } }).catch(() => {});
+      if (el) return el;
     }
+
     return this.queryOne(target, fallback, scope);
   }
 
@@ -1998,8 +2121,12 @@ async terminate(): Promise<void> {
 
   hasCapability(name: EngineCapability): boolean {
     switch (name) {
-      case "closed-shadow-pierce": return true; // via CDP DOM.getDocument
-      case "document-start-injection": return false;
+      case "closed-shadow-pierce": return true; // via in-page walk of open shadow roots
+      // TRUE, and previously reported false. Both boot() (installStealth) and
+      // newTab() call `page.evaluateOnNewDocument`, so scripts genuinely do run
+      // before page scripts on every document. A capability gate reading this
+      // flag was told the opposite of what the engine does.
+      case "document-start-injection": return true;
       case "bot-detection-evasion": return true; // launch flags
       case "native-input-os-level": return false;
       case "iframe-crossorigin-eval": return true; // Puppeteer handles this

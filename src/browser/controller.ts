@@ -913,8 +913,16 @@ export class BrowserController {
       // Only echo the previous URL when it actually changed — a 200-char data:/query
       // URL duplicated on every mutate would otherwise dominate the payload.
       if (fb.url_changed) fb.old_url = clip(before.url, 300);
-      fb.dom_changed = fb.url_changed || fb.document_changed ||
-        (fb as any).signature !== (before as any).signature ||
+      // A field is COMPARED only when the baseline actually carries it. The
+      // click path reuses a click-completion snapshot as its baseline, and that
+      // shape has no `signature` — comparing our computed `"len:muts:count"`
+      // against `undefined` is always unequal, which reported `dom_changed: true`
+      // (and therefore `page_mutated: true`) on literally every click. An absent
+      // field means "not observed", not "changed".
+      const beforeSig = (before as any).signature;
+      const signatureChanged =
+        typeof beforeSig === "string" && (fb as any).signature !== beforeSig;
+      fb.dom_changed = fb.url_changed || fb.document_changed || signatureChanged ||
         JSON.stringify({ t: fb.title, f: fb.focus }) !== JSON.stringify({ t: before.title, f: before.focus });
       fb.navigation = (fb.url_changed || fb.document_changed) ? "completed" : "none_observed";
       // §20C/§27: explicit mutation verdict (parity with state.dom_changed) so callers

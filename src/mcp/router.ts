@@ -61,6 +61,15 @@ function shapeError(error: unknown, tool: string): KruzErrorEnvelope {
       outcome: e.outcome ?? (isRefusalCode(code) ? "refusal" : "failure"),
       subsystem: e.subsystem ?? classify(code),
       ...(e.help ? { help: e.help } : {}),
+      // `cause` and `operation` are documented envelope fields (errors.ts) and
+      // were being DROPPED here on the plain-literal branch. Since `shapeResult`
+      // runs this over every ok:false result, a controller failure that set
+      // `operation` — which is the only thing telling a caller WHICH call failed
+      // once the code has been normalised to OPERATION_FAILED — lost it before
+      // the client ever saw it. Same for the underlying cause on a retry
+      // exhaustion. Preserve whatever is present rather than dropping silently.
+      ...(e.cause !== undefined ? { cause: String(typeof e.cause === "object" && (e.cause as any)?.message ? (e.cause as any).message : e.cause) } : {}),
+      ...(e.operation ? { operation: String(e.operation) } : {}),
       trace: [`tool:${tool}`, "router", ...(Array.isArray(e.trace) ? e.trace : [])],
     };
   }
@@ -174,6 +183,16 @@ export class ToolRouter {
    */
   private idleReleaseTimer?: ReturnType<typeof setTimeout>;
   private pingTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Explicit "a tool call is in flight" flag.
+   *
+   * The heartbeat used to infer this from the mere presence of `pingTimer`,
+   * which is not re-entrant: the timer is cleared at the top of its own
+   * callback, so `endControl()` arriving during the in-flight `await` had
+   * nothing to cancel and the loop restarted itself. This flag is set/cleared
+   * synchronously by begin/end, so it cannot be missed by a racing timer.
+   */
+  private controlActive = false;
 
   /**
    * Stop the heartbeat. That is ALL this does now.
@@ -199,6 +218,7 @@ export class ToolRouter {
    * `session.resume` (thinking), which go through `setControlMode`.
    */
   private endControl(_graceMs = 600): void {
+    this.controlActive = false;
     if (this.pingTimer) { clearTimeout(this.pingTimer); this.pingTimer = undefined; }
     if (this.idleReleaseTimer) { clearTimeout(this.idleReleaseTimer); this.idleReleaseTimer = undefined; }
   }
@@ -206,8 +226,12 @@ export class ToolRouter {
   /** Heartbeat ON for the duration of a call; overlay visible while it beats. */
   private async beginControl(): Promise<void> {
     if (this.idleReleaseTimer) { clearTimeout(this.idleReleaseTimer); this.idleReleaseTimer = undefined; }
+    // Set BEFORE the first ping: a nested/overlapping call must not be able to
+    // end control while this one is still waiting to establish the heartbeat.
+    this.controlActive = true;
     await this.setControlPing();
-    this.schedulePing();
+    // Only keep beating if control was not already ended while we awaited.
+    if (this.controlActive) this.schedulePing();
   }
 
   /**
@@ -219,10 +243,19 @@ export class ToolRouter {
     if (this.pingTimer) clearTimeout(this.pingTimer);
     this.pingTimer = setTimeout(async () => {
       this.pingTimer = undefined;
-      // A call is still in flight only if endControl has not run; it clears
-      // pingTimer, so reaching here means control is ongoing.
       await this.setControlPing();
-      if (!this.idleReleaseTimer) this.schedulePing();
+      // Re-arm ONLY if control is genuinely still active.
+      //
+      // The old guard was `if (!this.idleReleaseTimer)`, but `idleReleaseTimer`
+      // is never assigned anywhere in this class — only read and cleared. So the
+      // condition was unconditionally true and the heartbeat re-armed itself
+      // forever. The window: `pingTimer` is cleared at the TOP of this callback,
+      // so a `route()` finally-block running during the `await` below finds
+      // nothing to cancel — `endControl()` silently did nothing and the 200ms
+      // ping kept running, holding the banner blue and the page input-locked
+      // while the model sat idle. The comment above this check ("endControl has
+      // not run") was exactly the false premise.
+      if (this.controlActive) this.schedulePing();
     }, 200);
     (this.pingTimer as any)?.unref?.();
   }
@@ -271,10 +304,37 @@ export class ToolRouter {
     this.safety = new SafetyLayer(loadConfig().safetyPolicy);
   }
 
-  /** Pre-action state shape reused to avoid an extra CDP round trip (P1-A). */
-  private stateOf(v: any): { url: string; title: string; document_id?: number; signature?: string; focus?: string | null } | null {
+  /**
+   * Normalise a click-completion snapshot into a `PageFeedback` baseline.
+   *
+   * `captureClickState().state` is click-completion's `State`
+   * (`document_id` = RAW `performance.timeOrigin`, `signature` = a 2000-char
+   * body-text slice), while `pageFeedback` computes `document_id` as
+   * `Math.round(timeOrigin)` and `signature` as `"bodyLen:mutations:count"`.
+   * Handing one to the other made EVERY diff report a change:
+   *   - rounded int !== unrounded float  -> `document_changed: true` always,
+   *     which in turn forced `navigation: "completed"` on every single click;
+   *   - a body-text slice can never equal `"12345:0:812"` -> `dom_changed: true`
+   *     always.
+   * So `state.document_changed` and `state.navigation` carried no information at
+   * all, and could contradict `result.navigation` from `completeClick` — which
+   * honestly reported `"none_observed"` — on the same response.
+   *
+   * The fields that ARE comparable across both shapes are url, title and the
+   * rounded document id, so only those are carried across. `signature` is
+   * dropped rather than faked: an incomparable value is worse than none, since
+   * a present-but-wrong `signature` manufactures a false `dom_changed`.
+   */
+  private stateOf(v: any): { url: string; title: string; document_id?: number; focus?: string | null } | null {
     if (!v || typeof v !== "object") return null;
-    return { url: v.url ?? "", title: v.title ?? "", document_id: v.document_id, signature: v.signature, focus: v.focus ?? null };
+    const rawId = typeof v.document_id === "number" ? v.document_id : undefined;
+    return {
+      url: v.url ?? "",
+      title: v.title ?? "",
+      // Match pageFeedback's own rounding so the comparison is apples-to-apples.
+      document_id: rawId !== undefined ? Math.round(rawId) : undefined,
+      focus: v.focus ?? null,
+    };
   }
 
   /**
@@ -465,7 +525,16 @@ export class ToolRouter {
         return { ok: true, status: "active", was_paused: r, overlay: { mode: "thinking", banner: "Model is thinking" } };
       }
 
-      case "session.close": { const prev = this.sm.getActive(); const c = await this.sm.close(undefined, a.graceful !== false); if (c && prev?.engine) await (prev.engine as any).removeControlIndicator?.()?.catch?.(() => {}); return { ok: c, status: c ? "closed" : "error" }; }
+      case "session.close": {
+        const prev = this.sm.getActive();
+        // Tear the overlay down BEFORE closing the browser. The call used to run
+        // after `sm.close()`, by which point the engine was shut down and the
+        // CDP evaluate could only throw into the swallowed `.catch` — dead code,
+        // and the layer was never actually removed.
+        if (prev?.engine) await (prev.engine as any).removeControlIndicator?.()?.catch?.(() => {});
+        const c = await this.sm.close(undefined, a.graceful !== false);
+        return { ok: c, status: c ? "closed" : "error" };
+      }
 
       // Navigation
       case "page.open": return this.openWithRetry(a.url, a.wait_for ?? a.wait_until, a.timeout_ms ?? a.nav_timeout_ms, 1, a.detect_redirect);

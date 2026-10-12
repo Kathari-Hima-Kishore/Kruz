@@ -84,39 +84,47 @@ export class SafetyLayer {
   /**
    * Check if a page likely needs human intervention (CAPTCHA, login, etc.).
    */
+  /**
+   * Check if a page likely needs human intervention (CAPTCHA, login, 2FA).
+   *
+   * Accepts a Puppeteer `Page`. The previous implementation called
+   * `page.locator(...).count()`, which is PLAYWRIGHT API — the only page objects
+   * in this codebase are Puppeteer pages, which have no `.locator`. The
+   * resulting TypeError was swallowed by a bare `catch`, so this function
+   * returned `{needed:false}` unconditionally for every CAPTCHA, password and
+   * 2FA page: it could only ever answer "no".
+   *
+   * Now a single `page.evaluate` counts all three signal sets at once, which is
+   * both correct and one CDP round-trip instead of three.
+   */
   async detectHumanNeeded(page: any): Promise<{ needed: boolean; reason?: string }> {
     try {
-      // Check for CAPTCHA indicators
-      const hasCaptcha = await page.locator(
-        '[class*="captcha"], [id*="captcha"], [class*="recaptcha"], ' +
-        '[id*="recaptcha"], iframe[src*="recaptcha"], iframe[src*="captcha"], ' +
-        '[class*="hcaptcha"], iframe[src*="hcaptcha"]'
-      ).count() > 0;
+      const hit = await page.evaluate(() => {
+        const CAPTCHA = [
+          '[class*="captcha"]', '[id*="captcha"]', '[class*="recaptcha"]', '[id*="recaptcha"]',
+          'iframe[src*="recaptcha"]', 'iframe[src*="captcha"]', '[class*="hcaptcha"]',
+          'iframe[src*="hcaptcha"]',
+        ].join(',');
+        const PASSWORD = 'input[type="password"], input[name*="password"], input[id*="password"]';
+        const TWO_FACTOR = [
+          '[class*="2fa"]', '[class*="two-factor"]', '[class*="otp"]',
+          'input[name*="otp"]', 'input[name*="code"]', 'input[id*="otp"]',
+        ].join(',');
+        // CAPTCHA first: an hCaptcha reCAPTCHA iframe on a login page is the more
+        // specific reason, and reporting "password field" would send the model
+        // to type credentials into a wall it cannot pass.
+        if (document.querySelector(CAPTCHA)) return "captcha";
+        if (document.querySelector(PASSWORD)) return "password";
+        if (document.querySelector(TWO_FACTOR)) return "2fa";
+        return null;
+      });
 
-      if (hasCaptcha) {
-        return { needed: true, reason: "CAPTCHA detected on page" };
-      }
-
-      // Check for login forms (password fields)
-      const hasPasswordField = await page.locator(
-        'input[type="password"], input[name*="password"], input[id*="password"]'
-      ).count() > 0;
-
-      if (hasPasswordField) {
-        return { needed: true, reason: "Login/password form detected" };
-      }
-
-      // Check for 2FA indicators
-      const has2FA = await page.locator(
-        '[class*="2fa"], [class*="two-factor"], [class*="otp"], ' +
-        'input[name*="otp"], input[name*="code"], input[id*="otp"]'
-      ).count() > 0;
-
-      if (has2FA) {
-        return { needed: true, reason: "Two-factor authentication detected" };
-      }
+      if (hit === "captcha") return { needed: true, reason: "CAPTCHA detected on page" };
+      if (hit === "password") return { needed: true, reason: "Login/password form detected" };
+      if (hit === "2fa") return { needed: true, reason: "Two-factor authentication detected" };
     } catch {
-      // Ignore detection errors
+      // Detection is advisory: a page that cannot be evaluated is not evidence of
+      // a human being needed.
     }
 
     return { needed: false };
@@ -127,6 +135,27 @@ export class SafetyLayer {
   private getTargetText(target?: { name?: string; text?: string; role?: string }): string {
     if (!target) return "";
     return (target.name || target.text || "").toLowerCase();
+  }
+
+  /**
+   * Does `text` contain `keyword` as a WHOLE WORD?
+   *
+   * A bare `includes` matched inside unrelated words: "Display options" contains
+   * "pay", "Posted: 2 days ago" contains "post", "Cancellation policy" contains
+   * "cancel". Under `strict` each of those was classified `severity:"human"` and
+   * flagged `requiresHumanTakeover`, so ordinary navigation controls demanded
+   * human review while genuinely irreversible ones were indistinguishable from
+   * them. Multi-word keywords are matched as a contiguous phrase.
+   */
+  private hasKeyword(text: string, keyword: string): boolean {
+    if (!text || !keyword) return false;
+    const esc = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Word boundaries are expressed manually so the guard is identical whether or
+    // not the runtime supports `\b` inside the class (and so `_` counts as a word
+    // character, which is what we want for "opt_out"/"sign_out").
+    const start = "(?<![a-z0-9])";
+    const end = "(?![a-z0-9])";
+    return new RegExp(`${start}${esc.replace(/\s+/g, "\\s+")}${end}`, "i").test(text);
   }
 
   private isHighImpactAction(action: string, targetText: string, url?: string): boolean {
@@ -146,20 +175,27 @@ export class SafetyLayer {
     // Check action type
     if (action === "click") {
       for (const keyword of highImpactKeywords) {
-        if (targetText.includes(keyword)) return true;
+        if (this.hasKeyword(targetText, keyword)) return true;
       }
     }
 
     // Check for destructive patterns
     for (const keyword of destructiveKeywords) {
-      if (targetText.includes(keyword)) return true;
+      if (this.hasKeyword(targetText, keyword)) return true;
     }
 
-    // Check URL patterns for payment/checkout
+    // Check URL patterns for payment/checkout. URL segments are slash- or
+    // dot-delimited, so an anchored segment match is used rather than a bare
+    // substring: /pay and /checkout are payment pages, /player and /paying-in-4
+    // are not.
     if (url) {
       const paymentPatterns = [
-        /checkout/i, /payment/i, /pay/i, /purchase/i,
-        /cart.*review/i, /billing/i,
+        /(^|[/?#._-])checkout([/?#._-]|$)/i,
+        /(^|[/?#._-])payment([/?#._-]|$)/i,
+        /(^|[/?#._-])pay([/?#._-]|$)/i,
+        /(^|[/?#._-])purchase([/?#._-]|$)/i,
+        /(^|[/?#._-])billing([/?#._-]|$)/i,
+        /(^|[/?#._-])cart[/?#._-].*review/i,
       ];
       for (const pattern of paymentPatterns) {
         if (pattern.test(url)) return true;
@@ -177,23 +213,23 @@ export class SafetyLayer {
     ];
 
     for (const keyword of irreversibleKeywords) {
-      if (targetText.includes(keyword)) return true;
+      if (this.hasKeyword(targetText, keyword)) return true;
     }
 
     return false;
   }
 
   private getReason(action: string, targetText: string): string {
-    if (targetText.includes("delete") || targetText.includes("remove")) {
+    if (this.hasKeyword(targetText, "delete") || this.hasKeyword(targetText, "remove")) {
       return `This action appears to be destructive (${action}: "${targetText}"). Human review recommended.`;
     }
-    if (targetText.includes("submit") || targetText.includes("send")) {
+    if (this.hasKeyword(targetText, "submit") || this.hasKeyword(targetText, "send")) {
       return `This action submits/sends data (${action}: "${targetText}"). Human review recommended.`;
     }
-    if (targetText.includes("pay") || targetText.includes("purchase")) {
+    if (this.hasKeyword(targetText, "pay") || this.hasKeyword(targetText, "purchase")) {
       return `This action involves payment (${action}: "${targetText}"). Human review required.`;
     }
-    if (targetText.includes("accept") || targetText.includes("agree")) {
+    if (this.hasKeyword(targetText, "accept") || this.hasKeyword(targetText, "agree")) {
       return `This action accepts/agrees to terms (${action}: "${targetText}"). Human review recommended.`;
     }
     return `This action may have significant impact (${action}: "${targetText}").`;

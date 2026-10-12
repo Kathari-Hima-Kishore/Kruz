@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { execFileSync } from "node:child_process";
-import { getProjectRoot } from "./config.js";
+import { getProjectRoot, loadConfig } from "./config.js";
 
 /**
  * Single-instance guard (kruz-bugs.md #6).
@@ -50,6 +50,30 @@ function lockPath(): string {
 
 function err(msg: string): void {
   process.stderr.write(`[kruz] single-instance: ${msg}\n`);
+}
+
+/**
+ * Normalise a path for COMPARISON: backslashes, no trailing separator, lowercase.
+ * Used only for prefix tests, never for filesystem access.
+ */
+function pathUnder(p: string): string {
+  return p.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+/**
+ * Is `p` inside directory `root`?
+ *
+ * A bare `p.startsWith(root)` is a string-prefix test, not a path test: with
+ * root `D:\Kruz` it also matches `D:\Kruz-tools\dist\index.js` and
+ * `D:\KruzOld\…`. That misidentifies an unrelated Node server as a Kruz server,
+ * which then (a) suppresses orphan reaping and (b) under `KRUZ_TAKEOVER=1` gets
+ * it terminated. Requiring a separator boundary makes the test mean what it says.
+ */
+function isPathUnder(p: string, root: string): boolean {
+  const a = pathUnder(p);
+  const b = pathUnder(root);
+  if (!b) return false;
+  return a === b || a.startsWith(b + "\\");
 }
 
 /** True when the pid exists (EPERM counts as alive — it exists, we just can't signal it). */
@@ -126,7 +150,7 @@ function looksLikeKruzServerCmd(cmd: string): boolean {
   // killed the test runner itself. Requiring the resolved path to be under our root
   // matches the real server exactly and nothing else. Spaces in the install path are
   // handled by reading quoted spans whole rather than splitting on whitespace.
-  const root = resolve(getProjectRoot()).replace(/\//g, "\\").toLowerCase();
+  const root = pathUnder(getProjectRoot());
   const ENTRY = /(?:"([^"]*)"|'([^']*)'|([^\s"]+))/g;
   for (const m of raw.matchAll(ENTRY)) {
     const tok = (m[1] ?? m[2] ?? m[3] ?? "").trim();
@@ -134,7 +158,7 @@ function looksLikeKruzServerCmd(cmd: string): boolean {
     const abs = /^[A-Za-z]:[\\/]/.test(tok) || tok.startsWith("\\\\")
       ? tok
       : resolve(getProjectRoot(), tok);
-    if (abs.replace(/\//g, "\\").toLowerCase().startsWith(root)) return true;
+    if (isPathUnder(abs, root)) return true;
   }
   return false;
 }
@@ -164,7 +188,26 @@ function processIdentity(pid: number): { cmd: string; startedAt: string } | null
       if (!rec || !rec.ProcessId) return null;
       return { cmd: String(rec.CommandLine ?? ""), startedAt: String(rec.CreationDate ?? "") };
     }
-    return null;
+
+    // POSIX: `ps` is the same source of truth listProcesses() already uses, and
+    // `lstart` gives the OS start time.
+    //
+    // This branch used to `return null` unconditionally off win32, which made
+    // `maySignalPredecessor` fail closed on every macOS/Linux machine: takeover
+    // could NEVER terminate a recorded live predecessor, and — worse — the
+    // caller read that null as "pid recycled" and logged a confident falsehood
+    // about a genuinely live Kruz server.
+    const out = execFileSync(
+      "ps",
+      ["-p", String(pid), "-o", "lstart=,args="],
+      { encoding: "utf8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    if (!out) return null;
+    // `Tue Oct  7 13:00:46 2026 node dist/index.js` — lstart is 5 tokens.
+    const parts = out.split(/\s+/);
+    if (parts.length < 6) return null;
+    const startedAt = new Date(`${parts[0]} ${parts[1]} ${parts[2]} ${parts[3]} ${parts[4]}`).toISOString();
+    return { cmd: parts.slice(5).join(" "), startedAt };
   } catch {
     return null;
   }
@@ -246,20 +289,22 @@ function killPid(pid: number): boolean {
 }
 
 /**
- * Resolve the browser profile dir the same way loadConfig() does, without
- * pulling the whole config (the guard runs before anything else).
+ * Resolve the browser profile dir the same way loadConfig() does.
+ *
+ * This used to re-implement the precedence (env -> config.json -> default) with
+ * a hardcoded `"./browser-profile"` fallback. Duplicating it meant the reaper
+ * and the launcher could disagree about WHICH directory is the profile — most
+ * visibly once the profile default became conditional on the install directory
+ * being writable, where the reaper would have searched a path the launcher never
+ * used and silently reaped nothing.
+ *
+ * `loadConfig()` is memoised and cheap (it does not launch anything), so the
+ * single source of truth is also the correct dependency here. One definition of
+ * "the profile dir" means the reaper can never target the wrong directory.
  */
 function resolveProfileDir(): string | null {
   try {
-    let fileProfile: string | undefined;
-    const configPath = resolve(getProjectRoot(), "config.json");
-    if (existsSync(configPath)) {
-      try {
-        fileProfile = JSON.parse(readFileSync(configPath, "utf-8"))?.profileDir;
-      } catch { /* ignore */ }
-    }
-    const raw = process.env.BROWSER_PROFILE_DIR || fileProfile || "./browser-profile";
-    return resolve(getProjectRoot(), raw);
+    return loadConfig().profileDir || null;
   } catch {
     return null;
   }
@@ -275,11 +320,23 @@ function resolveProfileDir(): string | null {
 function reapOrphanedChrome(procs: Array<{ pid: number; cmd: string }>): number {
   const profileDir = resolveProfileDir();
   if (!profileDir) return 0;
-  const norm = profileDir.replace(/\//g, "\\").toLowerCase();
+  const norm = pathUnder(profileDir);
   let reaped = 0;
   for (const p of procs) {
     const cmd = p.cmd.replace(/\//g, "\\").toLowerCase();
-    if (!cmd.includes("chrome") || !cmd.includes(norm)) continue;
+    if (!cmd.includes("chrome")) continue;
+    // Only Chrome actually USING OUR profile dir is an orphan of ours.
+    //
+    // This was a bare substring test, so a sibling profile — `./browser-profile-2`,
+    // the exact per-project layout this file's own header recommends for running
+    // two projects at once — matched `browser-profile` and had its browser
+    // SIGKILLed, destroying a live session belonging to a concurrent instance.
+    // Matching the `--user-data-dir` ARGUMENT (rather than the whole command
+    // line) and requiring a separator boundary kills only our own holder.
+    const m = /--user-data-dir=(?:"([^"]*)"|'([^']*)'|(\S+))/i.exec(p.cmd);
+    if (!m) continue;
+    const used = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    if (!used || !isPathUnder(used, norm)) continue;
     if (killPid(p.pid)) reaped++;
     else err(`could not reap orphaned chrome pid=${p.pid}; profile lock may persist`);
   }
@@ -371,10 +428,12 @@ export async function claimSingleInstance(): Promise<void> {
   // arbitrary but stable, and every server computes the same answer independently.
   const ownerFromRecord = !!(prev && isAlive(prev.pid) && maySignalPredecessor(prev.pid, prev.startedAt).ok);
   if (prev && isAlive(prev.pid) && !ownerFromRecord) {
-    // The classic pid-recycling case: the record outlived its process and now names
-    // an unrelated program. Say so — silently ignoring the record looked like a
-    // no-op to whoever was reading the logs.
-    err(`record names live pid=${prev.pid}, which is not a verified Kruz server (pid recycled); ignoring it`);
+    // Report WHY, using the check's own verdict. The old code asserted
+    // "pid recycled" for every negative result, including "we could not read the
+    // process identity" — a confident, frequently false statement in the very
+    // log an operator debugs from.
+    const why = maySignalPredecessor(prev.pid, prev.startedAt).why;
+    err(`record names live pid=${prev.pid}, which is not a verified Kruz server; ignoring it (${why})`);
   }
   let owner = -1;
   if (ownerFromRecord) owner = prev!.pid;

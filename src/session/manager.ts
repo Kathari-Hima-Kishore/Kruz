@@ -3,7 +3,7 @@ import { launchBrowser, closeBrowser } from "../browser/launcher.js";
 import { Observer } from "../extractor/observer.js";
 import { RefRegistry } from "../browser/ref-registry.js";
 import { FidelityExtractor } from "../extractor/fidelity.js";
-import type { P1Config } from "../config.js";
+import { loadConfig, type P1Config } from "../config.js";
 
 export interface SessionState {
   id: string;
@@ -177,6 +177,14 @@ export class SessionManager {
 
     session.status = "closed";
     session.engine = null;
+    // Drop the cached observations and the ref namespace with it. `close()` used
+    // to only flip `status`, leaving every closed session — and its Observer LRU
+    // (up to `observationCacheSize` entries) and RefRegistry (up to 6000) —
+    // retained for the process lifetime. Over a long-running MCP server doing
+    // repeated session.create/close cycles that is unbounded growth.
+    session.observer.clearCache();
+    session.navigationTrace.length = 0;
+    this.sessions.delete(id);
 
     if (this.activeSessionId === id) {
       this.activeSessionId = null;
@@ -285,7 +293,15 @@ export class SessionManager {
     }
 
     const engine = new PuppeteerEngine(false, wsEndpoint);
-    const config = { profileDir: "attach", headless: false } as P1Config;
+    // Build on the real loaded config instead of a 2-field literal cast. The old
+    // `{profileDir:"attach",headless:false} as P1Config` left viewportWidth/Height,
+    // locale, timeoutMs, safetyPolicy and observationCacheSize `undefined` while
+    // claiming to be a full config — so `session.status` reported
+    // `viewport_requested: undefined` and `server.info` reported
+    // `locale: undefined`. Inheriting the real config also makes the Observer's
+    // cache size honour OBSERVATION_CACHE_SIZE instead of silently using 1000.
+    const base = loadConfig();
+    const config: P1Config = { ...base, profileDir: "attach", headless: false };
     try {
       await engine.boot(config, "attach");
     } catch {
@@ -294,8 +310,18 @@ export class SessionManager {
 
     // Same rule as launch(): one registry, shared with the Observer.
     const refs = new RefRegistry();
-    const observer = new Observer(config.observationCacheSize ?? 1000, refs);
+    const observer = new Observer(config.observationCacheSize, refs);
     const extractor = new FidelityExtractor();
+
+    // Close any session we are displacing BEFORE adopting the new engine —
+    // exactly as launch() does. attach() previously overwrote `activeSessionId`
+    // without closing the old one, leaking a running Chrome that kept holding
+    // the --user-data-dir lock, so the NEXT session.create failed with
+    // BROWSER_LAUNCH_FAILED — the very failure this class was hardened against.
+    const previous = this.getActive();
+    if (previous && previous.id !== id) {
+      try { await this.close(previous.id); } catch { /* best effort */ }
+    }
 
     const state: SessionState = {
       id, status: "active", createdAt: new Date().toISOString(),
